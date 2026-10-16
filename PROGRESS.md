@@ -966,3 +966,361 @@ break any of its existing tests.)
   *same* text block, where the two spans don't textually overlap so both
   survive `_claim()`). Per-source dedup/aggregation across candidates is
   explicitly the pipeline's job (subtask 7), not this module's.
+
+---
+
+## Subtask 4 — ingest/ — status: done
+
+### What's built
+Files created:
+- `reel2movie/ingest/__init__.py` — package docstring only.
+- `reel2movie/ingest/ytdlp_client.py` — `YtDlpClient`, the **only** module
+  in `reel2movie` that imports `yt_dlp` directly. `extract_info(url, *,
+  cookies_file: Path | None = None, download: bool = False) -> dict`
+  builds an options dict (`getcomments: True` always; `skip_download: not
+  download`; `cookiefile: str(cookies_file)` only when `cookies_file` is
+  given; `quiet`/`no_warnings: True` to keep stdout clean) and runs
+  `with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(url,
+  download=download)`. Returns yt-dlp's raw dict unmodified — no
+  normalization happens here, that's `instagram.py`'s job.
+- `reel2movie/ingest/instagram.py` — `InstagramIngestor`, structurally
+  satisfying the `Ingestor` Protocol (`fetch_metadata`, `ensure_video`),
+  built on a `YtDlpClient` instance taken as a constructor param (so tests
+  inject a fake, never importing `yt_dlp` themselves). Takes an optional
+  `cookies_file: Path | None` constructor param and passes it through to
+  `client.extract_info(...)` on every call — never calls
+  `config.get_instagram_cookies_file()` itself, matching the same
+  separation-of-concerns pattern `tmdb/client.py` uses for the TMDB token
+  (per subtask spec and Subtask 1's own open question flagging this).
+  - `fetch_metadata(url)` calls the client with `download=False`, then
+    maps the raw dict to `IngestResult`: `caption` <- `description`,
+    `creator_account_id` <- `uploader_id`, `comments` <- each item in
+    `comments` mapped to a `Comment`, `duration_seconds` <- `duration`,
+    `video_path=None`, `platform=Platform.INSTAGRAM`, `url=url` (the
+    original input string, not anything yt-dlp reports back, so the
+    output url always matches exactly what the caller passed in).
+  - `ensure_video(result)` calls the client again for `result.url` with
+    `download=True`, then reads the local path from
+    `requested_downloads[0]["filepath"]` if present, falling back to the
+    top-level `_filename` key, raising `IngestError` if neither is found.
+  - `IngestError(RuntimeError)` — raised (a) in `fetch_metadata` if
+    `uploader_id` is missing/falsy (can't identify the creator account at
+    all), (b) in the per-comment mapping if a comment is missing `id` or
+    `author_id` (rather than silently coercing `None` to the string
+    `"None"`, which would quietly corrupt the "is this the creator's own
+    comment" check downstream), and (c) in `ensure_video` if yt-dlp's
+    download response has neither `requested_downloads[...].filepath` nor
+    `_filename`. All three are "don't produce a garbage result" guards per
+    the subtask spec, not an exhaustive validation of every field.
+- `tests/fixtures/instagram_post_sample.json` — a hand-constructed,
+  **not-a-real-scrape** fixture (documented as such via its own
+  `_fixture_note` key, plus here), modeled on yt-dlp's documented/typical
+  Instagram extractor output shape. Contains `description`, `uploader_id`,
+  `duration`, and a 3-entry `comments` list: one top-level comment
+  (`parent: "root"`) from the **same** `author_id` as the post's
+  `uploader_id` (`cinephile_creator`) — the creator's-own-comment case the
+  waterfall cares about — one top-level comment from a different author,
+  and one reply (`parent` set to the second comment's `id`, not `"root"`)
+  to exercise `is_reply` derivation.
+- `tests/unit/ingest/__init__.py` — empty, for pytest discovery.
+- `tests/unit/ingest/test_ytdlp_client.py` — 6 tests, with
+  `yt_dlp.YoutubeDL` patched out entirely (a `MagicMock` configured to
+  support the `with ... as ydl:` context-manager protocol) so no real
+  `YoutubeDL` is ever constructed and nothing can touch the network.
+  Covers: `getcomments: True` always set; `skip_download` is `True` when
+  `download=False` and `False` when `download=True`; `cookiefile` is set
+  to `str(cookies_file)` when given and omitted entirely when
+  `cookies_file=None`; `ydl.extract_info(url, download=download)` is
+  called with exactly those arguments; the raw dict yt-dlp "produces" is
+  returned unchanged (identity-checked, not just equality).
+- `tests/unit/ingest/test_instagram.py` — 15 tests against a
+  `FakeYtDlpClient` test double (same `extract_info(url, *, cookies_file,
+  download)` signature as the real client, records every call, returns a
+  canned metadata or download dict depending on the `download` flag) fed
+  the JSON fixture above. Covers: `caption`/`creator_account_id`/
+  `duration_seconds`/`platform`/`url`/`video_path=None` field mapping;
+  per-comment `author_id`/`text`/`like_count` mapping; `is_reply=False`
+  for both `parent: "root"` comments; `is_reply=True` for the reply whose
+  `parent` is a comment id; a missing `parent` key treated as top-level;
+  `like_count` defaulting to `None` when absent; `cookies_file` passed
+  through to the client on both `fetch_metadata` and `ensure_video` calls;
+  `IngestError` raised (with a message-content check via
+  `pytest.raises(..., match=...)`) when `uploader_id` is missing and when
+  a comment is missing `author_id`; `ensure_video` resolving the path from
+  `requested_downloads[0].filepath`, falling back to `_filename`, and
+  raising `IngestError` when neither is present.
+
+Ran `python3 -m pytest tests/unit -q`:
+
+```
+.................................................................... [ 80%]
+.................                                                    [100%]
+89 passed in 0.60s
+```
+
+(68 pre-existing from Subtasks 0-3 + 21 new in `tests/unit/ingest/` — 6 in
+`test_ytdlp_client.py` + 15 in `test_instagram.py` — confirming nothing
+added here broke any earlier subtask's tests.)
+
+### Field-mapping assumptions (need live verification later — not silently baked in)
+
+Per the subtask spec's explicit instruction to surface these rather than
+assume them, and the plan's own flagged risks:
+
+- **`caption` <- `description`, not `caption`/`edge_media_to_caption`.**
+  Instagram's own API field names are `caption`/`edge_media_to_caption`,
+  but yt-dlp's documented extractor-normalization convention flattens
+  essentially every platform's post text to a common `description` key.
+  The fixture uses `description` on this assumption. **Unverified against
+  a live yt-dlp Instagram response in this sandbox** — if yt-dlp's real
+  Instagram extractor instead (or additionally) emits a raw `caption` key,
+  `fetch_metadata` would silently read an empty/stale `description` today
+  (falls back to `""`, not an error) rather than failing loudly. Worth a
+  single live `yt-dlp --dump-json` run against a real reel once the user
+  has cookies, specifically checking which of `description`/`caption` is
+  actually populated.
+- **`creator_account_id` <- `uploader_id`.** This is yt-dlp's standard
+  normalized field across most extractors for "the account that posted
+  this," so confidence here is higher than for `caption`, but still
+  unverified live for Instagram specifically.
+- **`is_reply` <- `parent` field, YouTube-extractor convention
+  (`"root"` vs. a comment id).** This is the plan's own explicitly flagged
+  open risk ("the reply-vs-top-level field needs explicit handling since
+  it's not guaranteed as reliable as YouTube's `parent` field"). This
+  subtask does NOT resolve that risk — it only implements the
+  best-available mapping (YouTube's documented convention, since that's
+  the one yt-dlp extractors most commonly reuse) and a safe default for
+  the missing-key case (treated as top-level, since a false "top-level"
+  is less damaging to the creator's-own-comment check than a false
+  "reply" would be — the former risks including a stray reply as if it
+  were the creator's primary comment, which still goes through TMDB
+  resolution and would likely just fail to resolve or resolve to
+  something a human would audit, versus the latter which would silently
+  discard a real creator top-level comment that should be checked).
+  **This is unverified against Instagram specifically and is called out
+  here, not assumed solved.**
+- **Comment `author_id`/`text`/`id` key names** — used as given in the
+  subtask spec's "likely" wording. The fixture's shape matches; a live
+  response could use different key names (e.g. `author` vs `author_id`
+  for the identifier used for matching), which would surface as a loud
+  `IngestError` (missing `author_id`) rather than a silent wrong mapping,
+  by design.
+- **`ensure_video` path extraction** — `requested_downloads[0].filepath`
+  is yt-dlp's modern documented convention when `download=True`;
+  `_filename` is the older/alternate key some extractor paths still set.
+  Checking both, in that order, is a documented hedge, not a guess — but
+  neither has been exercised against a real yt-dlp download in this
+  sandbox.
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (medium, forked) on the current diff
+(`reel2movie/ingest/{__init__,ytdlp_client,instagram}.py`,
+`tests/fixtures/instagram_post_sample.json`, `tests/unit/ingest/`),
+`/ponytail:ponytail-review` on the same diff, a hand-trace of
+`fetch_metadata()` against `tests/fixtures/instagram_post_sample.json`
+field-by-field, targeted greps for the yt-dlp import boundary and the
+cookies-file separation-of-concerns rule, a grep of the test suite for any
+real `yt_dlp.YoutubeDL(` construction, and a fresh, independent
+`python3 -m pytest tests/unit -q` run (89 passed, run directly — twice,
+once plain and once with `python3 -I` for import isolation — not just
+trusted from the build report).
+
+**From `/code-review` (correctness) — two findings, both reproduced, neither blocking:**
+- **Non-blocking** — `instagram.py` L70 (`_to_comment` via the list
+  comprehension in `fetch_metadata`): a `None` entry inside yt-dlp's
+  `comments` list (some extractors represent a deleted/redacted comment
+  this way) crashes with an unhandled `AttributeError: 'NoneType' object
+  has no attribute 'get'` instead of the module's own `IngestError`.
+  Verified directly: `fetch_metadata` with `comments: [None, {...}]`
+  raises `AttributeError`, not `IngestError`. This is adjacent to, but
+  distinct from, the explicitly-tested "missing required field inside a
+  present comment dict" case (which does correctly raise `IngestError` —
+  confirmed by `test_fetch_metadata_raises_ingest_error_when_comment_missing_author_id`).
+  Judged non-blocking: not reproduced against any realistic Instagram
+  yt-dlp shape in this sandbox (speculative edge case, same standard
+  applied to other unverified-shape risks already logged below), and the
+  failure mode is "loud crash," not "silent wrong data" — cheap to harden
+  later with a `raw is None or` guard before the field-level checks.
+- **Non-blocking** — `instagram.py` L63/76 vs. L98-99: `creator_account_id`
+  is assigned straight from `info.get("uploader_id")` with no `str()`
+  coercion, unlike `Comment.id`/`Comment.author_id` two lines later which
+  are deliberately `str()`-wrapped. Verified directly: a canned
+  `uploader_id: 12345` (int) yields `type(result.creator_account_id) is
+  int`, violating `IngestResult.creator_account_id: str`'s declared type.
+  Real consequence if it ever fires: the pipeline's later
+  "is this the creator's own comment" waterfall step (subtask 7) would
+  compare `creator_account_id` against `Comment.author_id` (always a
+  `str`), and an `int != str` comparison would silently never match even
+  when the IDs really are the same account — a quiet correctness bug, not
+  a crash. Judged non-blocking only because the current fixture (and all
+  15 `test_instagram.py` tests) always supplies a string `uploader_id`, so
+  nothing in the actual test suite demonstrates this; still, flagging it
+  as a cheap, worth-doing fix (`str(uploader_id)`, matching the pattern
+  already used for the other two id fields) before this is exercised
+  against live Instagram data.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- `tests/unit/ingest/test_instagram.py:L43-233`: `shrink:` 12 of the 15
+  tests hand-build the identical
+  `fixture = _load_fixture(); client = FakeYtDlpClient(metadata_response=fixture); ingestor = InstagramIngestor(client)`
+  triple before doing anything test-specific. Two `@pytest.fixture`s
+  (`fixture`, `ingestor`) injected by parameter name would cut this
+  boilerplate to zero lines per test for those 12 call sites.
+- `tests/unit/ingest/test_instagram.py:L85,99,111`: `shrink:` the same
+  `by_id = {c.id: c for c in result.comments}` lookup is rebuilt from
+  scratch in three separate tests. Minor; folding it into the proposed
+  `ingestor`-fixture helper (or a tiny local helper) would save a couple
+  more lines.
+- Everything else (`ytdlp_client.py`'s single-method wrapper, `_to_comment`
+  as a static helper, `IngestError` as a plain `RuntimeError` subclass with
+  no custom attributes, `test_ytdlp_client.py`'s shared
+  `_patched_youtubedl()` helper already reused across 5 tests) is minimal
+  and load-bearing — no reinvented stdlib, no unneeded dependency, no
+  speculative abstraction.
+- `net: -20 lines possible` (test-boilerplate only; both findings
+  non-blocking, same deferred-duplication pattern already accepted in
+  Subtasks 0-3's reviews).
+
+**Field-mapping correctness — hand-traced against
+`tests/fixtures/instagram_post_sample.json` (not just read off the test
+assertions):**
+- Fixture: `description = 'You need to watch "The Matrix" (1999) this
+  weekend! #moviereview'`, `uploader_id = "cinephile_creator"`,
+  `duration = 42.5`, 3 comments (ids `...001`/`...002`/`...003`).
+- Traced `fetch_metadata()` by hand against this fixture: `caption` =
+  `info.get("description") or ""` → the exact string above (confirmed
+  correct, matches `test_fetch_metadata_maps_caption_from_description`).
+  `creator_account_id` = `"cinephile_creator"` (correct).
+  `duration_seconds` = `42.5`, `platform` = `Platform.INSTAGRAM`, `url` =
+  the caller's original input string (not yt-dlp's `webpage_url`) — all
+  correct per spec.
+- Comment-by-comment trace of `_to_comment`: comment `...001`
+  (`author_id="cinephile_creator"`, `parent="root"`) →
+  `is_reply = parent is not None and parent != "root"` = `True and False`
+  = `False` — correct, this is the creator's own top-level comment, the
+  exact case the waterfall spec cares about. Comment `...002`
+  (`author_id="random_follower_22"`, `parent="root"`) → `is_reply=False`
+  — correct. Comment `...003` (`parent="17895000000000002"`, a real
+  comment id, not `"root"`) → `is_reply = True and True = True` — correct,
+  this is the reply. All three match what `test_instagram.py` asserts,
+  and the hand-trace independently confirms the test assertions are
+  checking the right thing, not just that the code and tests agree with
+  each other by construction.
+
+**Error-handling verification (missing-required-field → `IngestError`, not
+a raw crash or silent garbage):**
+- Confirmed `fetch_metadata` raises `IngestError` (not `KeyError`) when
+  `uploader_id` is absent (`info.get` + falsy check, not direct
+  indexing) — traced the code path, not just the passing test.
+- Confirmed `_to_comment` raises `IngestError` (not `KeyError`) when a
+  present comment dict is missing `id` or `author_id` — same pattern,
+  correctly using `.get()` + an explicit `is None` check rather than `[]`
+  indexing that would raise `KeyError`.
+- Confirmed `ensure_video` raises `IngestError` (not `IndexError`/
+  `KeyError`) when neither `requested_downloads[0].filepath` nor
+  `_filename` is present — uses `requested and requested[0].get(...)`
+  (short-circuits on an empty list, so no `IndexError` on `requested[0]`)
+  before falling back and finally raising.
+- The two gaps found above (`None` list entry, un-coerced
+  `creator_account_id`) are the only cases where this guarantee doesn't
+  fully hold; both logged as non-blocking for the reasons given.
+
+**Import-boundary and cookie-separation checks (grepped directly, not
+inferred from reading one file):**
+- `grep -rn "import yt_dlp\|yt_dlp\." reel2movie/ingest/` → every match is
+  in `ytdlp_client.py` (the `import yt_dlp` line itself, its docstring,
+  and the one `yt_dlp.YoutubeDL(opts)` construction). `instagram.py` only
+  *mentions* `yt_dlp`/`YtDlpClient` in prose/docstrings and imports the
+  `YtDlpClient` wrapper class, never `yt_dlp` itself — confirmed the
+  import boundary from the plan ("ytdlp_client.py — thin wrapper around
+  yt_dlp.YoutubeDL" as the sole yt_dlp-importing module) holds exactly.
+- `grep -rn "get_instagram_cookies_file" reel2movie/` → the only
+  definition is in `config.py`; the only other hit is a docstring mention
+  in `instagram.py` ("Does not call
+  `reel2movie.config.get_instagram_cookies_file()` itself") — confirmed
+  `InstagramIngestor` never calls it; `cookies_file` only ever arrives via
+  the constructor parameter, matching the same separation `tmdb/client.py`
+  uses for the TMDB bearer token (Subtask 2's pattern).
+- `grep -rn "yt_dlp.YoutubeDL(" tests/` → zero matches anywhere in the
+  test suite. The only place `yt_dlp.YoutubeDL` is referenced in tests is
+  as a string target for `unittest.mock.patch(...)` in
+  `test_ytdlp_client.py`, never actually constructed — confirmed no real
+  `YoutubeDL` instance, and therefore no live network call, is possible
+  from any unit test.
+
+**Independent test run:**
+- `python3 -m pytest tests/unit -q` → `89 passed` (68 pre-existing from
+  Subtasks 0-3 + 21 new in `tests/unit/ingest/`).
+- Re-ran with `python3 -I -m pytest tests/unit -q` (import-isolated, no
+  reliance on an ambient `sys.path`/cwd state) → also `89 passed`, same
+  count, confirming the result independent of environment.
+
+No blocking findings. Field mapping traces out correctly against the
+fixture for every case the fixture exercises; the explicit missing-field
+error-handling guarantee holds for every case the spec calls out; the
+yt_dlp import boundary and the cookies-file constructor-only rule both
+hold exactly, confirmed by grep rather than by trusting the module
+docstrings' own claims. The two new findings (null comment-list entry,
+un-coerced `creator_account_id`) are real but narrow, unverified-against-
+live-data edge cases with cheap fixes — logged for follow-up, not blocking
+this subtask.
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+(none yet — no blocking findings this pass)
+
+### Open questions / risks
+
+- **Comment-pagination risk (per the plan's "Known risks" — explicitly
+  NOT solved here, and not made worse).** Instagram's comment pagination
+  may surface "top"/most-liked comments first rather than chronological
+  order, so on a popular reel the creator's own pinned/top-level comment
+  could sit entirely outside whatever page `yt-dlp` fetches by default.
+  `YtDlpClient.extract_info` passes no explicit comment-count/sort options
+  to `yt_dlp.YoutubeDL` beyond `getcomments: True` — it takes whatever
+  yt-dlp's own default comment-fetch behavior returns. This subtask
+  neither attempts to force a specific sort order nor to paginate further
+  (yt-dlp has extractor-specific `max_comments`/sort options for some
+  sites, but their availability/semantics for Instagram specifically
+  were not verified live, so adding one here would itself be an unverified
+  assumption). Flagging explicitly per the task instructions: **this risk
+  is unsolved, not silently ignored** — a later subtask (likely
+  `pipeline/waterfall.py`, when it implements the "creator's own top-level
+  comment" waterfall step) needs to decide how to handle the case where
+  the creator's real comment simply never arrives in the fetched set, and
+  should not assume `comments` is either complete or chronologically
+  ordered.
+- **`is_reply` reliability is still an open risk**, not resolved by this
+  subtask — see the field-mapping section above. If a later live check
+  shows Instagram's yt-dlp extractor doesn't populate `parent` at all
+  (always `None`/absent), every comment would be treated as top-level by
+  this module's conservative default, which is safe (no crash, no wrong
+  data shape) but would silently make the creator's-top-level-comment
+  waterfall step see replies it shouldn't.
+- **`caption`/`description` key choice is unverified live** — see above;
+  flagged as the first thing to check with a real `yt-dlp --dump-json`
+  call once the user supplies Instagram cookies (per the plan's note that
+  live Instagram verification needs the user's own session).
+- **No retry/rate-limit/backoff logic** was added to `YtDlpClient` — out
+  of scope for this subtask and not mentioned in the plan; each call to
+  `extract_info` is a single attempt, same posture as `tmdb/client.py`'s
+  `requests.get` (also no retry logic, flagged there too).
+- **`YtDlpClient.extract_info` does not validate `cookies_file` existence
+  or readability before handing it to yt-dlp as `cookiefile`** — Subtask
+  1's open questions asked explicitly what `ingest/` should do here; this
+  subtask's answer is: nothing extra — if the path doesn't exist or isn't
+  readable, yt-dlp's own `cookiefile` handling will raise when
+  `extract_info` actually runs, and that error propagates to the caller
+  unchanged rather than being pre-validated or swallowed. No cookies-file
+  validation logic was added because yt-dlp already owns that failure
+  mode and duplicating it risked getting out of sync with yt-dlp's own
+  error message/behavior. `cookies_file=None` is fully supported (just
+  omits `cookiefile` from the options dict) for any future ingest path
+  that doesn't need authenticated access.
+- **No live Instagram/yt-dlp call of any kind was made in this subtask** —
+  per the hard constraint, all tests use the hand-built fixture and fakes.
+  Every field-mapping assumption above is therefore a documented guess,
+  not a verified fact, until the user supplies real Instagram cookies and
+  a live smoke test is run (expected at/after Subtask 8 per the plan).

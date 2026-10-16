@@ -1,0 +1,35 @@
+{
+  "_fixture_note": "Hand-constructed fixture modeled on yt-dlp's documented/typical Instagram extractor output shape. This is NOT a real scrape and has NOT been verified against a live Instagram API response - field names encode best-effort assumptions. See PROGRESS.md 'Subtask 4' for the full list of assumptions this fixture is used to test (description<->caption, uploader_id<->creator_account_id, parent<->is_reply).",
+  "id": "CxSampleReelId123",
+  "description": "You need to watch \"The Matrix\" (1999) this weekend! #moviereview",
+  "uploader_id": "cinephile_creator",
+  "uploader": "Cinephile Creator",
+  "duration": 42.5,
+  "webpage_url": "https://www.instagram.com/reel/CxSampleReelId123/",
+  "comments": [
+    {
+      "id": "17895000000000001",
+      "author_id": "cinephile_creator",
+      "author": "cinephile_creator",
+      "text": "Forgot to mention - also check out Inception (2010)!",
+      "parent": "root",
+      "like_count": 54
+    },
+    {
+      "id": "17895000000000002",
+      "author_id": "random_follower_22",
+      "author": "random_follower_22",
+      "text": "Great picks, adding to my watchlist",
+      "parent": "root",
+      "like_count": 3
+    },
+    {
+      "id": "17895000000000003",
+      "author_id": "another_follower",
+      "author": "another_follower",
+      "text": "Totally agree with this reply",
+      "parent": "17895000000000002",
+      "like_count": 0
+    }
+  ]
+}
