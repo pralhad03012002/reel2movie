@@ -8,7 +8,7 @@ dependencies = [
     "requests",
     "rapidfuzz",
     "imageio-ffmpeg",
-    "anthropic",
+    "anthropic>=1.0",
 ]
 
 [project.optional-dependencies]

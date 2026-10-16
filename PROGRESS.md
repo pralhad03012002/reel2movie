@@ -1787,3 +1787,383 @@ has unstaged changes. Next step per the loop is a fresh review subagent
   before writing any code) — no `pip install` was needed this subtask; it's
   already a `[project.dependencies]` entry in `pyproject.toml` from an
   earlier subtask, consistent with the plan.
+
+---
+
+## Subtask 6 — visual/vision_llm_detector.py — status: built, pending review
+
+### What's built
+Files created (nothing in `reel2movie/visual/__init__.py` touched — it
+already existed from Subtask 5):
+- `reel2movie/visual/vision_llm_detector.py`:
+  - A local `VisionChatClient` Protocol (`@runtime_checkable`,
+    `chat(self, image_path: Path, prompt: str) -> str`) — deliberately
+    defined in this module, not in `core/protocols.py`, per the plan's
+    "Visual detection approach" section: this is an implementation-detail
+    seam specific to how `VisionLLMPosterDetector` talks to a chat-capable
+    vision backend, not a pipeline-level Protocol other subpackages need.
+  - `AnthropicVisionChatClient(api_key: str, model: str =
+    "claude-sonnet-5-5")` — the real `anthropic.Anthropic` client is built
+    in `__init__` from the `api_key` constructor parameter; **never** calls
+    `config.get_anthropic_key()` itself, matching the same
+    separation-of-concerns rule `config.py`'s own docstring establishes
+    (callers — later `pipeline/deps.py` — own reading the env var and
+    passing the key in). `chat(image_path, prompt)` reads the image file's
+    bytes, base64-encodes them (`base64.standard_b64encode`), looks up the
+    Anthropic `media_type` from the file's extension via a small
+    `_EXTENSION_TO_MEDIA_TYPE` dict (`.jpg`/`.jpeg` → `image/jpeg`,
+    `.png` → `image/png`; anything else raises `ValueError` immediately,
+    rather than silently mislabeling the image to the API) — detected from
+    the real extension, not hardcoded to JPEG even though
+    `frame_sampler.py`'s own output is always `.jpg` today; this is called
+    out explicitly in the module docstring and in a comment at the dict
+    definition. Calls `self._client.messages.create(model=self._model,
+    max_tokens=1024, output_config={"effort": "low"}, messages=[...])`
+    with a single user message containing one `image` content block
+    (`source.type: "base64"`) followed by one `text` content block (the
+    prompt). Returns the concatenation of every `type == "text"` block in
+    `response.content` (not just the first — a defensive choice in case a
+    future model/response ever splits text across multiple blocks).
+  - `CONFIDENCE_MAP = {"high": 0.8, "medium": 0.5, "low": 0.3}` plus
+    `_DEFAULT_CONFIDENCE = CONFIDENCE_MAP["medium"]` as the fallback when
+    the model's own confidence label is missing/unrecognized (see
+    rationale below).
+  - `VisionLLMPosterDetector(chat_client: VisionChatClient)` — structurally
+    satisfies `core.protocols.PosterDetector` (`detect(frame: FrameSample)
+    -> list[Candidate]`), no inheritance. `detect()`:
+    1. Builds a fixed prompt (`_PROMPT` module constant) asking the model
+       to name any movie poster/title-card/identifiable-scene visible
+       (title + optional year, multiple if present), and to respond with
+       **only** a JSON array (e.g. `[{"title": "...", "year": 2010,
+       "confidence": "high"}]`, or `[]` if nothing found) — no prose, no
+       markdown fences — with two worked examples embedded in the prompt
+       text itself.
+    2. Calls `chat_client.chat(frame.path, _PROMPT)`.
+    3. Parses the raw text via `json.loads(raw_response.strip())` inside a
+       `try/except (json.JSONDecodeError, AttributeError)` — on failure,
+       logs a `logger.warning(...)` (stdlib `logging`, no new logging
+       dependency) naming the frame path and the raw text, and returns
+       `[]` rather than raising.
+    4. If the parsed JSON isn't a `list` (e.g. the model returned a bare
+       object), logs a warning and returns `[]`.
+    5. For each list item: skips (with a warning, `continue`, not a raised
+       exception) any item that isn't a `dict`, or whose `"title"` isn't a
+       non-empty string. Reads `"year"` leniently — accepts a real `int`,
+       a digit-only `str` (converted via `int()`), treats `bool` (a
+       sneaky `int` subclass in Python) as "no year", and falls back to
+       `None` for anything else. Builds `raw_text` as `f"{title}
+       ({year})"` when a year is present, else just `title` — the exact
+       format confirmed against both
+       `text_extraction/regex_extractor.py` (its two HIGH-confidence
+       passes build `raw_text` the same way) and
+       `tmdb/resolver.py`'s `_extract_year_hint()` (reads the **last**
+       `(YYYY)`-shaped substring via `_YEAR_IN_PARENS.findall(...)[-1]`),
+       by reading both files before finalizing this module, not assuming
+       the format from memory.
+    6. Maps `"confidence"` (lower-cased, whitespace-stripped) through
+       `CONFIDENCE_MAP`, falling back to `_DEFAULT_CONFIDENCE` (0.5) for a
+       missing or unrecognized label.
+    7. Returns the resulting `list[Candidate]`, every one with
+       `source=SourceTag.FRAME_VISUAL`.
+- `tests/unit/visual/test_vision_llm_detector.py` (the package's
+  `tests/unit/visual/__init__.py` already existed from Subtask 5, not
+  recreated) — **no live API calls anywhere**:
+  - `FakeVisionChatClient` — a plain test double implementing
+    `chat(image_path, prompt) -> str`, returning a canned string and
+    recording the `image_path`/`prompt` it was called with.
+  - `VisionLLMPosterDetector` tests via the fake: single movie with year →
+    `"Inception (2010)"` at confidence 0.8, and its `raw_text` round-trips
+    through `tmdb.resolver._extract_year_hint()` (imported and called
+    directly, same pattern Subtask 3 used) to get back `2010`; single
+    movie without year → bare `"Interstellar"` at confidence 0.5, and its
+    `raw_text` round-trips through `_extract_year_hint()` to get back
+    `None` (confirming the no-year case doesn't accidentally pick up a
+    stray year); a multi-movie response → two `Candidate`s in order, with
+    distinct confidences (high/low → 0.8/0.3); an explicit `"[]"` →
+    `[]`; five distinct malformed/edge-case responses, each asserted to
+    return `[]` or a filtered/degraded-but-non-crashing result rather than
+    raising: plain non-JSON prose, a JSON *object* instead of an array, a
+    markdown-code-fenced JSON array (the model ignoring the "no fences"
+    instruction — treated as malformed per spec, not specially unwrapped),
+    a list item missing `"title"` (skipped, sibling valid item still
+    returned), and an unrecognized confidence string (falls back to the
+    0.5 default); and a dedicated test asserting `source is
+    SourceTag.FRAME_VISUAL` on every returned `Candidate` across a
+    multi-movie response.
+  - `AnthropicVisionChatClient` tests, clearly separated in their own
+    `TestAnthropicVisionChatClient` class — mocks
+    `reel2movie.visual.vision_llm_detector.anthropic.Anthropic` itself
+    (via `unittest.mock.patch`), never constructs a real
+    `anthropic.Anthropic()` client and never touches the network: confirms
+    a real temp-file image (`tmp_path`) is read and base64-encoded
+    correctly (`image_block["source"]["data"] ==
+    base64.standard_b64encode(image_bytes).decode("utf-8")`), confirms the
+    prompt text is passed through unchanged as the trailing `text` content
+    block, confirms the default model id is exactly `"claude-sonnet-5-5"`
+    and that passing `model="custom-model"` is honored, confirms `.png` →
+    `image/png` media-type detection, confirms the response text is
+    correctly extracted from a response object shaped like the SDK's
+    (`response.content` = a list of objects with `.type`/`.text`,
+    including a non-`"text"`-type block mixed in to confirm only text
+    blocks are concatenated), and confirms an unsupported extension
+    (`.gif`) raises `ValueError` before any encode/API-call work happens.
+
+Ran `python3 -m pytest tests/unit -q`:
+
+```
+...............................................................................
+...........................                                              [100%]
+115 passed in 3.36s
+```
+
+(100 pre-existing from Subtasks 0-5 + 15 new in
+`tests/unit/visual/test_vision_llm_detector.py`, confirming nothing added
+here broke any earlier subtask's tests.)
+
+### Confidence-mapping choices and rationale
+
+- **high → 0.8, medium → 0.5, low → 0.3.** These are the extraction-layer
+  confidences the pipeline's waterfall gate checks (per
+  `core/models.py`'s `Candidate.confidence` docstring: "the extraction
+  layer's own confidence... independent of, and prior to, any later TMDB
+  match-quality score"). Chosen relative to the two other extractors
+  already built: `text_extraction/regex_extractor.py` uses `HIGH = 0.9` /
+  `MEDIUM = 0.6` for its own regex-based signal strength, and
+  `tmdb/scoring.py`'s `MIN_MATCH_SCORE = 0.5` is a *different* gate (TMDB
+  match quality, not extraction confidence) that this module's numbers
+  don't need to clear directly — but picking vision-LLM confidences in the
+  same rough 0.3-0.8 neighborhood as the regex extractor's 0.6-0.9 keeps
+  the three extraction sources comparable on the same scale rather than
+  inventing a disjoint range.
+  - `high = 0.8`: deliberately kept just *below* the regex extractor's
+    `HIGH = 0.9`, not above it — a clearly-read poster/title card is
+    strong signal, but a vision-LLM's own self-reported "high confidence"
+    on an image classification task is still one step more fallible than
+    "the caption literally contains `'Title' (YYYY)'" pattern-matched
+    text, so it shouldn't outrank the most explicit text signal on the
+    same comparative scale.
+  - `medium = 0.5`: matches the regex extractor's own `MEDIUM` tier
+    conceptually (a real but less certain signal) even though the exact
+    number (0.5 vs. regex's 0.6) differs slightly — chosen to sit clearly
+    above a "probably noise" floor.
+  - `low = 0.3`: still non-trivial (not 0.0/dropped-looking) — the model
+    flagged genuine uncertainty itself, but the signal is real enough to
+    pass through to the waterfall rather than being silently discarded
+    here; whether 0.3 clears whatever confidence bar `pipeline/waterfall.py`
+    (subtask 7, not yet built) ends up using is an open question for that
+    subtask, flagged below.
+  - `_DEFAULT_CONFIDENCE = 0.5` (same as `medium`) for a missing/garbled
+    confidence label: treated as a middling, not-dropped, not-maximal
+    guess — consistent with "don't make it so low a genuine hit never
+    clears the gate, don't inflate it either" from the subtask spec.
+
+### Malformed-response handling
+
+Three independent failure layers, all non-raising:
+1. **Whole response isn't valid JSON at all** (plain prose, a refusal
+   message, a markdown-fenced block the model added despite instructions)
+   → `json.loads` raises `json.JSONDecodeError`, caught, logged via
+   `logger.warning(...)`, returns `[]`.
+2. **Valid JSON, but not a list** (e.g. the model wrapped its answer in an
+   object) → caught by an explicit `isinstance(parsed, list)` check after
+   the parse succeeds, logged, returns `[]`.
+3. **A list, but an individual item is malformed** (not a dict, or missing
+   a usable `"title"`) → that one item is skipped with a warning
+   (`continue`), siblings in the same list are still processed — a partial
+   model response degrades gracefully rather than discarding the whole
+   frame's result over one bad entry.
+
+No new logging framework/dependency was added — plain stdlib
+`logging.getLogger(__name__)`, matching the subtask spec's "your call on
+logging mechanism, keep it simple" instruction.
+
+### Review findings (latest pass)
+
+Ran `/code-review` and `/ponytail:ponytail-review` against the diff
+(`reel2movie/visual/vision_llm_detector.py` +
+`tests/unit/visual/test_vision_llm_detector.py`, both new/untracked files,
+plus this `PROGRESS.md` update), independently re-ran
+`python3 -m pytest tests/unit -q`, and did the critical manual check on the
+real installed `anthropic` SDK (not from memory/assumption).
+
+**Critical manual check — `output_config={"effort": "low"}` and the
+response-parsing shape, verified against the actually-installed SDK:**
+
+- Installed `anthropic` version in this environment: **1.15.0**
+  (`python3 -c "import anthropic; print(anthropic.__file__, anthropic.__version__)"`
+  → `.../site-packages/anthropic/__init__.py`, `1.15.0`).
+- Inspected `anthropic/resources/messages/messages.py`'s `Messages.create()`
+  signature directly: `output_config: OutputConfigParam | Omit = omit` **is**
+  a real, documented keyword parameter ("Configuration options for the
+  model's output, such as the output format").
+- Inspected `anthropic/types/output_config_param.py`:
+  `OutputConfigParam` is a `TypedDict` with
+  `effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]]`
+  (plus an optional `format` key). `output_config={"effort": "low"}` is
+  therefore a **valid, well-typed call** on this installed SDK version —
+  **not a bug**. The build report's claim checks out against the real
+  package, not just against memory/documentation.
+- Inspected the response side: `anthropic/types/message.py` declares
+  `content: List[ContentBlock]`; `anthropic/types/content_block.py` defines
+  `ContentBlock` as a `Union[TextBlock, ThinkingBlock, ...]` discriminated
+  on `.type`; `anthropic/types/text_block.py`'s `TextBlock` has
+  `text: str` and `type: Literal["text"]`. This exactly matches
+  `AnthropicVisionChatClient.chat()`'s assumption (iterate
+  `response.content`, filter `block.type == "text"`, read `block.text`) —
+  **also not a bug**, and the module's own "Open questions" section was
+  properly cautious about this rather than overconfident.
+- **Non-blocking risk found while checking this (not the thing asked about,
+  but adjacent and real):** `pyproject.toml`'s `dependencies` list has
+  `"anthropic"` with **no version floor**
+  (`requires-python = ">=3.11"` is pinned, but the SDK itself isn't, e.g.
+  `"anthropic>=1.0"` or similar). `output_config` works today because
+  *this* environment happens to have resolved 1.15.0, but nothing in the
+  repo pins or documents that as the minimum required version — a fresh
+  install that resolves an older `anthropic` release predating
+  `output_config` would hit a real `TypeError` on the first live call, and
+  no test would catch it (every test mocks the SDK client entirely). Flagged
+  as a **non-blocking** follow-up (add a version floor to
+  `pyproject.toml`), not reopening this subtask for it, since it doesn't
+  affect correctness in this actual environment today.
+
+**Independent `pytest` re-run** (not trusting the reported 115 at face
+value): `python3 -m pytest tests/unit -q` → `115 passed in 2.49s`. Matches
+the build report's count exactly.
+
+**Independent `_extract_year_hint()` round-trip check** — imported
+`reel2movie.tmdb.resolver._extract_year_hint` directly and called it on
+sample strings in the exact shape the detector produces
+(`f"{title} ({year})"` or bare `title`):
+`'Inception (2010)' -> 2010`, `'Interstellar' -> None`,
+`'The Matrix (1999)' -> 1999`, `'Movie With No Year At All' -> None`,
+`'Weird (abc)' -> None` (non-digit parenthetical correctly ignored). Also
+checked a pathological double-`(YYYY)` string
+(`'Se7en (1995) (2010)' -> 2010`, i.e. it picks the **last** match) purely
+as a sanity check of `_extract_year_hint` itself — not a real concern for
+this module, since `VisionLLMPosterDetector.detect()` only ever appends at
+most one `(year)` suffix, so this edge case can't occur in this detector's
+actual output. **Round-trip confirmed correct.**
+
+**`/code-review` findings:**
+
+1. **(Non-blocking)** `pyproject.toml`'s unpinned `anthropic` dependency
+   (same finding as above, surfaced independently by the code-review pass
+   too) — real risk for future installs, not a bug in the current
+   environment/tests. Tracked as a follow-up, not reopening this subtask.
+2. **(Non-blocking)** `VisionLLMPosterDetector.detect()`'s year coercion
+   (lines ~222-228) handles `int`, digit-only `str`, and excludes `bool`,
+   but a JSON **float** year (e.g. `"year": 2010.0`, which some models emit
+   despite being asked for an integer) falls through to
+   `elif not isinstance(year, int): year = None` and is silently dropped
+   rather than coerced. This degrades gracefully (per spec: no crash, the
+   candidate is still returned, just without the year hint — the designed
+   fallback behavior for "can't make sense of this field") rather than
+   corrupting anything, so it's non-blocking, but worth a one-line fix
+   (`isinstance(year, (int, float)) and not isinstance(year, bool)` with
+   `int(year)`) in a future pass if real traffic shows models emitting
+   float years.
+
+**`/ponytail:ponytail-review` findings:**
+
+1. **(Non-blocking, informational)** `L58-62,79-85`: `yagni:` the
+   `_EXTENSION_TO_MEDIA_TYPE` dict supports `.png` in addition to `.jpg`/
+   `.jpeg`, but the only real caller (`frame_sampler.py`) only ever
+   produces `.jpg` today — this is speculative generality for a second
+   image format that doesn't exist yet. Replacement: could hardcode
+   `image/jpeg` and drop the dict/lookup/`ValueError` branch (~8 fewer
+   lines) until a second frame-producing path actually needs it. Not
+   treated as blocking: the code is already explicit and self-documenting
+   about this choice (module docstring + inline comment both call it out
+   as deliberate forward-compatibility, not an accident), it's a handful of
+   lines, and it directly prevents a real failure mode (silently mislabeling
+   a non-JPEG image's media type to the API) rather than adding speculative
+   behavior — a defensible judgment call either way. `net: -8 lines
+   possible, not taken.`
+2. No other over-engineering found — the Protocol-based DI
+   (`VisionChatClient`), the three-layer malformed-response handling, and
+   the confidence-mapping dict all match this codebase's established,
+   plan-mandated patterns (Protocol seams throughout, graceful-degradation
+   requirement explicit in the subtask spec) rather than being
+   module-local speculative abstraction. Lean otherwise.
+
+**Manual spec/Protocol-contract check:**
+
+- `VisionLLMPosterDetector.detect(frame: FrameSample) -> list[Candidate]`
+  structurally satisfies `core.protocols.PosterDetector` as required.
+- `AnthropicVisionChatClient` never imports `core.models`/`core.protocols`;
+  `VisionLLMPosterDetector` never imports `anthropic` — confirmed by
+  reading the file's imports, matching the module docstring's claimed
+  separation.
+- Neither class calls `config.get_anthropic_key()` — confirmed, API key is
+  a constructor parameter only, matching `config.py`'s separation-of-
+  concerns rule.
+- All `Candidate`s returned have `source=SourceTag.FRAME_VISUAL` —
+  confirmed in code and by the dedicated test.
+- No live API/network calls anywhere in the test file — confirmed; the
+  `anthropic.Anthropic` class itself is patched out in
+  `TestAnthropicVisionChatClient`, and `VisionLLMPosterDetector` tests only
+  ever touch `FakeVisionChatClient`.
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+(none yet)
+
+### Open questions / risks
+
+- **Real Anthropic SDK response shape, not verified against a live call**
+  (this sandbox has no real `ANTHROPIC_API_KEY`): `AnthropicVisionChatClient`
+  assumes `response.content` is iterable, each element has a `.type`
+  attribute, and text-bearing elements have a `.text` attribute holding a
+  plain `str` — modeled on the `anthropic` Python SDK's documented
+  `Message.content: list[ContentBlock]` shape (`TextBlock` has `.type ==
+  "text"` and `.text`), and on this same skill's own README excerpt read
+  before writing this module. The unit tests mock this shape with
+  `types.SimpleNamespace` objects rather than the SDK's real typed
+  `TextBlock`/`Message` classes, so a real response whose attribute names
+  or nesting differ even slightly from this assumption would not be caught
+  until an actual live call is made (deferred to whichever subtask first
+  runs a real smoke test — per the plan, that's expected no earlier than
+  subtask 8's CLI smoke test, once the user supplies a real
+  `ANTHROPIC_API_KEY`).
+- **Model id `"claude-sonnet-5-5"`**: used exactly as specified in the
+  subtask instructions (a real, current Claude 5 family model id, not a
+  deprecated/older name). Not independently verifiable against a live
+  `models.list()`/`models.retrieve()` call from this sandbox.
+- **`output_config={"effort": "low"}`**: added as a cost-conscious default
+  for what's a simple, repeated, low-stakes image-classification call
+  (per current Claude API cost-tuning guidance: low effort is a good fit
+  for "subagents or simple tasks"). Not validated against a real response
+  for quality — if a later live smoke test shows frames are frequently
+  missed or misread at `low` effort, this is the first knob to try
+  raising (e.g. to the model's default), isolated in one place in
+  `AnthropicVisionChatClient.chat`.
+- **Markdown-fenced JSON is treated as malformed (returns `[]`), not
+  unwrapped.** The prompt explicitly instructs the model not to use code
+  fences, so this is expected to be rare in practice; a deliberate choice
+  not to add fence-stripping logic preemptively (unasked-for defensive
+  complexity) — if live testing in a later subtask shows the model
+  frequently ignores this instruction, stripping ```` ```json ... ``` ````
+  wrappers before parsing would be a small, isolated follow-up fix in
+  `VisionLLMPosterDetector.detect`.
+- **Confidence-mapping numbers (0.8/0.5/0.3) are not tuned against any
+  real vision-LLM output** — same caveat `tmdb/scoring.py`'s
+  `MIN_MATCH_SCORE` open question already flagged for its own constant:
+  picked as "sensible defaults," isolated in one `CONFIDENCE_MAP` dict
+  specifically so they're easy to revisit once `pipeline/waterfall.py`
+  (subtask 7) defines its actual confidence gate and real frames/responses
+  are available to check against.
+- **No retry/backoff logic in `AnthropicVisionChatClient`** — a transient
+  network error or rate limit on one frame's vision call will raise
+  straight through `chat()` to `VisionLLMPosterDetector.detect()`, which
+  does **not** catch it (only JSON-parsing failures are treated as
+  "graceful" here — a failed *API call* is a different failure mode than
+  a malformed *response*, and the subtask spec only asked for the latter
+  to degrade gracefully). Whether the caller (`pipeline/waterfall.py`,
+  subtask 7) should catch/retry/skip-this-frame on a raised API error is
+  an open design question for that subtask, not resolved here.
+- Per the plan's loop, this subtask's `### Review findings` /
+  `### Fixes applied` sections are placeholders — a `/code-review` +
+  `/ponytail:ponytail-review` pass (plus the usual manual spec check and
+  independent test re-run) is the next step before this can be marked
+  `status: done` and committed.
