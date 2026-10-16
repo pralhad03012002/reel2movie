@@ -282,3 +282,223 @@ VERDICT: ACCEPTABLE
   uses `monkeypatch`, which pytest automatically reverts after each test,
   so there's no risk of leaking a fake value into the environment of
   later test runs in the same process.
+
+---
+
+## Subtask 2 — tmdb/ — status: done
+
+### What's built
+Files created:
+- `reel2movie/tmdb/__init__.py` — package docstring only.
+- `reel2movie/tmdb/client.py` — `TMDBHttpClient` (deliberately not named
+  `TMDBClient`, to avoid colliding with the Protocol of that name in
+  `core/protocols.py`). Takes a bearer token in `__init__`; does **not**
+  call `config.get_tmdb_token()` itself, so it stays constructible with
+  any token string for testability (per spec — that's a later
+  `build_default_pipeline_deps()`'s job). `search_movie(query, year=None)`
+  calls `GET https://api.themoviedb.org/3/search/movie` via `requests.get`
+  with `Authorization: Bearer <token>` header, `query` param always, `year`
+  param only when given. Maps each `results[]` item to a `TMDBSearchResult`
+  with `original_rank` = 0-indexed position in the response array. A
+  module-level `_parse_year()` helper extracts just the year out of TMDB's
+  `release_date` string (`"1999-03-30"` → `1999`), returning `None` on an
+  empty/unparseable string rather than raising. Calls
+  `response.raise_for_status()` unconditionally — HTTP errors propagate to
+  the caller rather than being swallowed.
+- `reel2movie/tmdb/scoring.py` — `score_result(query, year_hint, result)`
+  implements the plan's exact formula: `0.65 * title_similarity + 0.25 *
+  rank_bonus + 0.10 * year_bonus`, with `title_similarity =
+  rapidfuzz.fuzz.WRatio(query, result.title) / 100`, `rank_bonus = 1 / (1 +
+  result.original_rank)`, `year_bonus = 1.0 if year_hint and result.year ==
+  year_hint else 0.0`. `pick_best(query, year_hint, results)` returns the
+  argmax by `score_result`, or `None` if `results` is empty or the best
+  score is below `MIN_MATCH_SCORE = 0.5` (named constant, one-line comment:
+  "a reasonable floor, not derived from any real data").
+- `reel2movie/tmdb/resolver.py` — `resolve_candidate(candidate, client)`,
+  typed against the `TMDBClient` Protocol from `core/protocols.py`
+  (structural typing), not the concrete `TMDBHttpClient`, so tests/later
+  callers can pass any fake. A local `_extract_year_hint()` helper uses a
+  simple `\((\d{4})\)` regex to pull an obvious parenthesized year out of
+  `candidate.raw_text` (e.g. `"The Matrix (1999)"` → `1999`); this is
+  intentionally not real date parsing, just a cheap hint for the TMDB query
+  + scoring. Calls `client.search_movie(candidate.raw_text, year=year_hint)`,
+  then `pick_best()`, then maps the winning `TMDBSearchResult` to a
+  `ResolvedMovie` (dropping `popularity`/`original_rank`, adding
+  `match_score` from `score_result()`). Returns `None` when nothing
+  resolves — per flow.md, it's the caller's (a later pipeline subtask's)
+  job to decide to keep the candidate with `tmdb=None` rather than
+  dropping it; this function only signals "nothing resolved."
+- `tests/unit/tmdb/__init__.py` — empty, for pytest package discovery.
+- `tests/unit/tmdb/test_client.py` — mocks `reel2movie.tmdb.client.requests.get`
+  (via `unittest.mock.patch`; no new dev dependency added, plain
+  `unittest.mock` was sufficient) with canned TMDB-shaped JSON. Covers: the
+  `Authorization: Bearer <token>` header is set correctly, `query` param is
+  always passed, `year` param is passed only when given, the correct
+  endpoint URL is hit, field mapping into `TMDBSearchResult` (including year
+  parsing from `release_date`, and the empty-`release_date` → `year=None`
+  case), `original_rank` correctness across multiple results, and that an
+  HTTP error (`raise_for_status` side effect) propagates as `requests.HTTPError`
+  rather than being swallowed.
+- `tests/unit/tmdb/test_scoring.py` — pure function tests, no mocking:
+  exact title match scores higher than a loose match; a matching year hint
+  boosts the score relative to no hint; a wrong year hint gives no bonus
+  (same score as no hint); earlier rank scores higher than later rank;
+  `pick_best` returns `None` on empty results and on all-low-confidence
+  results; `pick_best` returns the correct argmax; a sanity check that
+  `MIN_MATCH_SCORE` is a float in `(0, 1)`.
+- `tests/unit/tmdb/test_resolver.py` — a `FakeTMDBClient` (not the real
+  `TMDBHttpClient`) recording the `query`/`year` it was called with and
+  returning a canned `TMDBSearchResult` list. Covers: year extraction from
+  candidate text (`"The Matrix (1999)"` → hint `1999` passed through to
+  `search_movie`), no year hint when absent, correct `ResolvedMovie`
+  field mapping (including that `popularity`/`original_rank` are absent on
+  the result via `hasattr` checks), `None` on an empty result list, and
+  `None` when the best available result is low-confidence.
+
+Ran `python3 -m pytest tests/unit -q` (Subtask 0 + 1's existing tests plus
+the new ones):
+
+```
+....................................................                      [100%]
+52 passed in 0.46s
+```
+
+(33 from Subtasks 0+1 + 19 new in `tests/unit/tmdb/`, confirming nothing
+added here broke earlier subtasks' tests.)
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (medium, forked) on the current diff
+(`reel2movie/tmdb/{__init__,client,scoring,resolver}.py` +
+`tests/unit/tmdb/`), `/ponytail:ponytail-review` on the same diff, a manual
+read of `client.py`/`scoring.py`/`resolver.py` against the subtask spec,
+`core/protocols.py`, and `vast-wobbling-owl.md`'s scoring formula/auth-style
+decisions, and a fresh `python3 -m pytest tests/unit -q` run (52 passed,
+confirmed independently, not just trusted from the build report).
+
+**From `/code-review` (correctness/efficiency):**
+- **Non-blocking** — `resolver.py` L33-35 / `scoring.py` L26: the
+  parenthesized year that `_extract_year_hint()` pulls out of
+  `candidate.raw_text` is never stripped from the text itself, so the same
+  unstripped `raw_text` (e.g. `"The Matrix (1999)"`) is sent both as the
+  TMDB search query and as the `fuzz.WRatio(query, result.title)` comparand
+  against TMDB's clean title (`"The Matrix"`). Confirmed intentional/tested
+  behavior, not an oversight — `test_resolver.py` L49 explicitly asserts
+  `client.last_query == "The Matrix (1999)"`. `WRatio` is specifically
+  designed to handle differing-length strings via partial-ratio weighting,
+  so the real-world score dilution is likely small, but it's a genuine
+  design tension: the year-hint extraction was meant to add signal, yet the
+  unstripped text feeding `title_similarity` could quietly cost some of
+  that signal back for exactly the candidates that have an explicit year.
+  Flagging as a risk to watch once this is exercised against live TMDB
+  data in a later subtask, not as a spec violation (the plan doesn't
+  specify stripping).
+- **Non-blocking** — `scoring.py` L39-41 / `resolver.py` L45:
+  `score_result()` is computed redundantly — twice inside `pick_best()`
+  (once per result inside `max()`'s key, once more for the winner to check
+  `MIN_MATCH_SCORE`), and a third time in `resolve_candidate()` to get
+  `match_score` for the same `(query, year_hint, best)` triple. Not a
+  correctness bug (all three computations are deterministic and agree),
+  just wasted `rapidfuzz` calls on every resolution.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- `scoring.py:L36-42`: `shrink:` `pick_best` recomputes `score_result` for
+  the winner after `max()` already found it. Score once per result and
+  reuse: `scored = [(score_result(query, year_hint, r), r) for r in
+  results]`; `best_score, best = max(scored, key=lambda p: p[0])`; `return
+  best if best_score >= MIN_MATCH_SCORE else None`.
+- `resolver.py:L45`: `yagni:` third recomputation of the same score to get
+  `match_score`. Have `pick_best` (or a thin wrapper) hand back the score
+  it already computed alongside the result, so `resolve_candidate` doesn't
+  call `score_result` again.
+- Everything else (the `TMDBHttpClient`/`_parse_year` split, the
+  `_extract_year_hint` regex helper, the three test files' structure) is
+  load-bearing and already minimal — no reinvented stdlib, no unneeded
+  dependency, no speculative abstraction.
+- `net: -3 lines possible` (mostly removes wasted computation, not bulk).
+
+**Manual verification (`client.py`/`scoring.py`/`resolver.py` vs. spec,
+`core/protocols.py`, and `vast-wobbling-owl.md`):**
+- Confirmed `TMDBHttpClient.__init__(self, bearer_token: str)` takes the
+  token directly as a constructor argument; confirmed by reading the whole
+  module that `reel2movie.config` / `get_tmdb_token()` is never imported or
+  called anywhere in `tmdb/` — loading the token from the environment stays
+  the caller's job, per the plan.
+- Confirmed `search_movie` sends `Authorization: Bearer <bearer_token>`
+  (client.py L58) against `https://api.themoviedb.org/3/search/movie`
+  (client.py L14, L56) — matches the plan's v4 Bearer auth-style decision,
+  not the older v3 `api_key` query-param style, and hits `search/movie`,
+  not `search/multi`.
+- Confirmed the scoring formula matches the spec exactly: `0.65 *
+  title_similarity + 0.25 * rank_bonus + 0.10 * year_bonus` (scoring.py
+  L29), with `title_similarity = fuzz.WRatio(query, result.title) / 100`,
+  `rank_bonus = 1 / (1 + result.original_rank)` (correctly decreasing with
+  later rank), `year_bonus = 1.0` only when `year_hint` is truthy *and*
+  `result.year == year_hint` (correctly 0.0 on mismatch or no hint).
+- Confirmed `resolve_candidate(candidate: Candidate, client: TMDBClient)`
+  (resolver.py L25) is typed against the `TMDBClient` Protocol imported
+  from `core/protocols.py` (structural typing), never against the concrete
+  `TMDBHttpClient` class — matches the plan's DI rationale and is exactly
+  what lets `tests/unit/tmdb/test_resolver.py`'s `FakeTMDBClient` stand in
+  without inheriting anything.
+- Confirmed `_parse_year()` (client.py L17-30) handles all three named edge
+  cases correctly without raising: missing `release_date` key (`.get()`
+  returns `None`, caught by the `if not release_date` falsy check), empty
+  string (same falsy check), and a malformed/non-numeric date string (the
+  `int(year_part)` `ValueError` is caught and returns `None`). Traced by
+  hand (not just by reading the one empty-string test case) against
+  additional cases not in the test suite — leading/trailing whitespace
+  (`int()` strips it) and a string with no `-` at all (`split("-", 1)[0]`
+  degrades gracefully to the whole string) — both still behave correctly.
+- **Non-blocking, newly noted** — `client.py` L56-60: `requests.get()` is
+  called with no `timeout`. A stalled/unresponsive TMDB endpoint would hang
+  `search_movie()` (and therefore `resolve_candidate()`) indefinitely
+  rather than failing fast. Not specified in the plan, but worth adding
+  before this hits a real pipeline run with many candidates.
+
+**Independent test run:**
+- `python3 -m pytest tests/unit -q` → `52 passed`, run directly in this
+  review pass, not just trusted from the build-subagent's report.
+
+No blocking findings. The formula, auth style, endpoint, Protocol typing,
+and year-parsing edge cases all check out against the spec exactly;
+remaining findings are efficiency/robustness polish, not deviations from
+`vast-wobbling-owl.md` or incorrect behavior for any case in the current
+test suite.
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+(none yet)
+
+### Open questions / risks
+- **TMDB response shape assumptions** (can't hit the live TMDB API from
+  this sandbox to verify): assumed `results[].release_date` is always a
+  string key present on every item (possibly empty `""`, handled via
+  `_parse_year`'s falsy check), `results[].poster_path` can be `null`/
+  absent (handled via `.get()`), and `results[].popularity` /
+  `.overview` are always present with sensible defaults if missing
+  (`0.0` / `""` via `.get(..., default)`). These match TMDB's documented
+  `search/movie` response shape from public API docs as remembered, but
+  have not been verified against a live call.
+- **`year` query param type**: passed as a Python `int` straight into
+  `requests`' `params` dict; `requests` will stringify it when building
+  the query string, which should match TMDB's expected `year` param format,
+  but this wasn't verified against a live request.
+- **`MIN_MATCH_SCORE = 0.5` threshold**: picked as "a reasonable floor,"
+  not tuned against any real TMDB result set. If later subtasks
+  (`pipeline/`) see too many false negatives (confident real matches
+  scoring just under 0.5) or false positives (wrong matches sneaking
+  over 0.5), this constant is the first thing to revisit — it's isolated
+  in one place (`tmdb/scoring.py`) specifically so it's easy to tune later.
+- **Year-hint regex** (`\((\d{4})\)`) only catches a parenthesized year
+  directly in the candidate's raw text (e.g. from `text_extraction/`'s
+  `"Title (YYYY)"` pattern per the plan). It will miss a year mentioned in
+  prose elsewhere in the same string (e.g. "the 1999 movie The Matrix") —
+  accepted as a deliberate scope limit per the subtask spec ("a simple
+  regex... don't duplicate real date parsing"), not a bug.
+- `TMDBHttpClient.search_movie` does not retry or cache; every call hits
+  the network fresh. No rate-limiting/backoff logic was added since it
+  wasn't in scope for this subtask and the plan doesn't mention it — worth
+  a look if a later subtask resolves many candidates per run and TMDB's
+  rate limits become a real concern.
