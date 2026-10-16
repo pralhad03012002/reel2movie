@@ -145,3 +145,140 @@ VERDICT: ACCEPTABLE
   under `tests/` — no `tests/unit/core/__init__.py`-style namespace packages
   elsewhere were assumed since this is a fresh repo with no prior tests/
   convention.
+
+---
+
+## Subtask 1 — config.py — status: done
+
+### What's built
+Files created:
+- `reel2movie/config.py` — three env-var-backed getters, no secret values
+  hardcoded anywhere:
+  - `get_tmdb_token() -> str` — reads `TMDB_API_KEY` from `os.environ`,
+    raises `RuntimeError` (message points at `.env.example`) if unset or
+    empty (empty string treated the same as unset).
+  - `get_anthropic_key() -> str` — same pattern for `ANTHROPIC_API_KEY`.
+  - `get_instagram_cookies_file() -> Path | None` — reads
+    `INSTAGRAM_COOKIES_FILE`; optional, returns `None` if unset/empty
+    rather than raising (not every pipeline run needs live Instagram
+    access, e.g. unit tests use recorded fixtures); returns a
+    `pathlib.Path` if set. Deliberately does **not** validate the file
+    exists — per the subtask spec, that's the `ingest/` module's job when
+    it actually tries to use the file.
+- `tests/unit/test_config.py` — sits directly under `tests/unit/` (no
+  `core`-style subpackage, since `config.py` isn't part of a subpackage).
+  Covers, for each getter: the set/returns-expected-value case, the
+  unset/raises-`RuntimeError`-with-message case (`pytest.raises(...,
+  match=...)`), and an explicit empty-string case treated as unset. For
+  the optional getter, also covers the unset-and-empty → `None` cases and
+  the set → `Path` case. All env var manipulation goes through
+  `monkeypatch.setenv` / `monkeypatch.delenv`; no real credentials appear
+  anywhere in the test file or `config.py` itself.
+
+Verified `.env.example` and `.gitignore` (written during scaffolding, not
+by me) rather than rewriting them: `.gitignore` excludes `.env` (and does
+**not** exclude `.env.example`, so the example file stays tracked);
+`.env.example` documents exactly `TMDB_API_KEY`, `ANTHROPIC_API_KEY`,
+`INSTAGRAM_COOKIES_FILE` with no real values. Both already correct — no
+changes made to either file.
+
+Ran `python3 -m pytest tests/unit -q` (runs Subtask 0's existing tests
+plus the new ones):
+
+```
+.................................                                        [100%]
+33 passed in 0.07s
+```
+
+(24 from Subtask 0's `tests/unit/core/` + 9 new in `tests/unit/test_config.py`,
+confirming nothing added here broke Subtask 0's tests.)
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (medium) on the current diff (`reel2movie/config.py`,
+`tests/unit/test_config.py`, plus this file's own doc update), `/ponytail:ponytail-review`
+on the same diff, a manual read of `config.py` against the subtask spec and
+`vast-wobbling-owl.md`, a repo-wide grep for hardcoded secrets, and a fresh
+`python3 -m pytest tests/unit -q` run (33 passed, confirmed independently).
+
+**From `/code-review` (correctness):**
+- No defect found. The three getters are straightforward `os.environ.get`
+  reads with consistent empty-string-as-unset handling, each covered by a
+  matching test; no existing callers yet so no cross-file breakage is
+  possible. One edge case noted but deemed not actionable: a whitespace-only
+  env var (e.g. `TMDB_API_KEY=" "`) passes the `if not value` check and would
+  be returned as a seemingly-valid token — **non-blocking**, speculative and
+  low-consequence for local dev config.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- **Non-blocking** — `config.py` L16-41: `get_tmdb_token()` and
+  `get_anthropic_key()` are two copies of the identical 6-line "read env var,
+  raise `RuntimeError` if empty" pattern, differing only in the variable name.
+  Could collapse into one `_require_env(name: str) -> str` helper called by
+  both, saving ~8 lines. Not wrong, just duplicated.
+- **Non-blocking** — `tests/unit/test_config.py` L20-51: 6 near-identical
+  tests (3 patterns × 2 getters: set/returns, unset/raises, empty/raises)
+  differing only in the var name and function under test. Could collapse via
+  `@pytest.mark.parametrize`. Same pattern already flagged (and deferred) in
+  Subtask 0's review.
+- Everything else (the optional-getter's distinct None-returning logic, the
+  `Path` wrapping, the module/function docstrings) is load-bearing per spec,
+  not speculative.
+
+**Manual spec check (`config.py` vs. subtask spec + `vast-wobbling-owl.md`):**
+- Confirmed `get_tmdb_token() -> str` reads `TMDB_API_KEY`, raises
+  `RuntimeError` (pointing at `.env.example`) on unset or empty.
+- Confirmed `get_anthropic_key() -> str` reads `ANTHROPIC_API_KEY`, same
+  raise-on-unset/empty behavior.
+- Confirmed `get_instagram_cookies_file() -> Path | None` reads
+  `INSTAGRAM_COOKIES_FILE`, returns `None` on unset/empty, **never raises**,
+  returns a `pathlib.Path` when set, does not validate file existence (left
+  to `ingest/`, per spec).
+- Confirmed `.env.example` documents exactly the three expected var names
+  with no real values, and `.gitignore` excludes `.env` but not
+  `.env.example`.
+
+**Secret-hardcoding check (critical, given the earlier real-token leak in
+chat):**
+- Ran `grep -rEn "eyJ[A-Za-z0-9_-]{10,}"` (JWT-header-shaped strings, matching
+  the structure of the TMDB v4 token that was pasted into chat earlier) and
+  `grep -rEn "\b[0-9a-fA-F]{32}\b"` (literal 32-char hex, a common raw-API-key
+  shape) across the entire repo, excluding `.git`. **Zero matches.** No
+  hardcoded secret/token of either shape exists anywhere in the codebase.
+  `config.py` and `test_config.py` only ever use fake placeholder strings
+  (e.g. `"fake-tmdb-token-value"`) via `monkeypatch`, never real credentials.
+
+**Independent test run:**
+- `python3 -m pytest tests/unit -q` → `33 passed` (24 from Subtask 0 +
+  9 from `test_config.py`), run directly, not just trusted from the
+  build-subagent's report.
+
+No blocking findings.
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+(none yet)
+
+### Open questions / risks
+- `get_instagram_cookies_file()` treats an empty-string env var the same
+  as unset (returns `None`). This matches `get_tmdb_token()` /
+  `get_anthropic_key()`'s empty-string-is-unset handling for consistency,
+  but wasn't explicitly specified for the optional getter — flagging in
+  case a later subtask wants a stricter distinction between "var unset"
+  and "var set to empty string".
+- Open question for `ingest/` (subtask 4): `get_instagram_cookies_file()`
+  returns a `Path` with zero validation (doesn't check existence,
+  readability, or Netscape-cookie-file format). The ingest module's
+  `InstagramIngestor` / `ytdlp_client.py` wrapper needs to decide what to
+  do when the configured path doesn't exist or isn't readable — e.g.
+  raise a clear error before handing it to `yt_dlp.YoutubeDL`, rather than
+  letting yt-dlp's own error surface opaquely. Also unresolved: what
+  happens when `get_instagram_cookies_file()` returns `None` entirely —
+  presumably `ingest/` should allow cookie-less operation for any ingest
+  path that doesn't need authenticated access (if any), or raise its own
+  clear error if cookies are mandatory for all Instagram ingestion.
+- No live/real env vars were touched by this subtask's tests — every test
+  uses `monkeypatch`, which pytest automatically reverts after each test,
+  so there's no risk of leaking a fake value into the environment of
+  later test runs in the same process.
