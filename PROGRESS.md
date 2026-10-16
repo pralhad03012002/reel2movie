@@ -502,3 +502,467 @@ VERDICT: ACCEPTABLE
   wasn't in scope for this subtask and the plan doesn't mention it — worth
   a look if a later subtask resolves many candidates per run and TMDB's
   rate limits become a real concern.
+
+---
+
+## Subtask 3 — text_extraction/regex_extractor.py — status: done
+
+### What's built
+Files created:
+- `reel2movie/text_extraction/__init__.py` — package docstring only.
+- `reel2movie/text_extraction/regex_extractor.py` — `RegexCandidateExtractor`
+  (structurally satisfies `core.protocols.CandidateExtractor`, no
+  inheritance). Pure `re`/string logic, no IO, no network, no NLP/ML
+  dependency (stdlib `re` only, per spec). `extract(text, source) ->
+  list[Candidate]` runs four regex passes over the text, in confidence
+  order, each pass skipping any match that overlaps a span already
+  claimed by an earlier (higher-priority) pass via a small `_claim()`
+  helper — this is what prevents e.g. `"Parasite" (2019)` from producing
+  both a HIGH `"Parasite (2019)"` candidate *and* a redundant MEDIUM
+  `"Parasite"` candidate from the plain-quote pass:
+  1. **Quoted `"Title" (YYYY)`** → HIGH (0.9). Matching-quote-type only
+     (`"..."` or `'...'`, not mixed), capped at 100 chars, no newlines.
+  2. **Unquoted `Title (YYYY)`** → HIGH (0.9). Requires every word in the
+     title to start with an uppercase letter, immediately (optional
+     whitespace only) followed by `(YYYY)`.
+  3. **Bare quoted span, no year** → MEDIUM (0.6). Same matching-quote-type
+     /length/no-newline rule as pass 1, just without the trailing-year
+     requirement.
+  4. **Numbered-list line (`"1. Title"` / `"2) Title"`)** → MEDIUM (0.6).
+     Captures the rest of the line after the `\d+[.)]\s+` marker; strips
+     whitespace, matching outer quotes, and trailing `.,;:` punctuation.
+  Output format: `Candidate.raw_text` is the cleaned title with quote
+  marks stripped, and for the two HIGH patterns is re-assembled as
+  exactly `"Title (YYYY)"` (title + a single space + literal parens around
+  the 4-digit year) — confirmed by reading `reel2movie/tmdb/resolver.py`
+  first: its `_extract_year_hint()` looks for `\((\d{4})\)` via
+  `re.search`, so this output is picked up correctly regardless of
+  anything before it in the string. `source: SourceTag` is passed straight
+  through to every returned `Candidate`, never hardcoded, so the same
+  extractor instance is reusable for both `SourceTag.CAPTION` and
+  `SourceTag.CREATOR_COMMENT` callers per the plan.
+- `tests/unit/text_extraction/__init__.py` — empty, for pytest discovery.
+- `tests/unit/text_extraction/test_regex_extractor.py` — 12 tests:
+  quoted-title-with-year → HIGH; unquoted-title-with-year → HIGH; a direct
+  round-trip check that `reel2movie.tmdb.resolver._extract_year_hint()`
+  correctly reads the year back out of a HIGH candidate's `raw_text`
+  (imports the resolver's private helper specifically to verify this
+  cross-module contract, not just assert the string shape by eye); bare
+  quoted title (no year) → MEDIUM, quotes stripped; a 3-line numbered list
+  → all 3 titles returned as separate MEDIUM candidates; a dismissive
+  sentence (`"not as good as 'The Godfather'"`) → still extracts (asserts
+  the known limitation's behavior, not a filtered-out assertion); a short
+  ambiguous quoted title (`"It"`) → still extracted as MEDIUM; empty string
+  → `[]`; plain no-signal prose → `[]`, no crash; `source` echoed into
+  every candidate for both `SourceTag` values used; multiple HIGH
+  candidates in one block (`'"Parasite" (2019) and Inception (2010)'`) →
+  both returned; return type is `Candidate` instances.
+
+Ran `python3 -m pytest tests/unit -q`:
+
+```
+................................................................          [100%]
+64 passed in 0.43s
+```
+
+(52 from Subtasks 0-2 + 12 new in `tests/unit/text_extraction/`, confirming
+nothing added here broke any earlier subtask's tests.)
+
+### Confidence-tiering choices and rationale
+
+- **HIGH (0.9) for `"Title (YYYY)"`, quoted or unquoted** — per spec, this
+  is the least ambiguous signal: both a title-shaped string and an
+  explicit year are present together, which is exactly the hint
+  `resolver.py`'s `_extract_year_hint()` + TMDB's `year` search param are
+  built to exploit.
+- **MEDIUM (0.6) for bare quoted spans and numbered-list lines** — both
+  have an explicit structural delimiter (quote marks, or a list marker)
+  that signals "this is a title-like unit," just without a year to
+  disambiguate it further. Treated as equally confident to each other
+  since neither has a stronger claim than the other without a year.
+- **Bare, unmarked title-case runs (no quotes, no year, no list marker)
+  are skipped entirely — not tagged LOW.** This was the explicitly
+  open "your call" choice in the spec. Chose to skip rather than emit a
+  0.3-confidence guess because: (1) this extractor is reused for both
+  captions *and* raw creator comments, which are free-form natural-
+  language text — any capitalized proper noun or sentence-initial phrase
+  would otherwise become a "candidate," producing a high false-positive
+  rate; (2) the pipeline's waterfall (subtask 7) falls through to the next
+  source only when the current one yields nothing *confident* — returning
+  a flood of noisy LOW candidates for ordinary prose risks the waterfall
+  treating a caption with zero real signal as "handled" by a garbage
+  guess, rather than correctly falling through to the creator's comment or
+  the visual fallback. Skipping keeps this module's output meaningful-
+  signal-only and pushes the "is there anything here at all" judgment call
+  to the next pipeline stage, which has more context (e.g. whether the
+  comment/visual steps found anything better). This materially affects
+  waterfall behavior as the spec flagged it would — documented here per
+  that instruction.
+
+### Accepted limitation — sentiment/dismissive-mention false positives
+
+Per `brainstorm.md`'s explicit "Known hard cases" list: a caption/comment
+that *mentions* a title only to dismiss it (`"not as good as 'X'"`) is
+**not** filtered out. Any quoted (or `Title (YYYY)`-shaped) span inside such
+a sentence is still extracted as a normal candidate at its usual
+confidence tier — this is an accepted, by-design limitation, not a bug.
+No sentiment/intent analysis was attempted (out of scope per spec); the
+only thing guaranteed here is that this case never crashes or produces
+malformed output, which `test_dismissive_sentence_with_quoted_title_is_still_extracted`
+confirms by asserting the extraction *does* happen.
+
+### Review findings (latest pass)
+
+This section holds two review passes, kept distinct rather than letting the
+newer one overwrite the older (per handoff-logging convention: never destroy
+history). **Cycle 0** (below) is the original pre-fix review; its outcome is
+narrated in `### Fixes applied` above this section was written and is kept
+here verbatim for the record. **Cycle 2** (further down) is a fresh,
+from-scratch re-review of the current working tree — including both
+`text_extraction/regex_extractor.py` and the one-line `tmdb/resolver.py`
+companion fix — run independently of cycle 0/1, not a continuation of them.
+
+#### cycle 0 review (historical — pre-fix; see "Fixes applied" above for what changed in response)
+
+Reviewed via `/code-review` (medium, forked) on the current diff
+(`reel2movie/text_extraction/{__init__,regex_extractor}.py` +
+`tests/unit/text_extraction/`), `/ponytail:ponytail-review` on the same diff,
+a manual read of `regex_extractor.py` against `core/protocols.py`'s
+`CandidateExtractor` contract and a hand-traced round-trip against
+`tmdb/resolver.py`'s `_extract_year_hint()`, and a fresh
+`python3 -m pytest tests/unit -q` run (64 passed, confirmed independently —
+not just trusted from the build report). Both `/code-review` findings below
+were additionally reproduced by direct script execution (not just read off
+the review output), since the task explicitly called for verifying rather
+than trusting the build report.
+
+**From `/code-review` (correctness):**
+- **Blocking** — `regex_extractor.py` L106-137 (`_UNQUOTED_TITLE_YEAR` pass
+  vs. the numbered-list pass, via shared `_claim()`): for a numbered-list
+  line whose title has a lowercase connector word before the year (e.g.
+  `"1. The Lord of the Rings (2001)"`), `_UNQUOTED_TITLE_YEAR` first claims
+  only the trailing `"Rings (2001)"` span (confirmed by hand-trace: the
+  all-caps-chain requirement breaks at "of", so the match starts fresh at
+  "Rings"). The numbered-list pass's full-line span then overlaps that
+  small claimed span, so `_claim()` rejects the *entire* line and the
+  correct MEDIUM candidate `"The Lord of the Rings"` is never emitted at
+  all. Net effect, reproduced directly:
+  ```
+  extractor.extract('5 movies like Inception:\n1. The Lord of the Rings (2001)\n2. Interstellar\n', SourceTag.CAPTION)
+  # -> [Candidate(raw_text='Rings (2001)', confidence=0.9), Candidate(raw_text='Interstellar', confidence=0.6)]
+  ```
+  Only a wrong, truncated title survives, at HIGH confidence — worse than
+  the existing "Open questions" note for this case (which only anticipated
+  the truncated HIGH match, not that the correct MEDIUM candidate also gets
+  silently dropped via the overlap-claim mechanism). This lands on exactly
+  the explicitly-accepted hard case from `brainstorm.md` ("multiple movies
+  in one reel / ranked list reels") and actively misleads a downstream TMDB
+  resolve with a confident-but-wrong query, rather than merely missing a
+  candidate (which would be an acceptable scope limit). Blocking because the
+  failure mode is "wrong confident answer," not "no answer."
+- **Non-blocking** — `regex_extractor.py` L91-104 /
+  `tmdb/resolver.py` `_extract_year_hint()`: when a quoted title's own text
+  contains a parenthesized 4-digit substring (e.g. a year mentioned inside
+  the quote), `_QUOTED_TITLE_YEAR`'s capture group `[^"\n]{1,100}` happily
+  includes it, and the resulting `raw_text` ends up with *two*
+  `(YYYY)`-shaped substrings. `_extract_year_hint()`'s `re.search` returns
+  the leftmost one, not the real trailing release year. Reproduced directly:
+  ```
+  extractor.extract('"Experience Paris (1920) like never before" (2023)', SourceTag.CAPTION)
+  # raw_text = 'Experience Paris (1920) like never before (2023)'
+  _extract_year_hint(raw_text)  # -> 1920, not 2023
+  ```
+  This contradicts the module docstring's claim that the HIGH-confidence
+  output "is picked up correctly regardless of anything before it in the
+  string." Non-blocking: narrow/rare input shape (a quoted title that
+  itself contains a parenthesized number), and the consequence is a
+  degraded year hint rather than a wrong confident resolution — the garbled
+  `raw_text` also gets sent as the TMDB query text itself, so title
+  similarity scoring is already compromised independent of the year hint.
+  Worth a quick fix (e.g. anchor the year extraction/regex to the *last*
+  `(YYYY)` in `raw_text`, or to the string's suffix) alongside the blocking
+  fix above, but not severe enough to block alone.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- `regex_extractor.py:L32-48`: `shrink:` the quote-matching sub-pattern
+  `(?:"([^"\n]{1,100})"|'([^'\n]{1,100})')` is duplicated verbatim between
+  `_QUOTED_TITLE_YEAR` and `_QUOTED_SPAN`, and the
+  `match.group(1) or match.group(2) or ""` extraction is repeated at L94 and
+  L122. Factor one `_QUOTE` sub-pattern constant reused by both compiled
+  regexes, plus a one-line `_quoted_text(m)` helper for the group
+  extraction.
+- `regex_extractor.py:L84-139`: `shrink:` `extract()` is four structurally
+  identical match → `_claim()` → build-`Candidate` blocks (14/12/9/9 lines),
+  differing only in pattern, confidence constant, and title formatting. A
+  single loop over `(pattern, confidence, title_fn)` config tuples would cut
+  this to roughly a third of the lines.
+- Everything else is in-scope and not flagged: pure stdlib `re`/string logic
+  only, no IO/network/NLP dependency pulled in, `_claim()` is a minimal
+  8-line interval-overlap check (nothing reinvented — stdlib has no
+  equivalent), `_Span` is a trivial type alias, `_clean_list_title` is a
+  plain 3-line helper. The 12 tests each cover a genuinely distinct
+  behavior, no near-duplicate boilerplate like earlier subtasks had.
+- `net: -20 lines possible` (both non-blocking).
+
+**Manual verification (done directly, not delegated):**
+- Read the whole of `regex_extractor.py`: confirmed every one of the four
+  `Candidate(...)` constructions uses `source=source` (the method's
+  parameter) — `source` is never hardcoded to `SourceTag.CAPTION` or any
+  other fixed value anywhere in the file.
+- Confirmed `extract("", source)` returns `[]` via the `if not text: return
+  []` guard, and traced that no branch in any of the four passes can raise
+  for ordinary string input (pure `re.finditer`/string ops, no indexing that
+  could go out of bounds); re-ran
+  `extractor.extract("just some plain lowercase text...", SourceTag.CREATOR_COMMENT)`
+  directly and confirmed `[]` with no exception.
+- Hand-traced the HIGH-confidence `raw_text` round-trip against
+  `tmdb/resolver.py`'s `_extract_year_hint()` (`r"\((\d{4})\)"` via
+  `re.search`): for the common case (title with no embedded parenthetical),
+  `f"{title} ({year})"` round-trips correctly — confirmed with
+  `'"Parasite" (2019)'` → year 2019. The round-trip breaks only in the edge
+  case documented as the non-blocking finding above.
+- Independently ran `python3 -m pytest tests/unit -q`: `64 passed`, matching
+  the build report's count exactly, run directly in this review pass.
+
+Cycle 0 outcome: **NEEDS FIXES** (addressed by `### Fixes applied` above —
+fix cycle 1 — producing the working tree re-reviewed below).
+
+#### cycle 2 review (current — fresh re-review of the post-fix working tree)
+
+Scope: the full current diff — `reel2movie/text_extraction/regex_extractor.py`
+(new file) plus the companion one-line change to the already-committed
+`reel2movie/tmdb/resolver.py` (`_extract_year_hint()`: `.search()` →
+`.findall()[-1]`). Run as a clean re-review, not a continuation of the cycle
+0/1 session: fresh `/code-review` (medium) and `/ponytail:ponytail-review`
+invocations against the current diff, plus independent manual verification
+(the fix's own claimed repro, the resolver's existing tests, an edge case the
+fix might have missed, and a from-scratch full-suite run).
+
+**Primary question — is the cycle 0 BLOCKING bug actually fixed? Yes, confirmed by direct reproduction:**
+```python
+extractor.extract('5 movies like Inception:\n1. The Lord of the Rings (2001)\n2. Interstellar\n', SourceTag.CAPTION)
+# -> [Candidate(raw_text='The Lord of the Rings (2001)', source=SourceTag.CAPTION, confidence=0.9),
+#     Candidate(raw_text='Interstellar', source=SourceTag.CAPTION, confidence=0.6)]
+```
+Exactly the two candidates the fix report claims — no dropped MEDIUM
+candidate, no truncated `"Rings (2001)"` HIGH candidate. The root-cause fix
+(adding connector words to `_UNQUOTED_TITLE_YEAR` so it claims the full
+title span itself, leaving nothing for the numbered-list pass to collide
+with) holds up under direct re-execution, not just re-reading the diff.
+
+**From `/code-review` (correctness) — three new findings, all reproduced, none blocking:**
+- **Non-blocking** — `regex_extractor.py` L32-55 (`_QUOTED_TITLE_YEAR` /
+  `_QUOTED_SPAN`): both quote regexes match straight ASCII quotes only
+  (`"`/`'`), not Unicode curly quotes (`“ ” ‘ ’`) that iOS/many keyboards
+  auto-substitute. Reproduced: `extractor.extract('Check out “Inception” (2010) tonight', SourceTag.CAPTION)`
+  → `[]`, not the expected HIGH `Inception (2010)`. Not in `brainstorm.md`'s
+  documented hard-case list. Judged non-blocking under the same standard
+  cycle 0 used: the failure mode is "no answer" (silent `[]`), not "wrong
+  confident answer" — the pipeline can still fall through to the next
+  waterfall source, it just loses this specific signal. Worth a follow-up
+  (add curly-quote variants to the quote character classes) but doesn't
+  block this subtask.
+- **Non-blocking** — `tmdb/resolver.py` `_extract_year_hint()` docstring:
+  the comment's claim that `raw_text` is "always" built as
+  `f"{title} ({year})"` is only true for the two HIGH-confidence candidate
+  paths. The two MEDIUM paths (`_QUOTED_SPAN`, `_NUMBERED_LIST`) set
+  `raw_text` to the bare title with **no** year appended at all — confirmed
+  by reading `regex_extractor.py` L126-144. So the "searching from the
+  right is unambiguous" justification doesn't universally hold for every
+  candidate source, only for HIGH ones; it just happens to be harmless for
+  MEDIUM candidates in the common case (no parenthesized year in the raw
+  title → `findall` returns `[]` → `None`, same as before). A contrived
+  MEDIUM candidate whose title itself contains two parenthesized years would
+  still get an arbitrary (last, not "real") year hint — no worse than the
+  old leftmost-match behavior, just not the clean invariant the docstring
+  claims. Cosmetic/documentation-accuracy issue, not a functional regression.
+- **Non-blocking** — `regex_extractor.py` L47-50 (`_UNQUOTED_TITLE_YEAR`):
+  the title-run capture group can exhibit quadratic-time backtracking on
+  long runs of capitalized words with no closing `(YYYY)` (measured ~2.4s on
+  a synthetic 4000-word all-caps input vs. ~30ms at Instagram's actual
+  ~2200-char caption cap). Latent risk only — not a demonstrated issue at
+  the input sizes this module is actually fed, per `brainstorm.md`/the
+  ingest subtask's caption-length bound.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity) — same two findings as cycle 0, still present, still non-blocking:**
+- `regex_extractor.py:L32-55`: `shrink:` the quote-matching sub-pattern is
+  still duplicated verbatim between `_QUOTED_TITLE_YEAR` and `_QUOTED_SPAN`,
+  and `match.group(1) or match.group(2) or ""` is still repeated at two
+  call sites. One `_QUOTE` constant + a 1-line `_quoted_text(m)` helper
+  would remove the duplication.
+- `regex_extractor.py:L98-144`: `shrink:` `extract()` is still four
+  structurally identical match → `_claim()` → build-`Candidate` blocks. A
+  loop over `(pattern, confidence, title_fn)` tuples would cut this to
+  roughly a third of the lines.
+- `tmdb/resolver.py`'s `.search()` → `.findall()[-1]` change itself: lean,
+  a 2-line diff, nothing to cut.
+- `net: -20 lines possible` (both findings carried over unchanged from cycle
+  0 — the fix report explicitly deferred them as out of scope for this fix
+  cycle, and that's still a reasonable call: neither is blocking, and fixing
+  the real bug took priority).
+
+**Manual verification (done directly in this cycle, not trusted from any report):**
+- Ran the exact repro from the task's instructions (above) — matches the
+  fix report's claimed output exactly, confirming the BLOCKING bug from
+  cycle 0 is genuinely fixed, not just re-described as fixed.
+- `python3 -m pytest tests/unit/tmdb/test_resolver.py -v`: **6 passed**
+  (`test_extracts_year_hint_from_candidate_text`,
+  `test_no_year_hint_when_no_parenthesized_year_present`,
+  `test_maps_winning_result_to_resolved_movie`,
+  `test_returns_none_when_nothing_resolves`,
+  `test_returns_none_when_best_result_is_low_confidence`,
+  `test_year_hint_uses_last_parenthesized_year_not_first`) — the
+  `resolver.py` change does not regress any of its own original tests.
+- Read `_extract_year_hint()`'s new `findall()[-1]` logic for the specific
+  edge case the task flagged — zero parenthesized years in `raw_text` at
+  all. `matches[-1] if matches else None` guards this explicitly:
+  `findall` returns `[]` on no match, the conditional short-circuits, no
+  `IndexError`. Confirmed directly:
+  ```python
+  _extract_year_hint('Interstellar')                    # -> None
+  _extract_year_hint('')                                  # -> None
+  _extract_year_hint('Some title without any year')        # -> None
+  ```
+  No exception in any case. This was already correct in the fix as applied
+  (not a residual bug) — the fix report's logic holds.
+- Independently ran `python3 -m pytest tests/unit -q` from scratch (not
+  trusting the reported 68): **68 passed in 0.38s**, matching the fix
+  report's count exactly.
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+
+Fix cycle 1 (this pass), addressing the review findings above:
+
+- **Blocking fix** — `regex_extractor.py`: `_UNQUOTED_TITLE_YEAR` now allows
+  a small, explicit set of lowercase connector words (`of`, `the`, `and`,
+  `a`, `an`, `in`, `on`, `to`, `for`, `at`, `by`, `vs`, `with`) *inside* a
+  title-case run, in addition to further uppercase-leading words. Chose
+  option (b) from the review's two suggested fixes (loosen the
+  unquoted-HIGH pattern) over option (a) (give the numbered-list pass
+  priority to re-claim/override a smaller span) because it's strictly
+  simpler: no change to `_claim()`'s overlap semantics or to the
+  numbered-list pass at all, and it fixes the bug at its root (the
+  unquoted-HIGH pass now captures the *correct, full* span on its own
+  first pass, so there's nothing left for the numbered-list pass to need
+  to re-claim). For `"1. The Lord of the Rings (2001)"`, the unquoted-HIGH
+  pass now matches the entire `"The Lord of the Rings (2001)"` span in one
+  go (title="The Lord of the Rings", year=2001); the numbered-list pass
+  then correctly sees that span already claimed and skips it, avoiding a
+  duplicate rather than dropping the title. Net effect on the review's
+  exact reproduction:
+  ```python
+  extractor.extract('5 movies like Inception:\n1. The Lord of the Rings (2001)\n2. Interstellar\n', SourceTag.CAPTION)
+  # now -> [Candidate(raw_text='The Lord of the Rings (2001)', confidence=0.9),
+  #         Candidate(raw_text='Interstellar', confidence=0.6)]
+  ```
+  Verified by hand that this does **not** reintroduce/worsen the
+  documented sentence-initial-word false positive: connector words are
+  lowercase literals matched case-sensitively, so they only extend a
+  chain across a *lowercase* connector, never add a new *uppercase*
+  leading word — `"Watch Inception (2010) tonight"` still (unchanged)
+  produces `"Watch Inception (2010)"`, the same pre-existing accepted
+  limitation as before, not a new or worse one. Also manually re-verified
+  `"I just watched Inception (2010) last night"` still correctly yields
+  just `"Inception (2010)"` (the lowercase "just"/"watched" aren't in the
+  connector allowlist, so the chain still resets there as before).
+- **Non-blocking fix** — `tmdb/resolver.py`: `_extract_year_hint()` now
+  uses `_YEAR_IN_PARENS.findall(raw_text)` and takes the **last** match
+  (`matches[-1]`) instead of `.search(...)`'s leftmost match. Fixed in
+  `resolver.py` rather than `regex_extractor.py` because the real bug was
+  purely which match `_extract_year_hint()` picks: `raw_text` is already
+  built as `f"{title} ({year})"` with the real release year appended at
+  the very end regardless of what the title itself contains, so searching
+  from the right is unambiguous and required no change to
+  `regex_extractor.py`'s output format at all. One-line-shaped change
+  exactly as the review anticipated. Verified
+  `tests/unit/tmdb/test_resolver.py` (6 tests, including a new regression
+  test for this exact case) and the full suite both still pass — no
+  existing resolver test assumed leftmost-match behavior.
+- **Not done (ponytail non-blocking, #3)** — the duplicated quote-pattern
+  sub-regex and the four near-identical match→claim→build blocks in
+  `extract()` were left as-is. Neither fix fell out naturally from fixing
+  #1 (the #1 fix only touched `_UNQUOTED_TITLE_YEAR`'s pattern body, not
+  `extract()`'s control flow or the quote-matching patterns), and the
+  instruction was explicit not to scope-creep into a refactor here.
+- Added regression tests: `tests/unit/text_extraction/test_regex_extractor.py`
+  — `test_numbered_list_title_with_connector_words_and_year_is_not_dropped`,
+  `test_sentence_initial_word_false_positive_not_worsened`,
+  `test_quoted_title_containing_own_parenthesized_year_uses_trailing_year`;
+  `tests/unit/tmdb/test_resolver.py` —
+  `test_year_hint_uses_last_parenthesized_year_not_first`.
+
+Ran `python3 -m pytest tests/unit -q`:
+
+```
+....................................................................     [100%]
+68 passed in 0.46s
+```
+
+(64 pre-existing + 4 new regression tests, all passing. Also ran
+`python3 -m pytest tests/unit/tmdb/test_resolver.py -v` specifically per
+the fix instructions: 6 passed, confirming the `resolver.py` change didn't
+break any of its existing tests.)
+
+### Open questions / risks
+- **Sentence-initial capitalized word adjacent to an unquoted title is a
+  real false-positive source for the unquoted `Title (YYYY)` HIGH pattern.**
+  E.g. `"Watch Inception (2010) tonight"` matches `"Watch Inception"` as
+  the title (both words satisfy "starts with uppercase," with no lowercase
+  word between them to break the chain), not just `"Inception"`. This was
+  caught while writing this subtask's own tests (first draft of
+  `test_unquoted_title_with_year_is_high_confidence` used exactly this
+  phrasing and failed) and worked around in the test by choosing input
+  where a lowercase word naturally separates the sentence opener from the
+  title (`"I just watched Inception (2010) last night"`), rather than by
+  further complicating the regex. A true fix would need real sentence
+  structure/POS awareness (overkill for a stdlib-`re`-only module per
+  spec) — flagging as a known false-positive source for real-world
+  captions phrased as imperatives/openers directly against the title
+  (`"Watch Dune (2021) now"`, `"See Oppenheimer (2023) today"`), worth
+  revisiting only if the resolved-movie accuracy numbers from a later
+  subtask show this is a frequent real-world pattern. The **quoted**
+  `"Title" (YYYY)` HIGH pattern is unaffected by this (quote marks
+  unambiguously bound the title), so this only risks unquoted captions.
+- **Unquoted titles with lowercase connector words** (`"The Lord of the
+  Rings (2001)"`) don't fully match the unquoted HIGH pattern, since
+  "of"/"the" break the all-words-capitalized chain — in that example the
+  regex would end up matching just `"Rings (2001)"` as its title (the last
+  all-caps-chain run immediately before the parens), losing the real
+  title's first three words. Deliberately not special-cased (would need a
+  connector-word allowlist, adding complexity for a stdlib-regex module
+  the spec asked to keep simple) — captions phrased this way will still
+  often get caught by the **quoted** pattern instead if the creator used
+  quotes, or will simply miss HIGH tier and fall through unextracted
+  (returns fewer candidates, not a crash or wrong-but-confident answer).
+  **UPDATE (fix cycle 1):** this is now special-cased — see "Fixes
+  applied" above. `_UNQUOTED_TITLE_YEAR` allows a small lowercase
+  connector-word allowlist inside the title-case run, so
+  `"The Lord of the Rings (2001)"` now matches as a single full span.
+  Left as historical context for *why* the numbered-list cross-pass bug
+  was possible in the first place.
+- **Quoted-span false positives from contractions**: a stray apostrophe in
+  a contraction (e.g. `"it's"`) could in principle pair with an unrelated
+  later single-quote on the same line and get misread as a quoted-title
+  delimiter. Mitigated (not eliminated) by capping quoted-span length at
+  100 chars and disallowing the match from crossing a newline, but not
+  fully solved — no test case surfaced an actual failure from this, so not
+  chasing it further per the "keep simple" instruction; flagging in case a
+  later real-caption smoke test (subtask 8) hits it.
+- **Numbered-list titles aren't resolved-year-checked for correctness** —
+  `_clean_list_title()` only strips whitespace/quotes/trailing punctuation;
+  if a list line happens to contain `"Title (YYYY)"` text that for some
+  reason wasn't already claimed by an earlier HIGH pass (shouldn't happen
+  in the current implementation, since both HIGH regexes scan the full
+  text first and claim their spans before the numbered-list pass runs),
+  it would still carry the year substring through at MEDIUM confidence,
+  which is harmless (resolver's year-hint regex would still find it) but
+  worth noting as an implicit (not test-locked) invariant between the pass
+  ordering and this behavior.
+- This extractor does not attempt to deduplicate semantically-identical
+  candidates that differ only in exact text (e.g. the same title appearing
+  once quoted in a caption and once unquoted in a numbered list within the
+  *same* text block, where the two spans don't textually overlap so both
+  survive `_claim()`). Per-source dedup/aggregation across candidates is
+  explicitly the pipeline's job (subtask 7), not this module's.

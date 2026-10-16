@@ -16,9 +16,18 @@ def _extract_year_hint(raw_text: str) -> int | None:
 
     A simple regex, not real date parsing — just enough to pass a year
     hint through to TMDB search / scoring when it's clearly spelled out.
+
+    Uses the LAST "(YYYY)"-shaped match, not the first: `raw_text` is
+    always built (by `text_extraction/regex_extractor.py`) as
+    `f"{title} ({year})"`, with the real release year appended at the very
+    end. If the title itself happens to contain its own parenthesized
+    4-digit substring (e.g. a quoted title like "Experience Paris (1920)
+    like never before" followed by the real trailing "(2023)"), searching
+    from the left would wrongly pick up the title's own embedded year
+    instead of the real one. Searching from the right is unambiguous.
     """
-    match = _YEAR_IN_PARENS.search(raw_text)
-    return int(match.group(1)) if match else None
+    matches = _YEAR_IN_PARENS.findall(raw_text)
+    return int(matches[-1]) if matches else None
 
 
 def resolve_candidate(

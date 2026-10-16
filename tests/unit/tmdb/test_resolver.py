@@ -90,3 +90,17 @@ def test_returns_none_when_best_result_is_low_confidence():
     resolved = resolve_candidate(_candidate("The Matrix"), client)
 
     assert resolved is None
+
+
+def test_year_hint_uses_last_parenthesized_year_not_first():
+    """Regression for Subtask 3 review finding #2: raw_text can contain
+    an embedded "(YYYY)"-shaped substring that isn't the real year (e.g.
+    a quoted title that itself mentions a year), with the real trailing
+    release year appended after it by text_extraction/regex_extractor.py.
+    `_extract_year_hint()` must pick the LAST match, not the first."""
+    client = FakeTMDBClient([_search_result()])
+
+    raw_text = 'Experience Paris (1920) like never before (2023)'
+    resolve_candidate(_candidate(raw_text), client)
+
+    assert client.last_year == 2023
