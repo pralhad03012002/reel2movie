@@ -1,0 +1,25 @@
+[project]
+name = "reel2movie"
+version = "0.1.0"
+description = "Extract movie recommendations from Instagram Reels and resolve them against TMDB."
+requires-python = ">=3.11"
+dependencies = [
+    "yt-dlp",
+    "requests",
+    "rapidfuzz",
+    "imageio-ffmpeg",
+    "anthropic",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["reel2movie*"]
