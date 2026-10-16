@@ -1324,3 +1324,466 @@ VERDICT: ACCEPTABLE
   Every field-mapping assumption above is therefore a documented guess,
   not a verified fact, until the user supplies real Instagram cookies and
   a live smoke test is run (expected at/after Subtask 8 per the plan).
+
+---
+
+## Subtask 5 — visual/frame_sampler.py — status: fixed, pending re-review
+
+### What's built
+Files created:
+- `reel2movie/visual/__init__.py` — package docstring only.
+- `reel2movie/visual/frame_sampler.py` — `sample_frames(video_path: Path, n:
+  int, duration_seconds: float, *, output_dir: Path | None = None) ->
+  list[FrameSample]`, importing `FrameSample` from `core/models.py` (not
+  redefined). A private `_compute_timestamps(n, duration_seconds) ->
+  list[float]` helper computes N equally-spaced timestamps within
+  `[0.05 * duration, 0.95 * duration]` inclusive of both ends (`start + i *
+  (end - start) / (n - 1)` for `i in range(n)`), or just `[0.5 * duration]`
+  when `n == 1`. For each timestamp, `sample_frames` shells out directly to
+  the `imageio_ffmpeg`-bundled ffmpeg binary (`imageio_ffmpeg.get_ffmpeg_exe()`,
+  **not** any system ffmpeg — this machine has neither Homebrew nor a system
+  ffmpeg, confirmed in the plan) via `subprocess.run([ffmpeg_exe, "-ss",
+  str(timestamp), "-i", str(video_path), "-frames:v", "1", "-pix_fmt",
+  "yuvj420p", "-y", str(frame_path)], capture_output=True, text=True)`,
+  writing one JPEG per timestamp (`frame_000.jpg`, `frame_001.jpg`, ...).
+  Does not use imageio's higher-level frame-reading API (awkward for
+  independent arbitrary-timestamp seeks, per spec's own suggestion) — a
+  direct subprocess call is the whole implementation, no retry/parallelism.
+- `reel2movie/visual/frame_sampler.py`'s `FrameExtractionError(RuntimeError)`
+  — raised when the ffmpeg subprocess returns nonzero, with ffmpeg's
+  captured `stderr` always included in the message (never swallowed).
+  Invalid input (`n < 1` or `duration_seconds <= 0`) raises plain
+  `ValueError` instead, before any ffmpeg/filesystem work happens — these
+  are caller-programming-error cases, not extraction failures, so a
+  different, simpler exception type than `FrameExtractionError` felt right.
+- `tests/unit/visual/__init__.py` — empty, for pytest discovery.
+- `tests/unit/visual/test_frame_sampler.py` — 9 tests (2 of them
+  `@pytest.mark.parametrize`d into 2 cases each, so 11 actual test runs):
+  N-equally-spaced-within-window + evenly-spaced + files-exist-and-nonempty
+  (`n=3`, duration 6.0s); `n=1` → exactly 1 frame at the midpoint;
+  `output_dir=None` → the returned path still exists and is readable
+  *after* `sample_frames` returns (the specific invariant the
+  temp-dir-ownership decision below depends on); `n=0`/`n=-1` →
+  `ValueError`; `duration_seconds=0.0`/`-1.0` → `ValueError`; a genuinely
+  nonexistent video path → `FrameExtractionError` with ffmpeg's real stderr
+  in the message; and a `subprocess.run`-patched nonzero-exit-code case →
+  `FrameExtractionError` with the patched stderr text present in the
+  message (`pytest.raises(..., match=...)`), confirming the error path
+  doesn't swallow or mangle stderr even when ffmpeg itself never actually
+  ran.
+
+### Temp-directory ownership/cleanup decision
+
+`tempfile.mkdtemp()` is used (not `tempfile.TemporaryDirectory()` as a
+context manager) when `output_dir` is omitted. Reasoning, thought through
+rather than picked by default: `TemporaryDirectory()` deletes the directory
+(and everything in it) the instant its `with` block's `__exit__` runs — if
+`sample_frames` used it internally as `with tempfile.TemporaryDirectory() as
+d: ...; return samples`, the directory would be wiped *before* the function
+even returns, and every `FrameSample.path` handed back to the caller would
+already point at a deleted file. That would silently violate this
+subtask's own "each `FrameSample.path` actually exists on disk" contract
+the moment the caller tried to use it. `mkdtemp()` has no such lifetime
+tied to a context manager — it creates a plain directory that persists
+until something explicitly removes it, which is exactly the "caller
+receives live, readable paths" behavior required here. The documented
+tradeoff: the caller now owns cleanup of a temp directory it never asked
+to create (it only asked for frames). This is called out in both the
+function's docstring and here rather than left implicit, since it's a real
+resource-leak risk if a later caller (subtask 6's
+`vision_llm_detector.py`, or `pipeline/waterfall.py`) forgets to
+`shutil.rmtree()` it — flagged as an open question below for whichever
+subtask ends up being the actual caller.
+
+### Fixture approach — generated fresh, nothing committed
+
+Chose **not** to commit a binary `.mp4` fixture to `tests/fixtures/`, even
+though `.gitignore` already excludes `tests/fixtures/*.mp4` and would have
+allowed it. Instead, `tests/unit/visual/test_frame_sampler.py` has its own
+module-scoped `sample_video` pytest fixture that generates a tiny synthetic
+test video fresh into a `tmp_path_factory`-created directory every test
+run, using the same bundled ffmpeg binary (`testsrc` lavfi source,
+`size=64x64`, `duration=6`) that `sample_frames` itself uses — fully
+offline, no download, no reliance on a pre-existing file that could go
+stale or missing. This was the spec's own explicitly offered "cleaner"
+alternative; picked it because it guarantees the test video is always
+generated by whatever ffmpeg binary `imageio_ffmpeg` resolves to in the
+*current* environment (no version-skew risk between a committed fixture
+and the installed `imageio-ffmpeg` version), and leaves zero stray files
+under `tests/fixtures/` (confirmed by a directory listing after a full test
+run — only the pre-existing `instagram_post_sample.json` is there).
+
+One deviation from the task's illustrative example worth flagging: the
+fixture uses `rate=10`, not `rate=1`. At 1fps a 6-second video has only 6
+frames total, and the 95%-of-duration timestamp (5.7s) then lands in a gap
+where ffmpeg's `-ss`-before-`-i` (input-side/fast) seek — the exact
+invocation style this subtask specifies — finds no frame to encode and
+silently produces a missing/zero-byte output (confirmed by hand: same
+command, same timestamp, 1fps source → `returncode 0` but no file written;
+10fps source → succeeds). This is a real ffmpeg quirk specific to very
+sparse frame grids at exactly the tail of the seek range, not a bug in
+`sample_frames`'s logic — real Instagram reels are never anywhere near
+1fps, so `rate=10` for the test fixture is representative of real input
+while still being tiny/deterministic/offline.
+
+Also added `-pix_fmt yuvj420p` to the extraction command (not in the task's
+literal example command list). Without it, the synthetic `testsrc` fixture
+(encoded by libx264 as `yuv444p`) made ffmpeg's mjpeg encoder fail with
+"Non full-range YUV is non-standard" / "Error while opening encoder" and
+silently write a zero-byte file — caught directly while running this
+subtask's own tests, not assumed. Forcing a pixel format the mjpeg encoder
+always accepts is a one-flag fix that costs nothing for normally-encoded
+real-world video (the overwhelmingly common case) and fixes the synthetic
+test fixture; documented inline in `frame_sampler.py` at the point the flag
+is added.
+
+### Test results
+
+Ran `python3 -m pytest tests/unit -q`:
+
+```
+..........................................................................
+..........................
+98 passed in 0.99s
+```
+
+(89 pre-existing from Subtasks 0-4 + 9 new in `tests/unit/visual/`, run
+both plain and with `python3 -I -m pytest tests/unit -q` for import
+isolation — both gave `98 passed`, confirming nothing added here broke any
+earlier subtask's tests, and no reliance on ambient `sys.path`/cwd state.)
+
+### Review findings (latest pass)
+
+This section holds two review passes, kept distinct rather than letting the
+newer one overwrite the older (per handoff-logging convention: never destroy
+history, same pattern as Subtask 3). **Cycle 0** (below) is the original
+pre-fix review; its outcome is addressed by `### Fixes applied` above (fix
+cycle 1) and is kept here verbatim for the record. **Cycle 2** (further
+down) is a fresh, from-scratch re-review of the current working tree —
+including the post-fix `exists()`/size check and the subprocess timeout —
+run independently of cycle 0/1, not a continuation of them.
+
+#### cycle 0 review (historical — pre-fix; see "Fixes applied" above for what changed in response)
+
+Reviewed via `/code-review` (medium) on the current diff
+(`reel2movie/visual/__init__.py`, `reel2movie/visual/frame_sampler.py`,
+`tests/unit/visual/__init__.py`, `tests/unit/visual/test_frame_sampler.py`),
+`/ponytail:ponytail-review` on the same diff, plus independent manual
+verification: re-ran the full suite and the visual tests individually
+(not just trusted from the build report), ran `sample_frames` directly
+outside pytest against a freshly-generated synthetic video, grepped for
+`get_ffmpeg_exe` to confirm the bundled binary (not a system one) is what's
+actually invoked, and specifically tried to reproduce the ffmpeg
+"exit 0 but writes no file" quirk the build report's own test-fixture
+commentary describes (and sidesteps via `rate=10`) rather than trusting
+that it's harmless.
+
+**From `/code-review` (correctness) — BLOCKING:**
+- **Blocking** — `frame_sampler.py` L127-134: `sample_frames` only checks
+  `result.returncode != 0` before trusting the output file; it never
+  verifies the JPEG actually exists and is non-empty. **Reproduced
+  directly, not just theorized**: generated a sparse 1fps/6s synthetic
+  video (`testsrc=duration=6:size=64x64:rate=1`) and called
+  `sample_frames(video, n=3, duration_seconds=6.0, output_dir=...)`
+  directly. The 3rd sample (timestamp 5.7s) came back as a `FrameSample`
+  whose `.path.exists()` is `False` — no exception raised. Running the
+  exact underlying ffmpeg command by hand confirms `returncode == 0` while
+  stderr literally says `"Output file is empty, nothing was encoded (check
+  -ss / -t / -frames parameters if used)"`. This is exactly the quirk
+  `tests/unit/visual/test_frame_sampler.py`'s own `sample_video` fixture
+  docstring (L40-50) describes firsthand from hitting it while writing the
+  tests — but the fix applied there was to make the **test fixture** denser
+  (`rate=10`) so the test suite never exercises this path, rather than
+  making `sample_frames` itself detect/reject it. Production input (a real,
+  possibly variable-fps or metadata-slightly-off reel) can still hit this,
+  silently handing a `FrameSample` with a dead path downstream to
+  `vision_llm_detector.py` (subtask 6). Directly violates this task's own
+  acceptance bar that every returned `FrameSample.path` be a real,
+  non-trivial-sized file. Needs a post-`subprocess.run` check (file exists
+  and `st_size > 0`) that raises `FrameExtractionError` when violated.
+- **Non-blocking** — `frame_sampler.py` L127: the per-timestamp
+  `subprocess.run(command, capture_output=True, text=True)` call has no
+  `timeout=`. A stalled/corrupt input could hang `sample_frames` (and its
+  caller) indefinitely with no recovery short of external process kill.
+- **Non-blocking** — `frame_sampler.py` L95-96: when `output_dir` is
+  omitted, the `tempfile.mkdtemp()` directory is never cleaned up by this
+  module (by design, per the documented caller-ownership decision below —
+  not a new issue, just restating the existing open risk as a concrete
+  accumulation risk, e.g. repeated test/pipeline runs piling up
+  `reel2movie_frames_*` dirs in the OS temp folder).
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- No findings. The direct ffmpeg subprocess call (vs. wrapping imageio's
+  higher-level API) is the leaner choice, not bloat. `_compute_timestamps`
+  is a small pure function with one caller, not a speculative abstraction.
+  `output_dir` is genuinely exercised by both branches in the tests, not
+  unused flexibility. The two `ValueError` tests are already collapsed via
+  `@pytest.mark.parametrize`. No reinvented stdlib, no unnecessary
+  dependencies, no dead code. "Lean already. Ship." `net: -0 lines possible.`
+
+**Manual verification (not just trusting the build report's explanations):**
+- **Timestamp math, independently recomputed**: `_compute_timestamps(1, 8.0)
+  == [4.0]` (midpoint, matches spec's n=1 decision);
+  `_compute_timestamps(2, 8.0) == [0.4, 7.6]` (exactly 5%/95% of 8.0 —
+  confirms the n=2 edge case lands precisely on both window bounds, no
+  off-by-one); `_compute_timestamps(5, 8.0)` gave 5 values evenly spaced
+  between 0.4 and 7.6. All confirmed by direct function call, not just
+  reading the code.
+- **`imageio_ffmpeg` (not system ffmpeg) confirmed via grep**: `grep -rn
+  "get_ffmpeg_exe\|ffmpeg" reel2movie/visual/frame_sampler.py` shows
+  `imageio_ffmpeg.get_ffmpeg_exe()` is called once (L100) and its return
+  value (`ffmpeg_exe`) is what's placed at `command[0]` — no literal
+  `"ffmpeg"` string or system-PATH lookup anywhere in the module.
+- **stderr capture, confirmed by reading the code**: `subprocess.run(...,
+  capture_output=True, text=True)` followed by `result.stderr` interpolated
+  directly into the `FrameExtractionError` message on nonzero exit — never
+  swallowed, matches the build report's claim.
+- **Temp-dir lifetime reasoning (`mkdtemp()` vs `TemporaryDirectory()`),
+  confirmed correct, not just trusted**: `tempfile.TemporaryDirectory()`
+  used as a `with`-block would delete the directory at `__exit__`, before
+  `sample_frames` returns — and even holding a `TemporaryDirectory` object
+  without entering it as a context manager still risks `__del__`-triggered
+  cleanup once the object is garbage-collected. `mkdtemp()` has no such
+  lifetime tied to any Python object, so it's the only one of the two that
+  actually satisfies "caller receives live, readable paths after the
+  function returns." The build report's stated reasoning is accurate.
+- **Full test suite, re-run independently**: `python3 -m pytest tests/unit
+  -q` → `98 passed` (not just trusted from the build report).
+  `python3 -m pytest tests/unit/visual -v` → all 9 individual tests passed
+  by name: `test_sample_frames_returns_n_evenly_spaced_frames_within_window`,
+  `test_n_1_returns_exactly_one_frame_at_midpoint`,
+  `test_no_output_dir_uses_a_persistent_temp_dir`,
+  `test_invalid_n_raises_value_error[0]`/`[-1]`,
+  `test_invalid_duration_raises_value_error[0.0]`/`[-1.0]`,
+  `test_nonexistent_video_path_raises_frame_extraction_error_with_stderr`,
+  `test_patched_nonzero_ffmpeg_exit_raises_frame_extraction_error_with_stderr`.
+- **Manual run outside pytest**: generated a fresh synthetic video
+  (`testsrc=duration=8:size=320x240:rate=24`) via `imageio_ffmpeg` directly,
+  then called `sample_frames(video, n=5, duration_seconds=8.0,
+  output_dir=...)` directly (no pytest, no mocks). All 5 returned
+  `FrameSample.path` files exist and are non-trivial JPEGs (6817-7193
+  bytes each, not zero-byte) — confirms the happy path genuinely produces
+  real images, not just an artifact of permissive test assertions.
+  Immediately after, reproduced the blocking finding above against a
+  deliberately sparse video, showing the happy-path check and the failure
+  mode are both real, not hypothetical.
+
+Cycle 0 outcome: **NEEDS FIXES** (addressed by `### Fixes applied` below —
+fix cycle 1 — producing the working tree re-reviewed in cycle 2 below).
+
+#### cycle 2 review (current — fresh re-review of the post-fix working tree)
+
+Scope: the full current diff — `reel2movie/visual/frame_sampler.py`
+(the fix-cycle-1 changes: the post-`subprocess.run` `exists()`/`st_size > 0`
+check and the `timeout=30` + `except subprocess.TimeoutExpired` handling),
+plus the two new regression tests in `tests/unit/visual/test_frame_sampler.py`.
+Run as a clean re-review, not a continuation of the cycle 0/1 session: fresh
+`/code-review` (medium) and `/ponytail:ponytail-review` invocations against
+the current diff, plus independent manual verification done by direct
+reproduction outside pytest (not trusting the fix report's claims) and a
+from-scratch full-suite run.
+
+**Primary question — is the cycle 0 BLOCKING bug actually fixed? Yes, confirmed by direct reproduction:**
+```python
+# generated testsrc=duration=6:size=64x64:rate=1 (sparse, same shape as cycle 0's repro)
+sample_frames(sparse_video, n=3, duration_seconds=6.0, output_dir=out_dir)
+# -> raises FrameExtractionError:
+# "ffmpeg reported success (exit code 0) extracting frame at timestamp
+#  5.700s from <path>, but the output file <path>/frame_002.jpg is missing
+#  or empty. ffmpeg stderr: ..."
+```
+Called directly, outside pytest, against a freshly-generated video — not
+reusing the fix report's own transcript. The original bug (silently
+returning a `FrameSample` whose `.path` didn't exist, no exception) is gone:
+the function now raises cleanly instead.
+
+Also independently confirmed the timeout handling doesn't break the happy
+path: the same direct-call harness against a well-formed
+`testsrc=duration=6:size=64x64:rate=10` video with `n=3` returned 3
+`FrameSample`s, all with `.path.exists()` true and `.path.stat().st_size`
+in the 1700-1800 byte range (real JPEG content, not empty placeholders).
+
+**From `/code-review` (correctness) — two new findings, both non-blocking:**
+- **Non-blocking** — `frame_sampler.py` L107 (and by extension the
+  per-iteration loop): on a mid-loop extraction failure when `output_dir`
+  is omitted, the `tempfile.mkdtemp()` directory (plus any frames already
+  successfully extracted in earlier iterations) is never cleaned up and its
+  path is never surfaced to the caller — it leaks permanently in the OS temp
+  folder. E.g. `sample_frames(video, n=3, ...)` with `output_dir=None`
+  succeeds on `frame_000.jpg`/`frame_001.jpg` then raises
+  `FrameExtractionError` on the third; the caller never learns the
+  `mkdtemp()` path and has no way to `rmtree` it. Judged non-blocking: this
+  is a disk-space leak on an already-rare failure path (the visual fallback
+  itself is rare per `flow.md`), not a silently-wrong result — and it's the
+  same accepted "caller never cleans up the temp dir" design decision
+  already documented in "Temp-directory ownership/cleanup decision" above
+  and flagged under "Open questions / risks" below, just extended from the
+  success path (already accepted) to the failure path (not previously
+  spelled out). Worth tightening later (e.g. `try/finally: shutil.rmtree`
+  on error when `output_dir` was auto-created), but doesn't block this
+  subtask under the same "wrong confident answer vs. no answer" bar used by
+  every prior cycle in this file.
+- **Non-blocking** — `frame_sampler.py` L162: the `exists()`/`st_size > 0`
+  check only verifies the output file's current state, not that the
+  *current* subprocess call actually produced it — so a stale leftover file
+  from an earlier call into a reused `output_dir` could in principle mask a
+  genuine current-call failure (the check would pass on old bytes). Not
+  independently re-reproduced in this pass (would require constructing a
+  failure mode where ffmpeg fails without truncating/removing a
+  pre-existing file at the same path, which is plausible but not confirmed
+  against the real binary here). Judged non-blocking: `sample_frames` is
+  documented and tested as a single-call-per-batch extraction (fresh
+  `frame_NNN.jpg` names each call, `output_dir=None` gets a brand-new
+  `mkdtemp()` dir by default), so hitting this requires a caller to
+  deliberately reuse one `output_dir` across multiple `sample_frames` calls
+  with overlapping frame indices — not the documented or tested usage
+  pattern, and not something any currently-built caller does (subtasks
+  6/7 don't exist yet). Worth a one-line note in the docstring if a later
+  subtask ever does call `sample_frames` more than once into the same
+  directory.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity) — run manually per the skill's loaded instructions:**
+- No findings on the fix-cycle delta specifically. The three failure
+  branches (`TimeoutExpired` except, nonzero-exit check, `exists`/`size`
+  check) each build a `FrameExtractionError` message carrying genuinely
+  different diagnostic info (timeout value vs. exit code+stderr vs.
+  path+stderr), so collapsing them into one helper would cost clarity for
+  no real line savings. The two new regression tests
+  (`test_exit_code_0_but_empty_output_raises_frame_extraction_error`,
+  `test_ffmpeg_timeout_raises_frame_extraction_error`) follow the exact
+  mock-`subprocess.run` pattern already established by the pre-existing
+  `test_patched_nonzero_ffmpeg_exit_...` test, each covering a genuinely
+  distinct branch, not boilerplate repeats. "Lean already. Ship."
+  `net: -0 lines possible.`
+
+**Manual verification (done directly in this cycle, not trusted from any report):**
+- Ran a direct, outside-pytest repro matching the task's instructions:
+  generated a sparse `testsrc=duration=6:size=64x64:rate=1` video and a
+  well-formed `testsrc=duration=6:size=64x64:rate=10` video via
+  `imageio_ffmpeg.get_ffmpeg_exe()` directly (no pytest, no mocks), then
+  called `sample_frames(video, n=3, duration_seconds=6.0,
+  output_dir=<tmp dir>)` on each:
+  - Sparse video → `FrameExtractionError` raised cleanly (message above),
+    confirming the original BLOCKING bug (silent `FrameSample` pointing at
+    a missing file) is genuinely fixed, not just re-described as fixed.
+  - Well-formed video → 3 valid `FrameSample`s returned, each `.path`
+    confirmed to exist with non-zero size (1700-1800 bytes, real JPEG
+    content) — confirming the timeout/exists-check additions don't break
+    the happy path.
+- Independently ran `python3 -m pytest tests/unit -q` from scratch (not
+  trusting the reported 100): **100 passed in 0.98s**, matching the fix
+  report's count exactly.
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+
+Fix cycle 1 of 3 (per the plan's cap). Addressed all three findings from the
+review pass above:
+
+- **Blocking, fixed** — `sample_frames` now checks the output file after
+  every `subprocess.run` call, not just `result.returncode`. After the
+  returncode check, it verifies `frame_path.exists() and
+  frame_path.stat().st_size > 0`; if either is false it raises
+  `FrameExtractionError` with a message that states the timestamp, the
+  video path, and `result.stderr` (captured regardless of returncode, since
+  ffmpeg's stderr often explains the real failure even on a "successful"
+  exit code — e.g. `"Output file is empty, nothing was encoded"`). This
+  closes the exact gap the reviewer reproduced: a sparse 1fps/6s video with
+  `n=3, duration=6.0` previously returned a `FrameSample` whose `.path`
+  didn't exist, with no exception.
+- **Non-blocking, fixed** — the per-timestamp `subprocess.run(...)` call now
+  passes `timeout=30` (module-level `_FFMPEG_TIMEOUT_SECONDS = 30`; a
+  single-frame extraction should never legitimately take longer). The call
+  is wrapped in `try/except subprocess.TimeoutExpired`, which is re-raised
+  as `FrameExtractionError` (stating the timeout value, timestamp, and video
+  path) rather than letting `TimeoutExpired` propagate raw to the caller.
+- **Non-blocking, confirmed as already clear, no code change** — re-read the
+  `tempfile.mkdtemp()`-not-cleaned-up docstring section and the "Temp-directory
+  ownership/cleanup decision" section above: both already state plainly that
+  this is a deliberate caller-ownership design (the caller receives live
+  paths and owns `shutil.rmtree()`-ing the directory when done), not an
+  oversight, and both are flagged again under "Open questions / risks" for
+  whichever subtask becomes the actual caller. Wording was judged clear
+  as-is; left untouched rather than rewritten for its own sake.
+
+Also added two regression tests to `tests/unit/visual/test_frame_sampler.py`
+(both via mocking `subprocess.run`, not the timing-sensitive real sparse-video
+case, per the reviewer's own suggestion):
+- `test_exit_code_0_but_empty_output_raises_frame_extraction_error` — mocks
+  `subprocess.run` to return `returncode=0` with stderr
+  `"Output file is empty, nothing was encoded"` while never creating the
+  output file; asserts `FrameExtractionError` is raised and the message
+  contains that stderr text.
+- `test_ffmpeg_timeout_raises_frame_extraction_error` — mocks
+  `subprocess.run` to raise `subprocess.TimeoutExpired`; asserts
+  `FrameExtractionError` is raised (message contains "timed out") instead of
+  the raw exception propagating.
+
+Verification performed directly (not just trusted):
+- `python3 -m pytest tests/unit -q` → **100 passed** (98 pre-existing +
+  2 new regression tests above; no earlier subtask broken).
+- Manually reproduced the reviewer's exact scenario outside pytest: generated
+  a fresh sparse `testsrc=duration=6:size=64x64:rate=1` video via
+  `imageio_ffmpeg`, called `sample_frames(video, n=3, duration_seconds=6.0,
+  output_dir=...)` directly (no mocks). Confirmed it now raises
+  `FrameExtractionError` — message: `"ffmpeg reported success (exit code 0)
+  extracting frame at timestamp 5.700s from <path>, but the output file
+  <path>/frame_002.jpg is missing or empty. ffmpeg stderr: ..."` — instead of
+  silently returning a `FrameSample` pointing at a nonexistent file.
+
+Not yet done: committing to git (per the plan, commit happens only after a
+module is accepted by a fresh review pass, not by the fix subagent itself).
+`reel2movie/visual/` and `tests/unit/visual/` remain untracked; `PROGRESS.md`
+has unstaged changes. Next step per the loop is a fresh review subagent
+(cycle 2's review, not resumed) re-checking this diff.
+
+### Open questions / risks
+
+- **Temp-directory cleanup is entirely the caller's responsibility when
+  `output_dir` is omitted**, per the decision above. `sample_frames` itself
+  never deletes anything it creates. Whichever subtask actually calls this
+  in the real pipeline (most likely `visual/vision_llm_detector.py` via
+  subtask 6, or `pipeline/waterfall.py` via subtask 7, once a frame has
+  been sent to the vision LLM and is no longer needed) needs to decide
+  when it's safe to `shutil.rmtree()` the directory — not addressed here,
+  since this subtask's scope is extraction only. A reasonable default
+  would be: the waterfall step that calls `sample_frames` also owns
+  calling `shutil.rmtree(samples[0].path.parent, ignore_errors=True)` once
+  it has the vision-LLM result in hand, but that's a call for subtask 6/7,
+  not assumed or implemented here.
+- **`-ss`-before-`-i` (fast/input-side seek) accuracy**: this is the
+  "fast but can land on the nearest preceding keyframe rather than the
+  exact frame" seek mode (vs. `-i` before `-ss`, which decodes from the
+  start and is frame-exact but much slower). The subtask spec explicitly
+  calls for `-ss` before `-i`, so that's what's implemented — for the
+  intended use case (sampling *roughly* evenly-spaced representative
+  frames for a vision-LLM poster/title-card check, not needing
+  frame-perfect precision), this tradeoff is the right one, but it means
+  the actual extracted frame's true timestamp can differ slightly from the
+  requested one on a real (non-synthetic, keyframe-sparse) video. The
+  `FrameSample.timestamp_seconds` returned is always the *requested*
+  timestamp, not whatever ffmpeg actually landed on — flagging this as a
+  known (accepted, per spec) imprecision, not a bug.
+- **Very short videos / small `n` near duration edges**: for a very short
+  `duration_seconds` (e.g. under ~1s) combined with a sparse real-world
+  frame rate, the same "`-ss` lands in a gap with no frame" failure mode
+  hit during this subtask's own test-fixture debugging (see above) could
+  in principle recur against a real low-frame-rate or very short reel,
+  surfacing as a loud `FrameExtractionError` (not a silent wrong result) —
+  acceptable per "no retry logic" in the spec, but worth knowing this is
+  the most likely real-world failure shape if `sample_frames` ever throws
+  in production.
+- **No validation that `video_path` is actually a readable video file**
+  before invoking ffmpeg — a nonexistent path, a non-video file, or a
+  corrupt file are all funneled through the same "ffmpeg returned nonzero,
+  raise `FrameExtractionError` with its stderr" path, per spec ("if the
+  ffmpeg subprocess call fails/returns nonzero"). Confirmed directly (one
+  of the 9 new tests) that a nonexistent path produces a clear
+  `FrameExtractionError` naming the missing path, not an unrelated
+  exception type.
+- `imageio_ffmpeg` was already installed in this environment (confirmed via
+  `python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"`
+  before writing any code) — no `pip install` was needed this subtask; it's
+  already a `[project.dependencies]` entry in `pyproject.toml` from an
+  earlier subtask, consistent with the plan.
