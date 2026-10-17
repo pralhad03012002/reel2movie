@@ -4476,3 +4476,253 @@ VERDICT: ACCEPTABLE
 ### Fixes applied
 (none yet — both findings above are non-blocking polish, left for a future
 pass per instructions not to scope-creep into a refactor during review)
+
+## Follow-up — retry/backoff for TMDB client network errors — status: done
+
+### Motivation
+
+A real end-to-end test against an actual reel showed `TMDBHttpClient.
+search_movie()` intermittently failing with `requests.exceptions.
+ConnectionError` ("Connection reset by peer", during the TLS handshake)
+against the real TMDB API — confirmed via direct testing to be transient
+network flakiness, not an auth/token/host problem (the exact same request
+with the exact same token succeeds via plain `curl`, and sometimes succeeds
+via a bare retry, just unreliably — roughly 40-60% failure rate observed
+across several real attempts in this environment). This was already
+flagged as an open risk in this module's own original review ("No
+retry/backoff/caching on `TMDBHttpClient.search_movie`... worth revisiting
+if TMDB rate limits become real") — now empirically confirmed real, not
+hypothetical.
+
+### What's built
+
+- `reel2movie/tmdb/client.py` — `search_movie()` now wraps the
+  `requests.get(...)` call in a small, fixed retry loop:
+  - **Retries only** `requests.exceptions.ConnectionError` and
+    `requests.exceptions.Timeout` — the connection-level failures actually
+    observed (a TLS handshake reset is a `ConnectionError`, not an HTTP
+    error response).
+  - **Does NOT retry** `requests.exceptions.HTTPError` raised by
+    `response.raise_for_status()` for a genuine 4xx/5xx response — that's
+    a real API-level outcome (bad auth, bad request, a server
+    deliberately erroring), not a transient connection blip, and retrying
+    it could mask a real bug or hammer a server that's intentionally
+    returning an error. Confirmed by test (below): on an `HTTPError`,
+    `requests.get` is called exactly once.
+  - **3 total attempts**, backing off `0.5s` then `1.0s` between failed
+    attempts (`time.sleep`, no new dependency — plain stdlib, per this
+    project's existing "don't add a dependency when stdlib suffices"
+    convention; no `tenacity` or similar added). Chosen small and fast
+    deliberately: this is a human-facing CLI call, not a background batch
+    job, and the observed failures resolve within a retry or two — so
+    worst case this adds 1.5s before either succeeding or finally
+    surfacing the error, not tens of seconds.
+  - If all 3 attempts raise the connection-level exception, the final
+    exception is re-raised unchanged — exactly the pre-existing behavior.
+    Nothing downstream changes: `tmdb/resolver.py`'s `resolve_candidate`
+    has no try/except of its own around `client.search_movie(...)`, so
+    the exception propagates up to `pipeline/waterfall.py`'s
+    `_resolve_all`, whose existing broad `except Exception:` around the
+    per-candidate resolve call catches it, logs it, and keeps that one
+    candidate unresolved rather than crashing the whole pipeline — this
+    follow-up only changes how many chances a single TMDB call gets
+    before giving up, not what happens after it finally gives up.
+
+### Decision: no 5xx-specific retry added
+
+Deliberately did **not** add retry-on-certain-5xx-status-codes as part of
+this change, even though some 5xx responses (502/503/504 in particular)
+can also be transient server-side blips in principle. Reasoning:
+- The task's own motivation section was specific — the *observed, tested*
+  failure mode is a TLS handshake reset (`ConnectionError`), not an HTTP
+  5xx response. There's no empirical evidence here that TMDB has been
+  returning transient 5xxs against this project's real calls; adding a
+  retry for a failure mode that hasn't actually been observed would be
+  speculative.
+- The task explicitly asked for this to be called out as a separate,
+  deliberate decision rather than silently folded in, specifically because
+  retrying a 5xx is a different kind of judgment call (it comes after
+  `raise_for_status()` has already decided "this is a real HTTP-level
+  error") than retrying a connection failure that never got an HTTP
+  response at all.
+- If TMDB 5xx responses are later observed to be a real, recurring problem
+  (the same way the `ConnectionError` issue was first flagged as
+  hypothetical and only later confirmed real), that would justify a
+  follow-up adding a narrow, explicit retry on e.g. `response.status_code
+  in (502, 503, 504)` before/instead of calling `raise_for_status()` — but
+  not now, on spec alone.
+
+### `timeout=` finding (reported, not changed)
+
+The task asked to confirm the existing `timeout=` value on the
+`requests.get` call and leave it as-is. On inspection, `search_movie()`'s
+`requests.get(...)` call currently passes **no `timeout=` parameter at
+all** — there never was one to keep. Left as-is per the instruction not to
+change this speculatively (`requests.exceptions.Timeout` is now wired into
+the retry logic in case a timeout is ever added or ever occurs via some
+other path, e.g. a proxy), but flagging explicitly: with no timeout set,
+a hung TLS handshake or slow server can block `requests.get` indefinitely
+rather than raising `Timeout` — so today, the retry loop's `Timeout`
+branch is reachable in principle but not exercised by the actual failure
+mode seen in testing (which raises `ConnectionError`, not `Timeout`).
+Worth a separate follow-up to add a `timeout=` if indefinite hangs are ever
+observed in practice.
+
+### Tests
+
+`tests/unit/tmdb/test_client.py` — added:
+- `test_search_movie_retries_connection_error_then_succeeds` — `requests.
+  get` raises `ConnectionError` twice then returns a successful response;
+  asserts the final result is correct AND `mock_get.call_count == 3`
+  (not just "it eventually returned something").
+- `test_search_movie_exhausts_retries_and_raises_connection_error` —
+  `requests.get` raises `ConnectionError` on every call; asserts the
+  `ConnectionError` propagates and `mock_get.call_count == 3` exactly (not
+  2, not 4 — the retry budget is exact).
+- `test_search_movie_retries_timeout_then_succeeds` — same shape as the
+  `ConnectionError` test but for `requests.exceptions.Timeout`, confirming
+  both exception types in the retry set are actually handled.
+- Extended the pre-existing `test_search_movie_raises_on_http_error` with
+  `assert mock_get.call_count == 1` — proving the retry logic does not
+  accidentally swallow/retry a real HTTP error.
+- All three new/extended tests mock `reel2movie.tmdb.client.time.sleep`
+  and assert `mock_sleep.call_args_list == [((0.5,),), ((1.0,),)]` (or the
+  matching prefix for the 2-call success case) — confirming the actual
+  backoff values used, without the test suite actually sleeping.
+
+`python3 -m pytest tests/unit -q` → **191 passed** (188 before this
+change + 3 new tests; the existing `test_search_movie_raises_on_http_error`
+was extended in place, not counted as new).
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (high, forked) on the current diff
+(`reel2movie/tmdb/client.py`, `tests/unit/tmdb/test_client.py`,
+`PROGRESS.md`), `/ponytail:ponytail-review` on the same diff, a manual
+line-by-line trace of `search_movie()`'s retry loop against the task's
+specific concerns (retry scope, exact attempt count), and a from-scratch
+`python3 -m pytest tests/unit -q` run plus a named run of
+`tests/unit/tmdb/test_client.py -v`.
+
+**Manual trace — retry scope and exact count (read directly, not trusted
+from the build report):**
+- **Confirmed**: `response.raise_for_status()` (L95) sits *after* the
+  `for attempt in range(_MAX_ATTEMPTS): ... break` loop (L81-93), not
+  inside its `try`/`except`. The `except` clause (L88) only ever catches
+  `(requests.exceptions.ConnectionError, requests.exceptions.Timeout)`
+  raised by `requests.get(...)` itself (L83-87). So a genuine
+  `requests.exceptions.HTTPError` from `raise_for_status()` is structurally
+  unreachable from inside the retry's `except` — it propagates on the
+  first and only attempt, exactly as claimed.
+- **Confirmed exact count**: `_MAX_ATTEMPTS = 3`, loop is
+  `range(_MAX_ATTEMPTS)` → attempts indexed `0, 1, 2` = **3 total calls**
+  to `requests.get`, not 2 or 4. The `if attempt == _MAX_ATTEMPTS - 1:
+  raise` guard fires only on the last index (`2`), and
+  `time.sleep(_BACKOFF_SECONDS[attempt])` otherwise fires for indices `0`
+  (`0.5`) and `1` (`1.0`) — matches the claimed `0.5s` then `1.0s` backoff
+  exactly.
+
+**From `/code-review` (correctness):**
+- **BLOCKING (see independent judgment below)** — `client.py` L83-87:
+  `requests.get(...)` is called with no `timeout=` kwarg at all, so the
+  newly-added `Timeout` except-branch is dead code in practice — `requests`
+  never raises `Timeout` unless a timeout is configured. A hung TLS
+  handshake or unresponsive server blocks indefinitely with no exception,
+  so neither the retry loop nor `raise_for_status()` ever runs. Also
+  inconsistent with this project's own established convention of passing
+  an explicit timeout to blocking calls elsewhere (`claude_code_extractor.
+  py:112`, `vision_llm_detector.py:196`).
+- **Non-blocking** — `_MAX_ATTEMPTS` (3) and `len(_BACKOFF_SECONDS)` (2)
+  are two separately-maintained constants with an implicit invariant
+  (`len(_BACKOFF_SECONDS) == _MAX_ATTEMPTS - 1`) that nothing enforces. A
+  future bump of `_MAX_ATTEMPTS` without updating `_BACKOFF_SECONDS` would
+  raise `IndexError` on the 3rd failure instead of retrying or surfacing
+  the real network error. Cheap future-proofing (e.g. an assertion at
+  import time, or deriving backoff via a formula) but not required now —
+  both constants are co-located and commented, so the risk is only live if
+  someone edits one without reading the other.
+- **Non-blocking** — the retry only catches `ConnectionError`/`Timeout`;
+  `requests.exceptions.ChunkedEncodingError` (a reset mid-response-body,
+  not at handshake) is not retried. Real edge case, but not the failure
+  mode actually observed (TLS-handshake reset) — reasonable to defer by
+  the same logic already used to defer the 5xx-retry decision above.
+- **Non-blocking** — the hand-rolled attempt-count/sleep loop reimplements
+  retry-with-backoff behavior `urllib3`'s `Retry` (already bundled via
+  `requests`, no new dependency) provides via a `Session`/`HTTPAdapter`.
+  Weighed against actually switching: doing so would require adding
+  persistent `Session` state to `__init__` and re-pointing every existing
+  test's mock target from `requests.get` to the session/adapter, for a
+  modest net line savings and a backoff-formula semantics change — not a
+  clear win for one call site. Reasonable to keep as-is.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- Same reuse angle as above (hand-rolled loop vs. `urllib3.Retry`) was the
+  only candidate found. Assessed and judged not worth the churn for the
+  reason given above (new `Session` plumbing + test-mock rewrite for a
+  single call site, exact backoff-value/exception-type-only control is
+  easier to express directly than via `Retry`'s formula-based backoff).
+- No unused flexibility, no new dependency, no speculative config, no
+  reinvented stdlib otherwise. The two new module constants are both
+  load-bearing and used. The four new/extended tests each cover a distinct
+  new branch (success-after-retry, exhaustion, `Timeout` variant, "HTTP
+  errors aren't retried") — proportionate, not excessive.
+- **Lean already, modulo the one deferred reuse note above.**
+
+**Independent judgment on the missing `timeout=` gap (asked for explicitly
+— not just repeating the build report's framing):**
+- **Verdict: BLOCKING.** Three factors tip this past "defensible to defer
+  again": (1) it is cheap — a single `timeout=` kwarg, zero risk of
+  breaking the mocked unit tests since none of them assert on the absence
+  of that kwarg; (2) it directly undermines the stated goal of this exact
+  fix cycle — "this call should be resilient to network flakiness" — by
+  leaving a failure mode (indefinite hang) that is strictly *worse* than
+  the connection-reset this fix already handles (a hang never surfaces an
+  exception at all, so it never even reaches the new retry logic, let
+  alone a final error the caller can log and move past); (3) it has now
+  been flagged twice — once in this module's original review, once again
+  here — and cheap, clearly-relevant fixes that get deferred twice tend to
+  never get picked up absent being forced. A secondary, non-dispositive
+  point: shipping a dedicated `Timeout` except-branch, with its own test,
+  for an exception that is provably unreachable under the current
+  configuration reads as the problem being handled when it isn't —
+  borderline-misleading to a future maintainer skimming the retry logic.
+  Recommend a conservative, generous value (e.g. `timeout=10`) — TMDB's
+  `search/movie` typically responds in a small fraction of that, so this
+  bounds the hang without meaningfully risking false-positive timeouts on
+  legitimately-slow-but-successful responses.
+
+**Independent test runs (run directly in this review pass, not trusted
+from the build report):**
+- `python3 -m pytest tests/unit -q` → **191 passed**, matching the build
+  report's count exactly.
+- `python3 -m pytest tests/unit/tmdb/test_client.py -v` → **9 passed**,
+  including all 3 new tests and the extended
+  `test_search_movie_raises_on_http_error` by name.
+- Read `tests/unit/tmdb/test_client.py` in full: confirmed the three
+  backoff-asserting tests check the literal sleep values, not just call
+  counts — `assert mock_sleep.call_args_list == [((0.5,),), ((1.0,),)]`
+  (two-failure and exhaustion cases) and `[((0.5,),)]` (single-`Timeout`
+  case) — genuinely pinning `0.5` then `1.0`, matching the claim exactly.
+
+One blocking finding: the missing `timeout=` on `search_movie()`'s
+`requests.get(...)` call leaves the newly-added `Timeout` retry branch
+unreachable and allows an indefinite hang, which undermines this fix
+cycle's own stated robustness goal — judged here as cheap enough and
+relevant enough to fix now rather than defer a third time. All other
+findings (constant-coupling fragility, `ChunkedEncodingError` gap,
+hand-rolled-loop-vs-`Retry` reuse angle) are non-blocking. The retry
+scope (only `ConnectionError`/`Timeout`, never `HTTPError`) and the exact
+3-attempt/`0.5s`+`1.0s` backoff were independently confirmed by direct
+code reading, and the test count and backoff-value assertions were
+independently confirmed by running the tests and reading their bodies.
+
+VERDICT: NEEDS FIXES
+
+### Fixes applied
+
+Added `timeout=10` to the `requests.get(...)` call in `TMDBHttpClient.search_movie()`
+(per the review's blocking finding — the missing timeout made the new `Timeout`
+retry branch unreachable dead code and left an unbounded-hang failure mode).
+One-line fix, applied directly (not re-run through a full build/fix subagent
+cycle given how small and unambiguous it was). Verified: `tests/unit/tmdb`
+(23 passed) and the full suite (191 passed) both still pass.

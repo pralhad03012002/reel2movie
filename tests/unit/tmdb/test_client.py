@@ -119,3 +119,57 @@ def test_search_movie_raises_on_http_error(mock_get):
 
     with pytest.raises(requests.HTTPError):
         client.search_movie("The Matrix")
+
+    # A genuine HTTP error response is not a transient connection failure
+    # and must not be retried.
+    assert mock_get.call_count == 1
+
+
+@patch("reel2movie.tmdb.client.time.sleep")
+@patch("reel2movie.tmdb.client.requests.get")
+def test_search_movie_retries_connection_error_then_succeeds(mock_get, mock_sleep):
+    mock_get.side_effect = [
+        requests.exceptions.ConnectionError("reset by peer"),
+        requests.exceptions.ConnectionError("reset by peer"),
+        _mock_get_response(_CANNED_RESPONSE),
+    ]
+    client = TMDBHttpClient("token")
+
+    results = client.search_movie("The Matrix")
+
+    assert len(results) == 2
+    assert results[0].title == "The Matrix"
+    assert mock_get.call_count == 3
+    assert mock_sleep.call_args_list == [((0.5,),), ((1.0,),)]
+
+
+@patch("reel2movie.tmdb.client.time.sleep")
+@patch("reel2movie.tmdb.client.requests.get")
+def test_search_movie_exhausts_retries_and_raises_connection_error(
+    mock_get, mock_sleep
+):
+    mock_get.side_effect = requests.exceptions.ConnectionError("reset by peer")
+    client = TMDBHttpClient("token")
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        client.search_movie("The Matrix")
+
+    # Exactly 3 attempts total (not 2, not 4) — the retry budget is fixed.
+    assert mock_get.call_count == 3
+    assert mock_sleep.call_args_list == [((0.5,),), ((1.0,),)]
+
+
+@patch("reel2movie.tmdb.client.time.sleep")
+@patch("reel2movie.tmdb.client.requests.get")
+def test_search_movie_retries_timeout_then_succeeds(mock_get, mock_sleep):
+    mock_get.side_effect = [
+        requests.exceptions.Timeout("timed out"),
+        _mock_get_response(_CANNED_RESPONSE),
+    ]
+    client = TMDBHttpClient("token")
+
+    results = client.search_movie("The Matrix")
+
+    assert len(results) == 2
+    assert mock_get.call_count == 2
+    assert mock_sleep.call_args_list == [((0.5,),)]

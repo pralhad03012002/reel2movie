@@ -7,11 +7,22 @@ vast-wobbling-owl.md's "TMDB auth style" decision), not the older v3
 
 from __future__ import annotations
 
+import time
+
 import requests
 
 from reel2movie.core.models import TMDBSearchResult
 
 _SEARCH_MOVIE_URL = "https://api.themoviedb.org/3/search/movie"
+
+# Retry budget for transient connection-level failures only (confirmed via
+# real-world testing: TLS handshake resets against the real TMDB API,
+# roughly 40-60% failure rate observed, resolving within a retry or two).
+# Kept small and fast since this is a human-facing CLI call, not a
+# background batch job — 3 total attempts, backing off 0.5s then 1s between
+# them (so worst case adds 1.5s, not tens of seconds).
+_MAX_ATTEMPTS = 3
+_BACKOFF_SECONDS = [0.5, 1.0]
 
 
 def _parse_year(release_date: str | None) -> int | None:
@@ -47,17 +58,41 @@ class TMDBHttpClient:
 
         Raises on HTTP errors via `response.raise_for_status()` rather than
         swallowing them; it's the caller's job to decide how to handle
-        failures.
+        failures. HTTP errors (`requests.exceptions.HTTPError`, e.g. a real
+        4xx/5xx response) are NOT retried here — a real API-level response
+        indicates an actual problem (bad auth, bad request, server error),
+        not a transient connection issue, so retrying would risk masking a
+        real bug or hammering a server that's deliberately erroring.
+
+        Connection-level transient failures (`requests.exceptions.
+        ConnectionError`, `requests.exceptions.Timeout` — e.g. a TLS
+        handshake reset, which is what's actually been observed against the
+        real TMDB API) ARE retried, up to `_MAX_ATTEMPTS` total attempts
+        with a short exponential backoff between them. If every attempt is
+        exhausted, the final exception is raised as before — the caller
+        (`tmdb/resolver.py`'s `resolve_candidate`, via `pipeline/
+        waterfall.py`'s `_resolve_all`) already catches and logs this
+        per-candidate.
         """
         params: dict[str, str | int] = {"query": query}
         if year is not None:
             params["year"] = year
 
-        response = requests.get(
-            _SEARCH_MOVIE_URL,
-            headers={"Authorization": f"Bearer {self._bearer_token}"},
-            params=params,
-        )
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                response = requests.get(
+                    _SEARCH_MOVIE_URL,
+                    headers={"Authorization": f"Bearer {self._bearer_token}"},
+                    params=params,
+                    timeout=10,
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                if attempt == _MAX_ATTEMPTS - 1:
+                    raise
+                time.sleep(_BACKOFF_SECONDS[attempt])
+                continue
+            break
+
         response.raise_for_status()
         payload = response.json()
 
