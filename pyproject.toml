@@ -9,6 +9,7 @@ dependencies = [
     "rapidfuzz",
     "imageio-ffmpeg",
     "anthropic>=1.0",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]

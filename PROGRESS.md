@@ -3668,3 +3668,24 @@ it came back as `ClaudeCodeVisionError` naming that exact binary string.
 Both confirm the fix end-to-end, not just via the mocked test.
 
 VERDICT: fix applied for the BLOCKING finding; ready for re-review.
+
+---
+
+## Post-ship follow-up — .env was never actually loaded
+
+Discovered while preparing for a real end-to-end test: `config.py` only
+ever read `os.environ` directly — nothing in the project called
+`load_dotenv()`, so values sitting in `.env` were never actually visible
+to the running process. This was a gap across all 9 original subtasks and
+the vision-backend follow-up; none of the build passes added it.
+
+Fixed directly (small, well-understood, low-risk addition — not run
+through the full subagent build-review loop): added `python-dotenv` to
+`pyproject.toml`, and `reel2movie/cli.py`'s `main()` now calls
+`load_dotenv()` as its first line (never overrides a var already set in
+the real shell environment). Verified via `python3 -m pytest tests -q`
+(154 passed, 1 skipped, no regressions) and a real smoke test:
+`python3 -m reel2movie "https://www.instagram.com/reel/dummy123/"` now
+gets past config entirely and fails only at real yt-dlp ingestion (dummy
+URL isn't a real reel) instead of erroring on a missing env var — proof
+`.env`'s `TMDB_API_KEY` is actually being read now.

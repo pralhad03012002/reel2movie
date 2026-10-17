@@ -1,5 +1,11 @@
 """Command-line entry point: ``python -m reel2movie <reel_url>``.
 
+Loads a ``.env`` file (if present) via ``python-dotenv`` before anything
+else runs, so the env vars ``config.py`` reads (``TMDB_API_KEY``, etc.) can
+come from a local ``.env`` instead of requiring the caller's shell
+environment to already have them set. ``load_dotenv()`` never overrides a
+variable already set in the real environment.
+
 Wires the real pipeline (``build_default_pipeline_deps()`` +
 ``run_pipeline()``) to a minimal argparse CLI and serializes the resulting
 ``PipelineResult`` to the JSON shape documented in ``brainstorm.md``'s
@@ -33,6 +39,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+
+from dotenv import load_dotenv
 
 from reel2movie.core.models import PipelineResult, Recommendation, ResolvedMovie
 from reel2movie.pipeline.deps import build_default_pipeline_deps
@@ -102,6 +110,8 @@ def _result_to_dict(result: PipelineResult) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()  # populates os.environ from a .env file, if one is found; never overrides a var already set
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 
