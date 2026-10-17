@@ -3689,3 +3689,443 @@ the real shell environment). Verified via `python3 -m pytest tests -q`
 gets past config entirely and fails only at real yt-dlp ingestion (dummy
 URL isn't a real reel) instead of erroring on a missing env var — proof
 `.env`'s `TMDB_API_KEY` is actually being read now.
+
+---
+
+## Follow-up — Claude CLI text extraction fallback — status: done
+
+### Motivation
+
+A real end-to-end test against an actual Instagram reel (caption: "🎬
+Dhobi Ghat, released internationally as Mumbai Diaries and Bombay
+Diaries, is a 2010 Indian drama film directed by Kiran Rao...") showed
+`RegexCandidateExtractor` completely misses the movie title: it's stated
+in natural prose — no quotes, no year immediately in parens (`"is a 2010
+... film"`, not `"Dhobi Ghat (2010)"`), no numbered list. This is a real,
+common caption style that regex is structurally incapable of parsing (it
+only matches a small set of explicit shapes by design — see Subtask 3's
+section above). Regex itself is not wrong or buggy here; it's simply
+scoped to a narrower set of shapes than real captions actually use.
+
+### What's built
+
+Files created:
+- `reel2movie/text_extraction/claude_code_extractor.py` — `TextChatClient`
+  (a local `@runtime_checkable` `Protocol`, `chat(prompt) -> str`, same
+  pattern as `visual/vision_llm_detector.py`'s local `VisionChatClient`),
+  `ClaudeCodeTextError` (text-only mirror of `ClaudeCodeVisionError`'s
+  semantics), `ClaudeCodeTextChatClient` (shells out to the `claude` CLI
+  with `claude -p --output-format json --tools "" --permission-mode
+  bypassPermissions --no-session-persistence <prompt>` — `--tools ""`
+  instead of `vision_llm_detector.py`'s `--tools Read`, since pure text
+  reasoning needs no file/image access at all), and
+  `ClaudeCodeCandidateExtractor` (the actual `CandidateExtractor`).
+  `ClaudeCodeTextChatClient.chat()`'s error-handling layering is an exact
+  mirror of `ClaudeCodeVisionChatClient.chat()`: `subprocess.TimeoutExpired`
+  → `OSError` → non-zero exit → `json.JSONDecodeError` → `is_error` →
+  `permission_denials` → return `parsed["result"]`, raising
+  `ClaudeCodeTextError` at each stage.
+  `ClaudeCodeCandidateExtractor.extract(text, source)`:
+  - Short-circuits to `return []` with **no CLI call at all** when `text`
+    is empty/whitespace-only — no point spending a subprocess call on
+    nothing (proven by a test asserting the fake chat client's call count
+    stays 0).
+  - Otherwise embeds `text` directly into a prompt (no file needed)
+    instructing the model to identify any movie title(s) explicitly
+    stated or clearly implied, including year if stated, including
+    natural-prose statements of fact (not just quoted/listed titles), and
+    to respond with ONLY a strict JSON array
+    (`[{"title": "...", "year": 2010, "confidence": "high"}]` or `[]`) —
+    same prompt-strictness pattern as `VisionLLMPosterDetector`'s own
+    prompt (no prose, no markdown fences).
+  - Parses the response with the exact same defensive pattern
+    `VisionLLMPosterDetector.detect()` uses: non-JSON → `[]`; not a list →
+    `[]`; a malformed item (missing/non-string/blank `title`) within an
+    otherwise-good list is skipped via `logger.warning(...)`, siblings
+    kept; `year` normalized the same way (bool rejected, numeric string
+    coerced, anything else non-int dropped to `None`).
+  - Maps `"high"` → `HIGH_CONFIDENCE`, `"medium"` → `MEDIUM_CONFIDENCE`,
+    anything else/missing → `MEDIUM_CONFIDENCE` (the safe middle default
+    — never defaults an unrecognized label to HIGH, which would be too
+    permissive).
+  - Builds `raw_text` as `f"{title} ({year})"` when a year is given, else
+    bare `title` — byte-for-byte the same format `regex_extractor.py`
+    uses, which is what makes `tmdb/resolver.py`'s `_extract_year_hint()`
+    work on this extractor's output without any special-casing.
+  - `source` is always the method's own parameter, never hardcoded.
+- `reel2movie/text_extraction/fallback_extractor.py` —
+  `FallbackCandidateExtractor(primary, fallback)`: calls
+  `primary.extract(text, source)`, returns it immediately if non-empty,
+  otherwise calls and returns `fallback.extract(text, source)`. Both
+  constructor parameters are typed against `core.protocols.CandidateExtractor`
+  (structural), not any concrete class — a generic composable wrapper,
+  not specific to regex+claude at all, so it can wrap any two
+  `CandidateExtractor`-shaped objects in the future.
+
+Files changed:
+- `reel2movie/pipeline/deps.py` — `build_default_pipeline_deps()`'s
+  `text_extractor` is now
+  `FallbackCandidateExtractor(RegexCandidateExtractor(),
+  ClaudeCodeCandidateExtractor(ClaudeCodeTextChatClient()))` instead of a
+  bare `RegexCandidateExtractor()`. Docstring updated to call out
+  explicitly that this wiring is **independent of `VISION_BACKEND`**: the
+  `claude` CLI is now an always-on dependency for *text* extraction
+  regardless of which vision backend (`claude_code` or `anthropic_api`)
+  is selected for the separate *visual* poster-detection step. These are
+  two independent decisions that happen to both be able to use the same
+  CLI — not coupled to each other.
+
+Tests added:
+- `tests/unit/text_extraction/test_claude_code_extractor.py` —
+  `TestClaudeCodeTextChatClient` mirrors
+  `test_vision_llm_detector.py`'s `TestClaudeCodeVisionChatClient` shapes
+  exactly (mocked `subprocess.run`): success (asserts `--tools ""` is
+  passed, not `Read`), timeout, missing binary/`OSError`, non-zero exit,
+  non-JSON stdout, `is_error`, non-empty `permission_denials`, custom
+  binary/timeout. `TestClaudeCodeCandidateExtractor*` uses a fake
+  `TextChatClient` returning canned JSON: single movie w/ year →
+  `HIGH_CONFIDENCE` + `raw_text` round-trips through
+  `tmdb/resolver.py`'s `_extract_year_hint()` (imported and called
+  directly), single movie w/o year (round-trips to `None` year hint),
+  multi-movie, explicit `[]`, non-JSON response (non-raising, `[]`), JSON
+  object instead of array (`[]`), an item missing `title` within an
+  otherwise-good list (skipped, sibling kept), unrecognized confidence
+  label → `MEDIUM_CONFIDENCE` default, `source` echoed correctly for both
+  `SourceTag` values, and the empty-string/whitespace-only short-circuit
+  (asserts the fake chat client's `call_count == 0` — proves no wasted
+  subprocess call).
+- `tests/unit/text_extraction/test_fallback_extractor.py` — fake
+  primary/fallback `CandidateExtractor`s recording whether they were
+  called and what they were called with: primary non-empty → fallback
+  never called, result is primary's; primary empty → fallback called,
+  result is fallback's; both empty → `[]` with no error; `text`/`source`
+  passed through unchanged to whichever extractor(s) actually run.
+- `tests/unit/pipeline/test_deps.py` —
+  `test_text_extractor_is_fallback_wrapping_regex_and_claude_code`:
+  confirms `build_default_pipeline_deps()`'s `text_extractor` is a
+  `FallbackCandidateExtractor` whose `_primary` is a
+  `RegexCandidateExtractor` and whose `_fallback` is a
+  `ClaudeCodeCandidateExtractor` (introspected directly via attribute
+  access, since there's no public accessor and none was warranted for
+  just this one test).
+
+Ran `python3 -m pytest tests/unit -q`:
+
+```
+........................................................................ [ 39%]
+........................................................................ [ 79%]
+.....................................                                    [100%]
+181 passed in 3.52s
+```
+
+(154 passing before this change + 27 new: 17 in
+`test_claude_code_extractor.py`, 5 in `test_fallback_extractor.py`, 1 new
+in `test_deps.py`, plus `tests/unit/pipeline/test_deps.py`'s pre-existing
+tests still passing unchanged — the arithmetic here is 154 + 27 = 181,
+matching the observed count exactly.)
+
+### Confidence-mapping rationale — text-tier, not vision-tier
+
+`ClaudeCodeCandidateExtractor` maps the model's own `"high"`/`"medium"`
+labels to `HIGH_CONFIDENCE` (0.9) / `MEDIUM_CONFIDENCE` (0.6) — the exact
+same module-level constants `regex_extractor.py` uses for its own
+HIGH/MEDIUM tiers, imported directly rather than re-declared as parallel
+literals (per this project's established convention — `waterfall.py`'s
+`CONFIDENCE_THRESHOLD = HIGH_CONFIDENCE` set this precedent). This is
+deliberately **not** `vision_llm_detector.py`'s dampened 0.8/0.5/0.3
+scale, even though both modules are "a `claude`-CLI-backed LLM call
+parsed into Candidates" at the implementation level. The two cases are
+not analogous in kind:
+
+- Vision detection is fundamentally a *guess from pixels* — the model is
+  inferring a title from a poster image or scene it may only partially
+  recognize, so even a "high confidence" vision read carries irreducible
+  uncertainty from the image itself. Dampening to 0.8 reflects that.
+- Explicit text stating "X is a 2010 film" is not a guess — it's reading
+  a fact the caption's author already wrote down in plain language. The
+  only reason this needs an LLM at all (instead of regex) is that the
+  *shape* of the sentence isn't one of regex's four matchable patterns —
+  the *certainty* of the claim itself is no different from regex's own
+  HIGH tier (`"Title (YYYY)"`, quoted or unquoted), which also just reads
+  an explicit title+year stated directly in the text. An LLM correctly
+  reading an unambiguous textual statement deserves the same confidence
+  tier as regex pattern-matching an unambiguous textual shape — the
+  *extraction mechanism* differs, the *epistemic status of the claim*
+  does not.
+- Concretely: this is what lets `waterfall.py`'s `CONFIDENCE_THRESHOLD =
+  HIGH_CONFIDENCE` gate correctly treat a claude-CLI-recovered "Dhobi Ghat
+  is a 2010 film" caption candidate as "confident enough to skip the
+  creator-comment and visual-fallback steps" — exactly like a regex HIGH
+  hit would, and exactly unlike a vision-tier 0.8 would (0.8 < 0.9, so a
+  vision hit alone never clears this gate, by design. A text-tier 0.9
+  claude-CLI hit correctly does).
+- The `"medium"` label maps to `MEDIUM_CONFIDENCE` (0.6) for the same
+  reason regex's own MEDIUM tier exists: a title-like signal is present
+  (the model identified a specific movie) but without the same
+  unambiguous year-anchored certainty — e.g. the text implies a
+  recommendation without flatly stating it as settled fact. An
+  unrecognized/missing confidence label also falls back to
+  `MEDIUM_CONFIDENCE`, not `HIGH_CONFIDENCE` — deliberately the safer,
+  less-permissive default, since defaulting an *unparseable* label to the
+  *most* trusted tier would be backwards.
+
+### Fallback-composition design
+
+`FallbackCandidateExtractor` is intentionally generic: both constructor
+parameters (`primary`, `fallback`) are typed against
+`core.protocols.CandidateExtractor` — the structural Protocol — not
+against `RegexCandidateExtractor`/`ClaudeCodeCandidateExtractor`
+concretely. `extract()` is exactly the three-line waterfall the task
+spec gave: try `primary`, return its result immediately if non-empty,
+otherwise call and return `fallback`'s result. This keeps the "try cheap
+first, escalate only on a miss" pattern reusable for any future
+extractor pair (e.g. if a third, even-smarter extractor is added later,
+or if the regex/claude roles ever need swapping in a test), rather than
+hardcoding a regex-specific or claude-specific waterfall. The composition
+also means `RegexCandidateExtractor`'s own zero-latency/zero-cost
+behavior for the common explicit-format case is fully preserved — regex
+runs unconditionally first, and the `claude` CLI subprocess is only ever
+invoked on a genuine regex miss, never on every call.
+
+### New always-on dependency: the `claude` CLI for text extraction
+
+This follow-up adds a **new, unconditional** runtime dependency on the
+local `claude` CLI being installed/on `PATH`/authenticated: whenever
+regex finds zero candidates for a caption or creator-comment block,
+`build_default_pipeline_deps()`'s wiring now shells out to `claude` to
+try again, **regardless of `VISION_BACKEND`'s value**. Before this
+follow-up, the `claude` CLI was only ever invoked when
+`VISION_BACKEND=claude_code` (the default) was selected for the visual
+poster-detection step — a user on `VISION_BACKEND=anthropic_api` could
+previously avoid the `claude` CLI entirely and rely solely on the
+`anthropic` API key for everything. That is no longer true: text
+extraction's fallback path always uses the `claude` CLI now, independent
+of whatever the visual step is configured to use. This is a deliberate,
+not-silently-coupled decision per the task spec ("don't couple these two
+independent decisions") — it is called out explicitly here, and in
+`deps.py`'s own docstring, rather than left as an implicit side effect a
+future maintainer would have to rediscover by reading code.
+
+### Open questions / risks
+
+- **No live `claude` CLI call was tested end-to-end against the real
+  Dhobi Ghat caption** in this follow-up — all tests use a fake
+  `TextChatClient`/mocked `subprocess.run`, per the explicit "no real
+  subprocess calls in automated tests" instruction. The prompt's ability
+  to actually recover "Dhobi Ghat" (year 2010) from that exact caption
+  text in practice is not verified by this test suite; it's a reasonable
+  design based on the same prompt-strictness pattern
+  `VisionLLMPosterDetector` already uses successfully, but a real smoke
+  test against the actual reel (as the motivating bug report described)
+  would be the next step to fully close the loop.
+- **Latency/cost**: unlike `RegexCandidateExtractor`, every regex-miss
+  now costs one `claude` CLI subprocess invocation (default 60s timeout)
+  per caption and per creator-comment text block. For a reel whose
+  caption and every creator top-level comment all miss regex, this could
+  mean several sequential CLI calls before even reaching the visual
+  fallback step. Not addressed here (out of scope per the task spec,
+  which explicitly asked only for the fallback mechanism, not
+  batching/parallelizing the calls) — worth revisiting if real-world
+  waterfall latency becomes a concern.
+- **`--tools ""` CLI flag shape** was specified directly by the task
+  instructions (not independently re-derived from a captured real
+  response, unlike `ClaudeCodeVisionChatClient`'s `--tools Read`, which
+  the project's history notes was grounded in an actual captured CLI
+  response). If a live run shows `--tools ""` doesn't behave as expected
+  (e.g. a different flag shape is needed to fully disable tools on this
+  CLI version), that would need a fresh real-response capture the same
+  way the vision client's shape was originally validated.
+- This follow-up did not touch `pipeline/waterfall.py` at all — the
+  waterfall already calls `deps.text_extractor.extract(...)` generically
+  against the `CandidateExtractor` Protocol, so swapping in
+  `FallbackCandidateExtractor` under that same attribute name required no
+  changes to the waterfall's own logic. `CONFIDENCE_THRESHOLD =
+  HIGH_CONFIDENCE` (imported from `regex_extractor.py`) continues to work
+  unchanged, now correctly gating claude-CLI-recovered text candidates
+  the same way it already gated regex's own HIGH candidates.
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (medium) on the current diff
+(`reel2movie/text_extraction/{claude_code_extractor,fallback_extractor}.py`,
+`reel2movie/pipeline/deps.py`, and the new/updated tests),
+`/ponytail:ponytail-review` on the same diff, a manual line-by-line
+comparison of `ClaudeCodeTextChatClient.chat()` against
+`ClaudeCodeVisionChatClient.chat()`, a manual trace of the
+confidence-default and fallback-triggering-condition logic plus the tests
+that claim to prove them, a grep-based check of `deps.py`'s
+`VISION_BACKEND` independence, and a fresh `python3 -m pytest tests/unit -q`
+run (181 passed, confirmed independently, not just trusted from the build
+report).
+
+**Manual verification — the five highest-risk correctness points named for
+this pass, all confirmed correct:**
+
+1. **Error-handling layering mirrors the vision client.** Read
+   `ClaudeCodeTextChatClient.chat()` (`claude_code_extractor.py` L86-153)
+   side by side with `ClaudeCodeVisionChatClient.chat()`
+   (`vision_llm_detector.py` L166-238): both run the exact same ordered
+   stages -- `subprocess.TimeoutExpired` -> `OSError` -> non-zero exit ->
+   `json.JSONDecodeError` -> `is_error` -> `permission_denials` -> `return
+   parsed["result"]` -- raising their own distinctly-typed error
+   (`ClaudeCodeTextError`/`ClaudeCodeVisionError`) at each stage. Confirmed
+   genuinely matching, not just claimed to match.
+2. **Confidence import, not duplicated literals.**
+   `claude_code_extractor.py` L41-44 imports `HIGH_CONFIDENCE,
+   MEDIUM_CONFIDENCE` directly from `regex_extractor.py` -- confirmed by
+   reading the import statement, not a re-declared `0.9`/`0.6` literal.
+   `_CONFIDENCE_MAP` (L192-195) maps `"high"`->`HIGH_CONFIDENCE`,
+   `"medium"`->`MEDIUM_CONFIDENCE`; `_DEFAULT_CONFIDENCE =
+   MEDIUM_CONFIDENCE` (L200) is the fallback for a missing/unrecognized
+   label -- confirmed NOT defaulting to HIGH.
+   `test_unrecognized_confidence_label_falls_back_to_medium_default`
+   (`test_claude_code_extractor.py` L361-371) exercises this directly with
+   `"confidence": "very sure"` and asserts `candidate.confidence ==
+   MEDIUM_CONFIDENCE`. This is the correct, safe default.
+3. **`raw_text` format round-trips through `resolver.py`.**
+   `claude_code_extractor.py` L274: `raw_text = f"{title} ({year})" if year
+   is not None else title` -- byte-identical to `regex_extractor.py`'s own
+   HIGH-tier format. `test_raw_text_year_round_trips_through_resolver`
+   (`test_claude_code_extractor.py` L248-256) imports
+   `tmdb.resolver._extract_year_hint` directly and asserts it recovers the
+   year from a constructed candidate's `raw_text` -- a genuine cross-module
+   round-trip test, not just an eyeballed string-shape assertion.
+4. **`FallbackCandidateExtractor` triggers only on an EMPTY primary result,
+   never on confidence.** `fallback_extractor.py` L35-37: `primary_result =
+   self._primary.extract(...); if primary_result: return primary_result;
+   return self._fallback.extract(...)` -- a plain truthiness check on the
+   list, no confidence inspection anywhere. Confirmed by reading the whole
+   38-line file (nothing else in it could branch on confidence) and by
+   `test_fallback_extractor.py`'s
+   `test_primary_nonempty_short_circuits_fallback`, which uses a primary
+   returning a single arbitrary-confidence (`0.9`) candidate and asserts
+   `fallback.called is False` -- though confidence is irrelevant to that
+   fake, so the test alone doesn't distinguish "any non-empty result
+   short-circuits" from "any sufficiently-confident result
+   short-circuits." Traced the implementation itself (not just the test)
+   to settle this: there is no confidence read anywhere in
+   `fallback_extractor.py`, so even a bare MEDIUM-confidence regex
+   candidate correctly short-circuits the claude-CLI fallback, matching
+   the design intent exactly.
+5. **Empty/whitespace short-circuit never invokes the chat client.**
+   `claude_code_extractor.py` L225-226: `if not text or not text.strip():
+   return []` -- placed before `self._chat_client.chat(...)` is ever
+   referenced, so no code path between the guard and a `chat()` call
+   exists. `test_empty_string_never_calls_chat_client` and
+   `test_whitespace_only_text_never_calls_chat_client`
+   (`test_claude_code_extractor.py` L391-407) both assert `fake.call_count
+   == 0` on a fake `TextChatClient` that increments a counter inside
+   `chat()` -- a genuine zero-subprocess-calls proof, not an inferred
+   claim.
+
+**From `/code-review` (medium) -- four findings, outside the five points
+above but worth recording:**
+- **Non-blocking** -- `pipeline/waterfall.py` L75-89
+  (`_extract_from_creator_comments`, file not touched by this diff but
+  newly exposed by it): the `for comment in creator_top_level_comments`
+  loop accumulates `candidates` across multiple comments, all inside one
+  `try` that maps any exception to a blanket `except Exception: return
+  []`. Before this follow-up, `deps.text_extractor` was a bare
+  `RegexCandidateExtractor`, which never raises -- so this blanket catch
+  was dead code for all practical purposes. Now that `text_extractor` can
+  genuinely raise (`ClaudeCodeTextError` from a subprocess
+  timeout/missing-binary/malformed-CLI-response on any one comment), a
+  failure on comment N discards every candidate already found from
+  comments 1..N-1 in the same batch, not just comment N's own (empty)
+  result. Concrete failure scenario: creator posts two top-level comments,
+  the first regex-matches a HIGH candidate, the second is prose that falls
+  to the `claude` CLI fallback and that CLI call times out -- the whole
+  step returns `[]`, discarding the first comment's good candidate and
+  incorrectly falling through to the visual-fallback step. This is a real
+  behavior change introduced by this follow-up (making a previously-
+  unreachable catch block reachable with real consequences), but it's in
+  an unmodified file outside this diff's scope -- flagging as a risk to
+  fix in a follow-up to `waterfall.py` rather than blocking this diff.
+- **Non-blocking, by design -- not a bug** -- `fallback_extractor.py`
+  L34-37: a regex false-positive (e.g. an unrelated quoted phrase matched
+  by `_QUOTED_SPAN`) returns a non-empty-but-wrong result that
+  short-circuits the claude-CLI fallback, even though the caption's real
+  movie statement (in prose, elsewhere in the same text) would have been
+  caught by the fallback. `/code-review` initially flagged this as a
+  defect; re-checked against this pass's explicit design instruction ("per
+  design, any non-empty regex result -- even a bare MEDIUM-confidence
+  candidate -- should short-circuit the claude-CLI fallback entirely,
+  since regex already explicitly skips genuinely low-signal text rather
+  than tagging it LOW") and confirmed this is the intended, accepted
+  tradeoff, not an oversight. Recording here as a known edge case (a stray
+  regex match can mask a real prose statement elsewhere in the same text)
+  rather than a finding to fix.
+- **Non-blocking** -- `claude_code_extractor.py` L247-283 duplicates ~35
+  lines of `vision_llm_detector.py`'s `VisionLLMPosterDetector.detect()`
+  parsing loop (L320-362) near-verbatim (non-dict-item skip, title
+  validation, bool/str/int year coercion, confidence-label lookup). Also
+  flagged independently by the ponytail pass below -- see there for the
+  fix recommendation.
+- **Non-blocking** -- `claude_code_extractor.py` L228
+  (`_PROMPT_TEMPLATE.replace("{text}", text)`): untrusted caption/comment
+  text is spliced directly into the LLM prompt with no escaping, so a
+  crafted caption could in principle prompt-inject a fabricated
+  HIGH-confidence title. Bounded blast radius: `--tools ""` means no
+  tool/file access is at risk, and the pipeline's existing trust model
+  already lets any caption author plant an arbitrary `Candidate` via
+  `RegexCandidateExtractor`'s own pattern-matching (e.g. writing
+  `"Anything" (1999)` directly) -- this is a variation on an
+  already-accepted trust boundary (caption text chooses its own extracted
+  candidate), not a new category of risk. Worth a light mitigation (e.g.
+  wrapping the untrusted span more defensively) but not blocking.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- `claude_code_extractor.py:L86-153` vs `vision_llm_detector.py:L166-238`:
+  `shrink:` both ~70-line `chat()` bodies run the identical 6-stage
+  error-layering boilerplate, differing only in CLI args/messages. One
+  shared `_run_claude_cli(args, binary, timeout) -> dict` helper collapses
+  both to ~12-line wrappers.
+- `claude_code_extractor.py:L247-283` vs
+  `vision_llm_detector.py:L320-362`: `shrink:` identical per-item
+  title/year/confidence-parsing loop, copy-pasted. One shared
+  `_parse_item(item) -> tuple[...] | None` helper.
+- `ClaudeCodeTextError` vs `ClaudeCodeVisionError` and the
+  `TextChatClient`/`VisionChatClient` Protocol split: **not flagged** --
+  these back genuinely distinct catch sites (`pipeline/waterfall.py`'s
+  separate text-extraction and visual-fallback steps) with different call
+  signatures (`chat(prompt)` vs `chat(image_path, prompt)`); keeping them
+  separately typed is the right call, not duplication for its own sake.
+  This directly answers the "or whether keeping them separate is the
+  right call" question: the *types* should stay separate, but the
+  *mechanics inside `chat()`'s body* should not have been copy-pasted.
+- `fallback_extractor.py` and the `deps.py` diff: lean already, nothing to
+  cut.
+- `net: -60 lines possible` (both findings span into the already-shipped
+  `vision_llm_detector.py`, so realizing the saving means touching code
+  outside this diff, not just this diff's new files).
+
+**Independent verification of `deps.py` wiring (not trusted from the build
+report):**
+- Read `build_default_pipeline_deps()` (`pipeline/deps.py` L61-125):
+  confirmed `text_extractor = FallbackCandidateExtractor(
+  RegexCandidateExtractor(), ClaudeCodeCandidateExtractor(
+  ClaudeCodeTextChatClient()))` (L101-104) is constructed and assigned
+  *before* `backend = config.get_vision_backend()` is even called
+  (L106) -- the construction has no data or control dependency on
+  `backend` at all.
+- `grep -rn "VISION_BACKEND" reel2movie/` confirms the only places
+  `VISION_BACKEND` is read or referenced are `config.py`
+  (`get_vision_backend()`'s own implementation) and `deps.py`'s
+  visual-backend branch (L106-116) plus its own docstring prose -- never
+  anywhere near the `text_extractor` assignment. Confirmed independent.
+
+**Independent test run:**
+- `python3 -m pytest tests/unit -q` run directly (not trusted from the
+  reported 181): **181 passed in 3.47s** -- matches the build report's
+  count exactly.
+
+No blocking findings. The five highest-risk correctness points for this
+pass (error-handling mirroring, confidence-default safety, raw_text
+round-trip, fallback-triggering condition, empty-text short-circuit) all
+check out exactly as designed. The one genuinely new risk
+(`waterfall.py`'s creator-comment loop now able to discard already-found
+candidates on a mid-loop `ClaudeCodeTextError`) is real but lives in a
+file outside this diff's scope, and the duplication findings are
+complexity/maintenance concerns, not correctness defects.
+
+VERDICT: ACCEPTABLE

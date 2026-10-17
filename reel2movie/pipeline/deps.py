@@ -22,6 +22,11 @@ from reel2movie.core.protocols import (
 )
 from reel2movie.ingest.instagram import InstagramIngestor
 from reel2movie.ingest.ytdlp_client import YtDlpClient
+from reel2movie.text_extraction.claude_code_extractor import (
+    ClaudeCodeCandidateExtractor,
+    ClaudeCodeTextChatClient,
+)
+from reel2movie.text_extraction.fallback_extractor import FallbackCandidateExtractor
 from reel2movie.text_extraction.regex_extractor import RegexCandidateExtractor
 from reel2movie.tmdb.client import TMDBHttpClient
 from reel2movie.visual.vision_llm_detector import (
@@ -59,7 +64,16 @@ def build_default_pipeline_deps() -> PipelineDeps:
     - `ingestor` -- `InstagramIngestor` over a real `YtDlpClient`, with
       `config.get_instagram_cookies_file()` passed through (may be
       `None`; `InstagramIngestor` itself tolerates that).
-    - `text_extractor` -- `RegexCandidateExtractor` (no config needed).
+    - `text_extractor` -- `FallbackCandidateExtractor` wrapping
+      `RegexCandidateExtractor` (free/instant first pass, no config
+      needed) with `ClaudeCodeCandidateExtractor` over a
+      `ClaudeCodeTextChatClient` as the fallback for prose regex can't
+      parse. This always shells out to the local `claude` CLI for text
+      when regex finds nothing -- independent of, and regardless of,
+      whatever `config.get_vision_backend()` selects for the *visual*
+      poster detector below. The two are separate decisions: the `claude`
+      CLI is now a dependency for text extraction unconditionally, not
+      just when `VISION_BACKEND=claude_code`.
     - `poster_detector` -- `VisionLLMPosterDetector` over whichever
       `VisionChatClient` `config.get_vision_backend()` selects:
       `"claude_code"` (the default) wires a `ClaudeCodeVisionChatClient`
@@ -84,7 +98,10 @@ def build_default_pipeline_deps() -> PipelineDeps:
     ingestor = InstagramIngestor(
         YtDlpClient(), cookies_file=config.get_instagram_cookies_file()
     )
-    text_extractor = RegexCandidateExtractor()
+    text_extractor = FallbackCandidateExtractor(
+        RegexCandidateExtractor(),
+        ClaudeCodeCandidateExtractor(ClaudeCodeTextChatClient()),
+    )
 
     backend = config.get_vision_backend()
     if backend == "claude_code":

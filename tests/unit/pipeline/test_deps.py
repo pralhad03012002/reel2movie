@@ -11,6 +11,11 @@ from __future__ import annotations
 import pytest
 
 from reel2movie.pipeline.deps import PipelineDeps, build_default_pipeline_deps
+from reel2movie.text_extraction.claude_code_extractor import (
+    ClaudeCodeCandidateExtractor,
+)
+from reel2movie.text_extraction.fallback_extractor import FallbackCandidateExtractor
+from reel2movie.text_extraction.regex_extractor import RegexCandidateExtractor
 
 
 def test_builds_without_raising_when_required_env_vars_present(monkeypatch):
@@ -73,3 +78,19 @@ def test_anthropic_api_backend_succeeds_when_key_set(monkeypatch):
     deps = build_default_pipeline_deps()
 
     assert isinstance(deps, PipelineDeps)
+
+
+def test_text_extractor_is_fallback_wrapping_regex_and_claude_code(monkeypatch):
+    """The new always-on text fallback: regex first (free/instant), claude
+    CLI second -- wired regardless of VISION_BACKEND's value.
+    """
+    monkeypatch.setenv("TMDB_API_KEY", "fake-tmdb-token")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("VISION_BACKEND", raising=False)
+    monkeypatch.delenv("INSTAGRAM_COOKIES_FILE", raising=False)
+
+    deps = build_default_pipeline_deps()
+
+    assert isinstance(deps.text_extractor, FallbackCandidateExtractor)
+    assert isinstance(deps.text_extractor._primary, RegexCandidateExtractor)
+    assert isinstance(deps.text_extractor._fallback, ClaudeCodeCandidateExtractor)
