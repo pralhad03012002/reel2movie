@@ -30,7 +30,11 @@ from reel2movie.core.models import (
 from reel2movie.pipeline.deps import PipelineDeps
 from reel2movie.text_extraction.regex_extractor import HIGH_CONFIDENCE
 from reel2movie.tmdb.resolver import resolve_candidate
-from reel2movie.visual.frame_sampler import sample_frames
+from reel2movie.visual.frame_sampler import (
+    FrameExtractionError,
+    probe_duration_seconds,
+    sample_frames,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,26 +102,43 @@ def _extract_from_visual(result: IngestResult, deps: PipelineDeps) -> list[Candi
     This is the last fallback: whatever it produces is used as-is, even
     if sparse or empty -- there is no further step to fall through to.
 
-    Two distinct "found nothing" causes are deliberately logged/handled
-    differently, so a later debugging session can tell them apart instead
-    of seeing the same opaque `[]`:
+    Duration determination (this is a fallback-probe-then-decide flow,
+    not a check-before-downloading one): `result.duration_seconds` (from
+    yt-dlp/Instagram metadata) is used directly when it's a valid
+    positive number -- it's free, no extra ffmpeg call needed. But
+    yt-dlp/Instagram can legitimately omit duration for a given reel
+    (`IngestResult.duration_seconds` is typed `float | None`), and a
+    missing/invalid *reported* duration must NOT by itself prevent this
+    last-resort fallback from running. So `deps.ingestor.ensure_video`
+    now runs unconditionally whenever this step is reached (this step
+    already needs the downloaded video for frame sampling regardless),
+    and when metadata duration is missing/invalid,
+    `frame_sampler.probe_duration_seconds` is used instead to determine
+    the duration directly from the downloaded file -- independent of
+    whatever Instagram/yt-dlp did or didn't report. Only when probing
+    ALSO fails (raises `FrameExtractionError`) or ALSO yields an invalid
+    (`<= 0`) value is duration treated as genuinely undeterminable.
 
-    1. `result.duration_seconds` is `None` or `<= 0` (yt-dlp can
-       legitimately omit duration for a given reel -- `IngestResult.
-       duration_seconds` is typed `float | None`). This is checked
-       explicitly *before* calling `sample_frames` -- that function does
-       an unconditional `duration_seconds <= 0`, which raises `TypeError`
-       on `None`, and letting that TypeError fall into the blanket
-       `except Exception` below would silently and misleadingly report
-       this case identically to "the visual detector ran and found
-       nothing" or "ffmpeg actually failed", when in fact the last
-       fallback could not even be attempted. Logged as its own warning
-       and returns `[]` without ever calling `sample_frames` or
-       `ensure_video`.
-    2. Any other internal failure (ensure_video, ffmpeg extraction, poster
-       detection) -- caught by the `except Exception` below and logged via
-       `logger.exception` with a different message, same as the other
-       waterfall steps.
+    Three distinct outcomes are deliberately logged/handled differently,
+    so a later debugging session can tell them apart instead of seeing
+    the same opaque `[]`:
+
+    1. Duration genuinely undeterminable: metadata was missing/invalid
+       *and* probing the downloaded file also failed or also produced an
+       invalid value. Logged as its own warning and returns `[]` without
+       ever calling `sample_frames`. Note `ensure_video` has already run
+       by this point -- a reel whose video is corrupt/unprobeable now
+       always pays for the download attempt, which the old
+       check-before-downloading flow could sometimes skip. Accepted cost
+       of making probing possible at all; see PROGRESS.md.
+    2. Any other internal failure (`ensure_video` itself raising, ffmpeg
+       frame extraction, poster detection) -- caught by the
+       `except Exception` below and logged via `logger.exception` with a
+       different message, same as the other waterfall steps.
+    3. Success, via either metadata or probed duration -- which source
+       won is logged (debug for metadata, info for probed), since
+       probing is new, not-yet-proven-reliable behavior worth being able
+       to distinguish from metadata-sourced duration in logs.
 
     Frame-directory lifecycle: `sample_frames` (per its own docstring)
     hands back a *caller-owned* temp directory of JPEGs when no
@@ -129,22 +150,57 @@ def _extract_from_visual(result: IngestResult, deps: PipelineDeps) -> list[Candi
     after), inside a `finally` so cleanup happens even if poster detection
     or frame extraction raises partway through.
     """
-    if result.duration_seconds is None or result.duration_seconds <= 0:
-        logger.warning(
-            "cannot run visual fallback: unknown reel duration "
-            "(duration_seconds=%r); skipping frame sampling and poster "
-            "detection for this reel",
-            result.duration_seconds,
-        )
-        return []
-
     frames_dir = Path(tempfile.mkdtemp(prefix="reel2movie_frames_"))
     try:
         video_path = deps.ingestor.ensure_video(result)
+
+        if result.duration_seconds is not None and result.duration_seconds > 0:
+            duration_seconds = result.duration_seconds
+            logger.debug(
+                "visual fallback: using metadata-reported duration %.3fs "
+                "for %s",
+                duration_seconds,
+                video_path,
+            )
+        else:
+            try:
+                duration_seconds = probe_duration_seconds(video_path)
+            except FrameExtractionError:
+                logger.warning(
+                    "cannot run visual fallback: unknown reel duration "
+                    "(metadata duration_seconds=%r was missing/invalid, "
+                    "and probing the downloaded video file at %s for its "
+                    "actual duration also failed); skipping frame "
+                    "sampling and poster detection for this reel",
+                    result.duration_seconds,
+                    video_path,
+                )
+                return []
+            if duration_seconds <= 0:
+                logger.warning(
+                    "cannot run visual fallback: unknown reel duration "
+                    "(metadata duration_seconds=%r was missing/invalid, "
+                    "and probing %s also yielded an invalid duration "
+                    "%r); skipping frame sampling and poster detection "
+                    "for this reel",
+                    result.duration_seconds,
+                    video_path,
+                    duration_seconds,
+                )
+                return []
+            logger.info(
+                "visual fallback: metadata duration missing/invalid "
+                "(duration_seconds=%r); probed actual video file at %s "
+                "for duration instead -> %.3fs",
+                result.duration_seconds,
+                video_path,
+                duration_seconds,
+            )
+
         frames = sample_frames(
             video_path,
             deps.frame_count,
-            result.duration_seconds,
+            duration_seconds,
             output_dir=frames_dir,
         )
         candidates: list[Candidate] = []

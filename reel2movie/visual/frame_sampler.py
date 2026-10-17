@@ -17,6 +17,7 @@ arbitrary-timestamp seeks.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -40,6 +41,11 @@ class FrameExtractionError(RuntimeError):
 # A single-frame extraction should never legitimately take this long; a
 # hung/corrupt input is treated as a failure rather than blocking forever.
 _FFMPEG_TIMEOUT_SECONDS = 30
+
+# Matches ffmpeg's stderr line of the form "Duration: 00:01:23.45" (also
+# tolerates "N/A" durations not matching -- those correctly fail to match
+# and are treated as "no Duration line found" below).
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d\.\d+)")
 
 
 def _compute_timestamps(n: int, duration_seconds: float) -> list[float]:
@@ -170,3 +176,60 @@ def sample_frames(
         samples.append(FrameSample(path=frame_path, timestamp_seconds=timestamp))
 
     return samples
+
+
+def probe_duration_seconds(video_path: Path) -> float:
+    """Determine a video's duration by probing the actual file on disk.
+
+    `imageio-ffmpeg` bundles only the `ffmpeg` binary, not `ffprobe`, so
+    this uses the standard "ffmpeg with no output" technique: running
+    `ffmpeg -i <video_path>` with no output path given makes ffmpeg exit
+    non-zero (there's nothing for it to encode), but before it gives up it
+    prints a line like `Duration: 00:01:23.45` to stderr -- parsed here
+    regardless of the exit code, since the exit code itself carries no
+    information for this call (there was never an output to succeed at
+    writing).
+
+    This has no dependency on yt-dlp/Instagram metadata whatsoever -- that
+    is the point: it's an independent, metadata-agnostic way to determine
+    duration from a real downloaded file, for use as a fallback when a
+    platform's own reported duration is missing or invalid (see
+    `pipeline/waterfall.py`'s `_extract_from_visual`).
+
+    Raises:
+        FrameExtractionError: if the ffmpeg subprocess times out, the
+            ffmpeg binary can't be run at all (`OSError`), or no
+            parseable `Duration:` line is found in stderr (e.g. a
+            corrupt or non-video file) -- the message includes a
+            snippet of ffmpeg's stderr for debuggability.
+    """
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    command = [ffmpeg_exe, "-i", str(video_path)]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=_FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise FrameExtractionError(
+            f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS}s probing "
+            f"duration of {video_path}"
+        ) from exc
+    except OSError as exc:
+        raise FrameExtractionError(
+            f"ffmpeg could not be run to probe duration of {video_path}: {exc}"
+        ) from exc
+
+    match = _DURATION_RE.search(result.stderr)
+    if match is None:
+        stderr_snippet = result.stderr[:500] if result.stderr else "<empty>"
+        raise FrameExtractionError(
+            f"could not find a parseable 'Duration:' line in ffmpeg's "
+            f"stderr while probing {video_path} (corrupt file or not a "
+            f"video?). ffmpeg stderr: {stderr_snippet}"
+        )
+
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)

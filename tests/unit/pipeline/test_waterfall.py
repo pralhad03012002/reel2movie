@@ -598,37 +598,138 @@ def test_visual_fallback_cleans_up_temp_dir_even_if_poster_detection_raises(
     assert result.recommendations == []
 
 
-def test_visual_fallback_with_none_duration_logs_warning_and_skips_sample_frames(
+def test_visual_fallback_with_none_duration_and_failed_probe_logs_warning_and_skips_sample_frames(
     monkeypatch, caplog
 ):
-    """Regression test: `result.duration_seconds=None` must be handled as
-    its own distinct, clearly-logged case -- not passed into
-    `sample_frames` (which would raise `TypeError` on `None <= 0` and get
-    silently swallowed by the blanket `except Exception`, indistinguishable
-    from a genuine "visual detector found nothing" outcome).
+    """Regression test (updated for the duration-probing fallback):
+    `result.duration_seconds=None` must be handled as its own distinct,
+    clearly-logged case -- not passed into `sample_frames` (which would
+    raise `TypeError` on `None <= 0` and get silently swallowed by the
+    blanket `except Exception`, indistinguishable from a genuine "visual
+    detector found nothing" outcome). `ensure_video` now runs
+    unconditionally (new behavior: it's required to attempt the
+    duration-probing fallback at all), but when probing ALSO fails,
+    duration is still genuinely undeterminable and `sample_frames` must
+    never be called.
     """
     ingestor = FakeIngestor(metadata=_ingest_result(caption="", duration_seconds=None))
     extractor = FakeCandidateExtractor()  # nothing confident from text sources
     deps = _make_deps(ingestor=ingestor, text_extractor=extractor)
 
     import reel2movie.pipeline.waterfall as waterfall_module
+    from reel2movie.visual.frame_sampler import FrameExtractionError
 
     def sample_frames_must_not_be_called(*args, **kwargs):
         raise AssertionError(
-            "sample_frames must never be called when duration_seconds is None"
+            "sample_frames must never be called when duration is undeterminable"
         )
+
+    def probe_duration_seconds_fails(video_path):
+        raise FrameExtractionError("could not find a Duration: line; corrupt file")
 
     monkeypatch.setattr(
         waterfall_module, "sample_frames", sample_frames_must_not_be_called
+    )
+    monkeypatch.setattr(
+        waterfall_module, "probe_duration_seconds", probe_duration_seconds_fails
     )
 
     with caplog.at_level("WARNING"):
         result = run_pipeline(URL, deps)
 
     assert result.recommendations == []
-    # ensure_video is only needed once sample_frames is about to run; with
-    # duration unknown, the whole attempt is skipped before that point.
-    assert ingestor.ensure_video_calls == []
+    # ensure_video now runs unconditionally once the visual step is
+    # reached -- it's needed to even attempt the duration-probing
+    # fallback -- unlike the old check-before-downloading behavior.
+    assert len(ingestor.ensure_video_calls) == 1
     assert any(
         "unknown reel duration" in record.message for record in caplog.records
     )
+
+
+def test_visual_fallback_none_duration_falls_back_to_probed_duration(monkeypatch):
+    """`result.duration_seconds=None` must no longer short-circuit the
+    visual fallback: `ensure_video` runs, `probe_duration_seconds` is
+    tried, and on success `sample_frames` is called with the PROBED
+    duration, not a stale/wrong one.
+    """
+    frame_candidate = Candidate(
+        raw_text="Oldboy (2003)", source=SourceTag.FRAME_VISUAL, confidence=0.8
+    )
+    ingestor = FakeIngestor(metadata=_ingest_result(caption="", duration_seconds=None))
+    extractor = FakeCandidateExtractor()
+    frame = FrameSample(path=Path("/fake/frame_000.jpg"), timestamp_seconds=5.0)
+    poster_detector = FakePosterDetector(responses={frame.path: [frame_candidate]})
+    tmdb_client = FakeTMDBClient(default_results=[_exact_match_result("Oldboy (2003)")])
+    deps = _make_deps(
+        ingestor=ingestor,
+        text_extractor=extractor,
+        poster_detector=poster_detector,
+        tmdb_client=tmdb_client,
+    )
+
+    import reel2movie.pipeline.waterfall as waterfall_module
+
+    probed_duration = 42.5
+    probe_calls = []
+
+    def fake_probe_duration_seconds(video_path):
+        probe_calls.append(video_path)
+        return probed_duration
+
+    sample_calls = []
+
+    def fake_sample_frames(video_path, n, duration_seconds, **kwargs):
+        sample_calls.append((video_path, n, duration_seconds))
+        return [frame]
+
+    monkeypatch.setattr(
+        waterfall_module, "probe_duration_seconds", fake_probe_duration_seconds
+    )
+    monkeypatch.setattr(waterfall_module, "sample_frames", fake_sample_frames)
+
+    result = run_pipeline(URL, deps)
+
+    assert len(ingestor.ensure_video_calls) == 1
+    assert len(probe_calls) == 1
+    assert len(sample_calls) == 1
+    # sample_frames must receive the PROBED duration, not None/stale.
+    assert sample_calls[0][2] == probed_duration
+    assert len(result.recommendations) == 1
+    assert result.recommendations[0].source == SourceTag.FRAME_VISUAL
+
+
+def test_visual_fallback_with_valid_metadata_duration_never_probes(monkeypatch):
+    """When `result.duration_seconds` is already valid, metadata takes
+    precedence -- `probe_duration_seconds` must never be called (no
+    wasted extra ffmpeg invocation).
+    """
+    ingestor = FakeIngestor(metadata=_ingest_result(caption="", duration_seconds=30.0))
+    extractor = FakeCandidateExtractor()
+    deps = _make_deps(ingestor=ingestor, text_extractor=extractor)
+
+    import reel2movie.pipeline.waterfall as waterfall_module
+
+    def probe_duration_seconds_must_not_be_called(video_path):
+        raise AssertionError(
+            "probe_duration_seconds must not be called when metadata "
+            "duration is already valid"
+        )
+
+    sample_calls = []
+
+    def fake_sample_frames(video_path, n, duration_seconds, **kwargs):
+        sample_calls.append((video_path, n, duration_seconds))
+        return []
+
+    monkeypatch.setattr(
+        waterfall_module,
+        "probe_duration_seconds",
+        probe_duration_seconds_must_not_be_called,
+    )
+    monkeypatch.setattr(waterfall_module, "sample_frames", fake_sample_frames)
+
+    run_pipeline(URL, deps)
+
+    assert len(ingestor.ensure_video_calls) == 1
+    assert sample_calls == [(ingestor.video_path, deps.frame_count, 30.0)]

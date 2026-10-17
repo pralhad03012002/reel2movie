@@ -26,7 +26,11 @@ from unittest.mock import patch
 import imageio_ffmpeg
 import pytest
 
-from reel2movie.visual.frame_sampler import FrameExtractionError, sample_frames
+from reel2movie.visual.frame_sampler import (
+    FrameExtractionError,
+    probe_duration_seconds,
+    sample_frames,
+)
 
 VIDEO_DURATION_SECONDS = 6.0
 
@@ -175,3 +179,61 @@ def test_ffmpeg_timeout_raises_frame_extraction_error(sample_video: Path, tmp_pa
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=30)
         with pytest.raises(FrameExtractionError, match="timed out"):
             sample_frames(sample_video, n=1, duration_seconds=VIDEO_DURATION_SECONDS, output_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# probe_duration_seconds
+# ---------------------------------------------------------------------------
+
+
+def test_probe_duration_seconds_matches_known_duration_within_tolerance(
+    sample_video: Path,
+) -> None:
+    probed = probe_duration_seconds(sample_video)
+
+    # ffmpeg's own duration reporting has some precision limits (it's
+    # parsed from the container's rounded duration field, not re-derived
+    # from frame count), so a small tolerance is used rather than exact
+    # equality.
+    assert probed == pytest.approx(VIDEO_DURATION_SECONDS, abs=0.5)
+
+
+def test_probe_duration_seconds_on_nonexistent_file_raises_clear_error(
+    tmp_path: Path,
+) -> None:
+    missing_video = tmp_path / "does_not_exist.mp4"
+    with pytest.raises(FrameExtractionError) as excinfo:
+        probe_duration_seconds(missing_video)
+
+    # A clear, debuggable error -- not a raw regex/parse crash (e.g.
+    # `None` unpacking into `match.groups()`) -- and ffmpeg's real stderr
+    # is captured in the message, not swallowed.
+    assert str(missing_video) in str(excinfo.value)
+
+
+def test_probe_duration_seconds_on_corrupt_file_raises_clear_error(
+    tmp_path: Path,
+) -> None:
+    corrupt_video = tmp_path / "corrupt.mp4"
+    corrupt_video.write_bytes(b"this is not a real video file, just junk bytes")
+
+    with pytest.raises(FrameExtractionError, match="Duration"):
+        probe_duration_seconds(corrupt_video)
+
+
+def test_probe_duration_seconds_timeout_raises_frame_extraction_error(
+    sample_video: Path,
+) -> None:
+    with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=30)
+        with pytest.raises(FrameExtractionError, match="timed out"):
+            probe_duration_seconds(sample_video)
+
+
+def test_probe_duration_seconds_oserror_raises_frame_extraction_error(
+    sample_video: Path,
+) -> None:
+    with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
+        mock_run.side_effect = OSError("ffmpeg binary not found")
+        with pytest.raises(FrameExtractionError, match="could not be run"):
+            probe_duration_seconds(sample_video)

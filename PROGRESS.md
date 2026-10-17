@@ -4129,3 +4129,350 @@ file outside this diff's scope, and the duplication findings are
 complexity/maintenance concerns, not correctness defects.
 
 VERDICT: ACCEPTABLE
+
+---
+
+## Follow-up — duration probing fallback for visual step — status: done
+
+### Motivation
+
+A real end-to-end test against an actual Instagram reel showed
+Instagram/yt-dlp didn't report a `duration` for that post, so
+`IngestResult.duration_seconds` was `None`. The old
+`_extract_from_visual` checked `duration_seconds is None or <= 0` and
+returned `[]` *before* ever calling `ensure_video` -- so the last-resort
+visual fallback never even attempted to download the video or look at
+the file itself. A missing metadata field was silently treated the same
+as "nothing to see here," even though the file itself (once downloaded)
+would have its own real duration.
+
+### What's built
+
+- `reel2movie/visual/frame_sampler.py` -- new `probe_duration_seconds(video_path: Path) -> float`:
+  - Runs `[imageio_ffmpeg.get_ffmpeg_exe(), "-i", str(video_path)]` via
+    `subprocess.run(capture_output=True, text=True, timeout=_FFMPEG_TIMEOUT_SECONDS)`
+    (the same 30s timeout constant `sample_frames` already uses -- no new
+    constant needed). No output path is given, so ffmpeg always exits
+    non-zero; the exit code is ignored entirely and only stderr is
+    examined.
+  - A new module-level `_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d\.\d+)")`
+    parses ffmpeg's `Duration: HH:MM:SS.ss` stderr line and converts to
+    total seconds as a float.
+  - Raises the file's existing `FrameExtractionError` (reused, not a new
+    exception type) in exactly three cases: `subprocess.TimeoutExpired`,
+    `OSError` (binary can't be run -- a case `sample_frames` itself
+    didn't previously handle either), and no parseable `Duration:` line
+    found in stderr (corrupt/non-video file) -- the last case's message
+    includes a stderr snippet (first 500 chars) for debuggability.
+  - Has zero dependency on yt-dlp/Instagram metadata -- it only ever
+    looks at the file on disk, which is the whole point: an independent,
+    metadata-agnostic fallback.
+
+- `reel2movie/pipeline/waterfall.py` -- `_extract_from_visual` restructured
+  from "check duration validity, bail before downloading" to
+  "download unconditionally, then determine duration, falling back to
+  probing":
+  1. `deps.ingestor.ensure_video(result)` is now called unconditionally,
+     as the very first thing inside the `try` block, whenever this step
+     is reached -- no longer gated on `duration_seconds` being valid.
+  2. If `result.duration_seconds` is a valid positive number, it's used
+     directly (logged at `debug` -- "using metadata-reported duration").
+     This is checked *first* so a working metadata duration never pays
+     for an extra ffmpeg probe call.
+  3. Otherwise, `probe_duration_seconds(video_path)` is called as a
+     fallback. Success is logged at `info` level (new, less-trusted
+     behavior, so it's visible by default) -- "metadata duration
+     missing/invalid; probed actual video file for duration instead".
+  4. If probing raises `FrameExtractionError`, *or* yields a `<= 0`
+     value, duration is treated as genuinely undeterminable: a
+     `logger.warning` (keeping the "cannot run visual fallback: unknown
+     reel duration" phrase from the original message, but now explicit
+     that both metadata *and* probing were tried and both failed) and
+     `return []` -- same end result as before, reached via a more
+     thorough path. This return is inside the function's `try`, so the
+     existing `finally: shutil.rmtree(frames_dir, ...)` still cleans up
+     the (empty) frames directory.
+  5. Any *other* internal failure (`ensure_video` itself raising, ffmpeg
+     frame extraction, poster detection) is still caught by the
+     pre-existing, separate `except Exception: logger.exception(...)`
+     block -- the two "found nothing" causes (duration genuinely
+     undeterminable vs. some other internal failure) remain distinct
+     catches, not collapsed into one generic catch-all, preserving the
+     original design point from this module's history.
+  6. Everything downstream of duration determination (the `sample_frames`
+     call, the poster-detection loop, `frames_dir` cleanup) is
+     structurally unchanged, just now fed whichever `duration_seconds`
+     value (metadata or probed) was determined valid.
+  - The function's docstring was rewritten in full to describe this new
+    flow and explicitly retire the old "checked explicitly *before*
+    calling `sample_frames`... to avoid downloading" rationale, which no
+    longer applies.
+
+### Tradeoff: `ensure_video` now runs even when duration ends up undeterminable
+
+Explicitly confirming, since the task asked for it directly: **yes**,
+`ensure_video` now runs even in the case where duration turns out to be
+totally undeterminable (metadata missing/invalid *and* probing fails).
+There is no way to attempt probing without first having the file on
+disk, so the download has to happen before we can know whether probing
+will succeed. This is an accepted cost of the fix, not an oversight: a
+reel whose video is corrupt, geo-blocked-at-download-time, or otherwise
+unprobeable now always pays for one download attempt it previously
+could sometimes skip (the old code's only advantage was skipping
+*exactly* this one case for free, at the cost of also skipping every
+*recoverable* missing-duration case, which is the actual bug this
+follow-up fixes). Since the visual step is already the pipeline's last
+resort (reached only when caption and creator-comment extraction both
+failed to yield a confident candidate), this is judged a reasonable
+trade: one extra download attempt in a rare dead-end case, in exchange
+for the visual fallback actually working in the much more common
+"metadata just didn't report duration" case that motivated this
+follow-up in the first place.
+
+### Tests
+
+- `tests/unit/visual/test_frame_sampler.py` -- 5 new tests for
+  `probe_duration_seconds`, reusing the file's existing `sample_video`
+  module-scoped fixture (a real, synthetic 6-second ffmpeg `testsrc`
+  video) rather than inventing a new fixture pattern:
+  - `test_probe_duration_seconds_matches_known_duration_within_tolerance`
+    -- probes the real fixture video, asserts the result is within 0.5s
+    of the known `VIDEO_DURATION_SECONDS = 6.0` (not exact equality, per
+    ffmpeg's own duration-reporting precision limits).
+  - `test_probe_duration_seconds_on_nonexistent_file_raises_clear_error`
+    -- a missing path raises `FrameExtractionError` with the path
+    included in the message.
+  - `test_probe_duration_seconds_on_corrupt_file_raises_clear_error` -- a
+    file containing junk (non-video) bytes raises `FrameExtractionError`
+    matching `"Duration"` (the clear, parseable error, not a raw regex/
+    `None`-unpacking crash).
+  - `test_probe_duration_seconds_timeout_raises_frame_extraction_error`
+    and `test_probe_duration_seconds_oserror_raises_frame_extraction_error`
+    -- both mock `subprocess.run` (same `patch("reel2movie.visual.frame_sampler.subprocess.run")`
+    pattern the file's existing `sample_frames` timeout test uses) to
+    raise `TimeoutExpired` / `OSError` respectively.
+
+- `tests/unit/pipeline/test_waterfall.py`:
+  - Renamed and rewrote the old
+    `test_visual_fallback_with_none_duration_logs_warning_and_skips_sample_frames`
+    (which asserted `ensure_video_calls == []` -- no longer true under
+    the new flow) into
+    `test_visual_fallback_with_none_duration_and_failed_probe_logs_warning_and_skips_sample_frames`:
+    `duration_seconds=None`, `probe_duration_seconds` monkeypatched on
+    the `waterfall` module (same pattern already used for
+    `sample_frames`) to raise `FrameExtractionError`; asserts `[]` is
+    returned, the warning is logged, `sample_frames` is never called,
+    but `ensure_video_calls` now has exactly 1 entry -- proving the new
+    unconditional-download behavior directly, not just asserting the
+    old "never downloads" behavior is gone.
+  - New `test_visual_fallback_none_duration_falls_back_to_probed_duration`
+    -- `duration_seconds=None`, `probe_duration_seconds` monkeypatched to
+    succeed with a known value (`42.5`); asserts `sample_frames` is
+    called with that exact probed value (not `None`, not some stale
+    default), and the resulting recommendation still resolves correctly
+    end-to-end.
+  - New `test_visual_fallback_with_valid_metadata_duration_never_probes`
+    -- `duration_seconds=30.0` (valid); `probe_duration_seconds`
+    monkeypatched to an assertion-raising stub, proving it is genuinely
+    never called when metadata already supplies a valid duration (no
+    wasted ffmpeg invocation), while `ensure_video` still runs (needed
+    for frame sampling regardless) and `sample_frames` receives the
+    metadata value unchanged.
+
+Ran `python3 -m pytest tests/unit -q`:
+
+```
+........................................................................ [ 38%]
+........................................................................ [ 76%]
+............................................                             [100%]
+188 passed in 2.60s
+```
+
+(181 passing before this follow-up + 7 new: 5 in
+`test_frame_sampler.py`, and a net +2 in `test_waterfall.py` from
+replacing 1 old test with 1 renamed/rewritten test plus 2 brand-new
+ones.)
+
+### Open questions / risks
+
+- **ffmpeg duration-parsing precision/locale assumptions**: `_DURATION_RE`
+  assumes ffmpeg's stderr always renders `Duration:` in the
+  `HH:MM:SS.ss` format with a literal `.` decimal separator and ASCII
+  digits, which is ffmpeg's standard, locale-independent CLI output
+  format in every version observed -- not something this follow-up
+  verified across multiple ffmpeg builds/versions beyond the one bundled
+  by the installed `imageio-ffmpeg` version. If a future `imageio-ffmpeg`
+  upgrade ever changed that line's format, `probe_duration_seconds`
+  would correctly raise `FrameExtractionError` (no parseable line found)
+  rather than silently returning a wrong value -- a safe failure mode,
+  but one that hasn't been exercised against a different ffmpeg build.
+- **Not yet verified against the real Dhobi Ghat reel that motivated
+  this fix.** This follow-up was built and tested entirely against the
+  existing synthetic `testsrc` fixture and fakes/mocks in the unit test
+  suite -- there was no live network/Instagram access available in this
+  environment to re-run the actual end-to-end case (the specific reel
+  whose missing `duration` metadata originally surfaced this gap). The
+  fix directly addresses the mechanism described (metadata-missing
+  duration no longer skips `ensure_video`/the visual fallback), and the
+  new unit tests cover the probing success/failure/precedence logic in
+  isolation, but a real run against that specific reel (or any reel
+  Instagram omits duration for) would be the strongest remaining
+  confirmation that this actually resolves the originally-observed
+  failure end-to-end.
+- **ffmpeg's `-i`-with-no-output probe cost**: `probe_duration_seconds`
+  only reads container metadata (ffmpeg doesn't need to decode any
+  frames to print the `Duration:` line), so it should be fast regardless
+  of video length -- but this wasn't benchmarked against a real
+  multi-megabyte Instagram reel file, only the tiny 6-second synthetic
+  fixture.
+- As called out in the tradeoff section above: a reel whose video
+  download succeeds but whose file is genuinely corrupt/unprobeable now
+  always pays for that download attempt before giving up, whereas the
+  old code could sometimes skip it for free (at the cost of also wrongly
+  skipping every recoverable case). Not revisited further here since the
+  task explicitly framed this as an accepted cost, not an open question
+  to resolve.
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (medium, forked) on the current diff
+(`reel2movie/visual/frame_sampler.py`, `reel2movie/pipeline/waterfall.py`,
+plus the two test files), `/ponytail:ponytail-review` on the same diff, a
+manual line-by-line trace of the new `_extract_from_visual` flow and
+`probe_duration_seconds` against the task's specific concerns, a from-scratch
+`python3 -m pytest tests/unit -q` run plus individually-named runs of the two
+touched test files, and a standalone, outside-pytest script that generates a
+real synthetic video and calls `probe_duration_seconds()` on it directly (not
+mocked) to confirm the regex/parsing genuinely works end-to-end.
+
+**From `/code-review` (correctness):**
+- **Non-blocking** — `frame_sampler.py` L144-151 vs. L220-223: the new
+  `probe_duration_seconds` catches `OSError` from `subprocess.run` (e.g. the
+  `imageio_ffmpeg`-resolved binary path is missing/not executable) and wraps
+  it into a clear `FrameExtractionError`, but the pre-existing `sample_frames`
+  right above it in the same file does not catch `OSError` at all for the
+  identical failure mode. Not a regression introduced by this diff (
+  `sample_frames` wasn't touched), and the raw `OSError` is still caught one
+  level up by `_extract_from_visual`'s outer `except Exception` in
+  `waterfall.py`, so nothing crashes unhandled — but the two sibling
+  functions now handle the same underlying failure inconsistently (one gives
+  a debuggable `FrameExtractionError` message, the other gives a generic
+  "visual fallback extraction failed" log with no specific cause). Worth a
+  follow-up to catch `OSError` in `sample_frames` too for consistency, not
+  blocking this follow-up.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- `waterfall.py:L168-190`: `shrink:` two near-identical
+  warning-log-then-`return []` blocks — one for `probe_duration_seconds`
+  raising `FrameExtractionError`, one for it returning a `<= 0` value — differ
+  only in wording and which variable they report. Catch the exception into a
+  sentinel (e.g. `duration_seconds = -1.0`) and fall through to one shared
+  `if duration_seconds <= 0: logger.warning(...); return []` check instead of
+  two separate ones. `net: -10 lines possible` (non-blocking — the current
+  form is correct and already reasonably readable, this is purely a line-count
+  opportunity).
+- Everything else (the new `_DURATION_RE` regex, `probe_duration_seconds`
+  itself, the three-way duration-precedence logic in `_extract_from_visual`)
+  is load-bearing for the fix this follow-up targets, not speculative. No
+  reinvented stdlib, no new dependency (reuses the already-declared
+  `imageio-ffmpeg`), no dead flexibility.
+
+**Manual trace of `_extract_from_visual` against the task's specific concerns:**
+- **`ensure_video` runs unconditionally, confirmed by reading the code**:
+  `waterfall.py` L155 (`video_path = deps.ingestor.ensure_video(result)`) is
+  the first statement inside the `try` block, with no duration check or
+  early-return before it anywhere in the function — including when
+  `result.duration_seconds` is already known-invalid (`None`, `0`, or
+  negative). This is exactly the behavior change the follow-up's motivation
+  section describes, and it's real, not just narrated.
+- **Metadata duration genuinely takes precedence; probing is genuinely
+  skipped, not run redundantly, when both are available**: the `if
+  result.duration_seconds is not None and result.duration_seconds > 0:`
+  branch (L157) is checked *before* the `else` branch that calls
+  `probe_duration_seconds` (L167) — structurally an if/else, not two
+  independent calls — so a valid metadata duration takes the `if` branch and
+  `probe_duration_seconds` is never invoked in that run. Confirmed both by
+  code structure and by `test_visual_fallback_with_valid_metadata_duration_never_probes`,
+  which monkeypatches `probe_duration_seconds` to an assertion-raising stub
+  and passes, proving it's genuinely never called in that path.
+- **Probe failure produces a clean `[]` with a clear log message, not an
+  unhandled exception or a confusing double-logged state**: the `except
+  FrameExtractionError:` at L168 is scoped narrowly around only the
+  `probe_duration_seconds(video_path)` call (L166-167), not around
+  `sample_frames` or anything else — so it can't accidentally swallow an
+  unrelated failure. Exactly one `logger.warning` call fires per failure
+  path, immediately followed by `return []` inside the same `try`, so the
+  pre-existing `finally: shutil.rmtree(...)` still cleans up — no double log,
+  no unhandled exception, confirmed by direct read, not inference.
+- **The two "found nothing" failure modes remain genuinely distinguishable,
+  not collapsed by the restructure**: (1) duration genuinely undeterminable —
+  caught by the narrow `except FrameExtractionError:` / `if duration_seconds
+  <= 0:` checks inside the inner duration-determination logic, logged via
+  `logger.warning` with a message naming both metadata and probe outcomes,
+  returns `[]` *without* ever calling `sample_frames`; (2) any other internal
+  failure (`ensure_video` itself raising, `sample_frames`/ffmpeg extraction
+  raising, poster detection raising) — falls through to the function's
+  outer, separate `except Exception:` block (L210-212), logged via
+  `logger.exception` with a distinctly different message
+  ("visual fallback extraction failed"). These two catches are structurally
+  separate (inner narrow catch vs. outer blanket catch), not merged into one
+  generic handler during the restructure — confirmed by reading the full
+  function body, not just the docstring's claim that this is true.
+
+**Direct, outside-pytest sanity check of `probe_duration_seconds` against a
+real video (not mocks) — run as a standalone script, no pytest involved:**
+- Generated a real 6-second, 64x64, synthetic ffmpeg `testsrc` video (same
+  technique `tests/unit/visual/test_frame_sampler.py`'s `sample_video` fixture
+  uses, but built fresh and independently here) and called
+  `probe_duration_seconds()` on it directly:
+  ```
+  known duration:  6.0
+  probed duration: 6.0
+  abs diff:        0.0
+  ```
+  Exact match in this run (ffmpeg's `testsrc` duration is generated precisely
+  enough that it landed on exactly 6.0s; the test suite's own tolerance check
+  — `abs=0.5` — is still the correct, non-flaky assertion to keep, since
+  ffmpeg's real-world duration reporting precision isn't guaranteed to always
+  land exactly on the nominal value for arbitrary input files).
+- Also ran, in the same standalone script, a nonexistent-file case and a
+  corrupt/junk-bytes-file case directly against the real ffmpeg binary (no
+  mocking of `subprocess.run` at all, unlike the two equivalent unit tests
+  which do mock it for the timeout/`OSError` cases specifically): both raised
+  `FrameExtractionError` with a clear, debuggable message including a stderr
+  snippet, exactly as designed, no crash.
+- **Conclusion: the regex (`_DURATION_RE`) and parsing in
+  `probe_duration_seconds` genuinely work end-to-end against a real ffmpeg
+  invocation on a real video file** — this was verified by direct execution
+  in this review pass, not by reading the regex and assuming it's correct.
+
+**Independent test runs (run directly in this review pass, not trusted from
+the build report):**
+- `python3 -m pytest tests/unit -q` → **188 passed**, matching the build
+  report's count exactly, confirmed independently.
+- `python3 -m pytest tests/unit/visual/test_frame_sampler.py -v` → **16
+  passed**, including all 5 new `probe_duration_seconds` tests by name:
+  `test_probe_duration_seconds_matches_known_duration_within_tolerance`,
+  `test_probe_duration_seconds_on_nonexistent_file_raises_clear_error`,
+  `test_probe_duration_seconds_on_corrupt_file_raises_clear_error`,
+  `test_probe_duration_seconds_timeout_raises_frame_extraction_error`,
+  `test_probe_duration_seconds_oserror_raises_frame_extraction_error`.
+- `python3 -m pytest tests/unit/pipeline/test_waterfall.py -v` → **17
+  passed**, including all 3 duration-handling tests by name:
+  `test_visual_fallback_with_none_duration_and_failed_probe_logs_warning_and_skips_sample_frames`,
+  `test_visual_fallback_none_duration_falls_back_to_probed_duration`,
+  `test_visual_fallback_with_valid_metadata_duration_never_probes`.
+
+No blocking findings. The core correctness properties the task specifically
+asked to verify — unconditional `ensure_video`, metadata-before-probe
+precedence with no redundant probing, clean non-exceptional failure handling,
+and genuinely distinct "found nothing" causes — all check out against the
+actual code, not just the build report's narrative, and
+`probe_duration_seconds` was independently confirmed to work against a real
+video file outside of any mock.
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+(none yet — both findings above are non-blocking polish, left for a future
+pass per instructions not to scope-creep into a refactor during review)
