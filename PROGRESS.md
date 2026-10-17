@@ -2167,3 +2167,604 @@ VERDICT: ACCEPTABLE
   `/ponytail:ponytail-review` pass (plus the usual manual spec check and
   independent test re-run) is the next step before this can be marked
   `status: done` and committed.
+
+---
+
+## Subtask 7 — pipeline/ — status: fixes applied, awaiting re-review
+
+### What's built
+
+Files created:
+- `reel2movie/pipeline/__init__.py` — package docstring only.
+- `reel2movie/pipeline/deps.py` — `PipelineDeps` (plain `@dataclass`,
+  fields `ingestor: Ingestor`, `text_extractor: CandidateExtractor`,
+  `poster_detector: PosterDetector`, `tmdb_client: TMDBClient`,
+  `frame_count: int = 6`) typed entirely against the four `core/protocols.py`
+  Protocols — matches the spec's code shape exactly. `build_default_pipeline_deps()`
+  is the one function in this subtask allowed to import/construct concrete
+  classes from every other subpackage: wires `InstagramIngestor(YtDlpClient(),
+  cookies_file=config.get_instagram_cookies_file())`, `RegexCandidateExtractor()`,
+  `VisionLLMPosterDetector(AnthropicVisionChatClient(config.get_anthropic_key()))`,
+  `TMDBHttpClient(config.get_tmdb_token())`. It does not catch the `RuntimeError`s
+  `get_anthropic_key()`/`get_tmdb_token()` raise on a missing env var —
+  deliberately lets them propagate, since there's no sensible fallback and
+  failing fast at startup (subtask 8's `cli.py` will call this) is better
+  than failing deep inside a run.
+- `reel2movie/pipeline/waterfall.py` — `run_pipeline(url: str, deps:
+  PipelineDeps) -> PipelineResult`, implementing `flow.md` steps [2]-[6]
+  as a strict waterfall:
+  1. `deps.ingestor.fetch_metadata(url)` — called with **no** try/except
+     around it, so an unreachable/unsupported-link exception propagates
+     straight out of `run_pipeline`, per flow.md's "fail immediately" rule.
+  2. Caption extraction via `deps.text_extractor.extract(result.caption,
+     SourceTag.CAPTION)`, wrapped in try/except (any internal exception
+     here is logged and treated as `[]`, i.e. "not confident", never
+     propagated).
+  3. If caption isn't confident: filter `result.comments` to `c.author_id
+     == result.creator_account_id and not c.is_reply`, extract each
+     surviving comment's text with `SourceTag.CREATOR_COMMENT`, pool the
+     results. Also wrapped in try/except, same "treat failure as empty"
+     rule.
+  4. If comments aren't confident either: `deps.ingestor.ensure_video(result)`
+     → `sample_frames(video_path, deps.frame_count, result.duration_seconds)`
+     (imported directly from `visual/frame_sampler.py`, per the task's
+     explicit "already built, you call this" instruction) → `deps.poster_detector.detect(frame)`
+     per sampled frame, pooling whatever comes back with no confidence
+     filter (last fallback — use it as-is, even sparse/empty). Also
+     wrapped in try/except.
+  5. Whichever step's pooled candidate list "won" (step 2, 3, or 4 — **only
+     one** list proceeds, not an accumulation across steps, per the task
+     spec's "For every candidate gathered from whichever step won")
+     is resolved one-by-one via `tmdb.resolver.resolve_candidate(candidate,
+     deps.tmdb_client)` (imported directly, same "already built" rule as
+     `sample_frames`). Each candidate becomes a `Recommendation(query=candidate.raw_text,
+     source=candidate.source, confidence=candidate.confidence, tmdb=resolved)`
+     — kept even when `resolved is None`, never dropped. A `resolve_candidate`
+     call that itself raises (not just returns `None`) is also caught and
+     treated as an unresolved candidate, so one bad TMDB lookup can't lose
+     every other candidate's recommendation.
+  6. Dedupe/aggregate (see "Dedupe-merge rule" below), sort by `confidence`
+     descending, return `PipelineResult(reel_url=url, recommendations=...)`.
+- `tests/unit/pipeline/__init__.py` — empty, for pytest discovery.
+- `tests/unit/pipeline/test_waterfall.py` — fakes for all four Protocols
+  (`FakeIngestor`, `FakeCandidateExtractor`, `FakePosterDetector`,
+  `FakeTMDBClient`), each a small `@dataclass` that records every call it
+  receives (so tests can assert a step was *never* invoked, not just that
+  the right data came back) and is configurable per test (canned
+  responses, or an error to raise). `FakeTMDBClient` doesn't fake
+  `resolve_candidate`'s scoring — it returns canned `TMDBSearchResult`s
+  and lets the real `tmdb/resolver.py` + `tmdb/scoring.py` run against
+  them; a small `_exact_match_result(query)` helper builds a result whose
+  title exactly matches the query text, which reliably clears
+  `MIN_MATCH_SCORE` via the real formula without needing to mock scoring.
+  12 tests cover: caption-confident short-circuits comment+visual;
+  creator-comment-confident short-circuits visual AND correctly excludes
+  a non-creator comment and the creator's own reply; both text sources
+  empty → visual fallback runs, `ensure_video` called exactly once;
+  `deps.frame_count` passed through correctly to `sample_frames`; nothing
+  resolving anywhere returns an empty-recommendations `PipelineResult`
+  without raising; an unresolved candidate is kept with `tmdb=None`; two
+  candidates resolving to the same TMDB id are deduped (keeping the
+  higher-confidence one); recommendations are sorted by confidence
+  descending; a step-1 `fetch_metadata` failure propagates out of
+  `run_pipeline`; a step-2 (caption) internal exception falls through to
+  step 3 rather than aborting; a step-4 (`ensure_video`) internal
+  exception is swallowed, not raised. Also a sanity test that
+  `CONFIDENCE_THRESHOLD` equals `text_extraction/regex_extractor.py`'s
+  own `HIGH_CONFIDENCE` constant (not just two numbers that happen to
+  match).
+- `tests/unit/pipeline/test_deps.py` — one test for
+  `build_default_pipeline_deps()`, per the spec's explicit instruction not
+  to test it beyond "constructs without raising": sets
+  `TMDB_API_KEY`/`ANTHROPIC_API_KEY` via `monkeypatch.setenv`, clears
+  `INSTAGRAM_COOKIES_FILE`, asserts a `PipelineDeps` comes back. No live
+  network/API call happens during construction of any of the wired
+  classes (`yt_dlp.YoutubeDL`, `anthropic.Anthropic`, and
+  `TMDBHttpClient`/`requests` are all lazy — they don't connect until a
+  method is actually called).
+
+### Confidence-threshold value chosen, and why
+
+`CONFIDENCE_THRESHOLD = 0.9` in `pipeline/waterfall.py`, reusing
+`text_extraction/regex_extractor.py`'s own `HIGH_CONFIDENCE = 0.9`
+constant's *value* directly (asserted equal in a dedicated test, so this
+can't silently drift if `regex_extractor.py` ever changes its tiers
+without this module being updated to match). Rationale: `HIGH` is exactly
+the tier that extractor reserves for its least-ambiguous signal
+("Title (YYYY)", quoted or unquoted — both a title-shaped string *and* a
+year present together), which is the same bar flow.md's "confident" gate
+language ("If ≥1 confident candidate") is meant to express. Concretely,
+this means a `MEDIUM` (0.6) candidate — a bare quoted span or a
+numbered-list line with no year — does **not** by itself clear the gate:
+a caption that's just a numbered list of titles with no years falls
+through to the creator-comment step rather than the waterfall committing
+early to a weaker signal. `vision_llm_detector.py`'s own `CONFIDENCE_MAP`
+tops out at 0.8 (`high`) for a vision hit, which is *below* 0.9 — this is
+intentional, not an oversight: the visual fallback is the *last* step
+(step 4), so nothing after it needs to re-check its confidence; its
+candidates are pooled and resolved unconditionally regardless of this
+threshold (see step 4 above), so the threshold is simply never applied to
+visual candidates at all.
+
+### Dedupe-merge rule chosen, and why
+
+In `_dedupe()`: recommendations with `tmdb is None` are never merged with
+anything (no `id` to group on, and two different unresolved candidates
+aren't known to be the same movie). Recommendations with `tmdb is not
+None` are grouped by `tmdb.id`; within each group, the single
+`Recommendation` with the **highest `confidence`** is kept verbatim — not
+a field-by-field blend of the group. Rationale: `query`/`source`/
+`confidence` all describe *how that recommendation was found*, which only
+makes sense to report for one winning extraction per movie (e.g. "found
+via the caption at 0.9"), not averaged or concatenated across several
+near-duplicate extractions of the same underlying movie. The final list
+(deduped-resolved + all-unresolved) is sorted by `confidence` descending.
+
+### How `sample_frames` was made testable from within the waterfall
+
+`sample_frames` is a free function (`visual/frame_sampler.py`), not a
+Protocol method, so there's no Protocol seam for it per the plan's
+design. `pipeline/waterfall.py` imports it by name at module level
+(`from reel2movie.visual.frame_sampler import sample_frames`) and calls
+it as a bare name inside `_extract_from_visual`. Tests substitute a fake
+by reassigning `reel2movie.pipeline.waterfall.sample_frames` (either via
+`monkeypatch.setattr` or a manual save/restore) — this patches the name
+in *waterfall.py's own module namespace*, which is what the function body
+actually looks up at call time, rather than patching
+`visual.frame_sampler.sample_frames` (which wouldn't affect the
+already-bound-by-import name in `waterfall.py`). This adds no new
+injection seam beyond what the plan specifies (`deps.frame_count` is
+still the only configurable knob on `PipelineDeps` itself); it's purely a
+test-time monkeypatch of an ordinary Python import, the same technique
+`tests/unit/tmdb/test_client.py` already uses for `requests.get`.
+
+### Pytest summary
+
+Ran `python3 -m pytest tests/unit -q` after adding this subtask's tests:
+
+```
+........................................................................ [ 56%]
+........................................................                 [100%]
+128 passed in 3.14s
+```
+
+(115 passing before this subtask + 13 new: 12 in `test_waterfall.py` + 1 in
+`test_deps.py`.)
+
+### Review findings (latest pass)
+
+This section holds two review passes, kept distinct rather than letting the
+newer one overwrite the older (per the historical/current split convention
+already established in Subtasks 3 and 5). **Cycle 0** (below) is the
+original pre-fix review; its outcome is narrated in `### Fixes applied`
+above and is kept here verbatim for the record. **Cycle 2** (further down)
+is a fresh, from-scratch re-review of the current working tree — including
+the temp-dir cleanup, the `None`/`<=0` duration guard, and the
+`CONFIDENCE_THRESHOLD` import-binding, all three from fix cycle 1 — run
+independently of cycle 0, not a continuation of it.
+
+#### cycle 0 review (historical — pre-fix; see "Fixes applied" above for what changed in response)
+
+Reviewed via `/code-review` (high, forked) on the current diff
+(`reel2movie/pipeline/{__init__,deps,waterfall}.py` + `tests/unit/pipeline/`),
+`/ponytail:ponytail-review` on the same diff, a full manual read of
+`waterfall.py` and `deps.py` (not a skim), a line-by-line trace of the
+waterfall short-circuit control flow against `flow.md`, a repo-wide import
+grep to verify the Protocol-only boundary, and an independent
+`python3 -m pytest tests/unit -q` run (128 passed, matches the build report
+exactly, not just trusted).
+
+**Plan-file discrepancy, verified:** confirmed by reading
+`/Users/apple/.claude/plans/vast-wobbling-owl.md` in full — it has no literal
+"Orchestration / pipeline module" code-sketch section; `pipeline/` only
+appears in the project-layout tree and the one-paragraph subtask-breakdown
+entry. The build agent's report of this mismatch is accurate.`flow.md`'s
+step-by-step spec is confirmed as the authoritative behavioral contract and
+is what this review judges the implementation against.
+
+**Blocking:**
+
+1. **`waterfall.py` L98 — sampled-frame temp directories are never cleaned
+   up, leaking disk space on every visual-fallback run.** `_extract_from_visual`
+   calls `sample_frames(video_path, deps.frame_count, result.duration_seconds)`
+   with no `output_dir`, so `frame_sampler.py` always creates a fresh
+   `tempfile.mkdtemp(prefix="reel2movie_frames_")` directory. That module's own
+   docstring explicitly makes cleanup the caller's job ("the caller receives
+   live paths and is responsible for cleaning up that temp directory itself
+   (e.g. `shutil.rmtree`) once it's done with the frames") and
+   Subtask 5's own "Open questions/risks" flagged this exact responsibility as
+   deferred to Subtask 7. Verified by grep: `grep -rn "rmtree" reel2movie/`
+   finds the docstring mention only — zero actual `shutil.rmtree` calls
+   anywhere in the codebase. Every reel that falls through to the visual
+   step leaves a directory of JPEGs on disk permanently. Blocking because
+   it's an unbounded resource leak in the pipeline's own last-resort path,
+   not a cosmetic gap, and the responsibility was explicitly handed to this
+   module by the prior subtask.
+2. **`waterfall.py` L98 — `result.duration_seconds` (typed `float | None`) is
+   passed straight into `sample_frames`, which does `duration_seconds <= 0`
+   unconditionally; `None <= 0` raises `TypeError`, silently swallowed by
+   `_extract_from_visual`'s blanket `except Exception` and reported as "found
+   nothing."** `IngestResult.duration_seconds` is genuinely optional
+   (`core/models.py` L60) and is populated from `info.get("duration")` in
+   `ingest/instagram.py` L78, which yt-dlp can legitimately omit for a given
+   reel. Reproduced directly:
+   ```
+   sample_frames(Path('/fake.mp4'), 6, None)
+   # TypeError: '<=' not supported between instances of 'NoneType' and 'int'
+   ```
+   This TypeError is indistinguishable in behavior/logs from a genuine
+   "visual detector found nothing" outcome, for exactly the reels where the
+   visual fallback — the *only* remaining signal source at that point in the
+   waterfall — is most needed. No test in `test_waterfall.py` exercises
+   `duration_seconds=None` (the test helper `_ingest_result` defaults it to
+   `30.0`), so this path isn't covered. Blocking because it silently
+   disables the last-resort fallback for an input shape the data model
+   itself declares as valid.
+
+**Non-blocking, high-attention (per the task's specific instruction to scrutinize this coupling):**
+
+3. **`CONFIDENCE_THRESHOLD = 0.9` in `waterfall.py` is a hardcoded literal,
+   not an import/binding of `text_extraction/regex_extractor.py`'s
+   `HIGH_CONFIDENCE` constant.** The two are kept in sync *only* by
+   `test_confidence_threshold_matches_regex_extractor_high_tier`, which does
+   genuinely import the real `HIGH_CONFIDENCE` and assert equality against
+   the hardcoded `0.9` (confirmed by reading the test — it is a real
+   cross-module check, not a tautology comparing the literal to itself).
+   Today the values agree and the test is sound, so this is not a live bug.
+   But the design still ties the pipeline's waterfall-gate semantics to an
+   extractor-internal tiering constant via a *parallel* literal rather than
+   a single source of truth: if someone changes `HIGH_CONFIDENCE` in
+   `regex_extractor.py` (e.g. re-tiers confidence scoring) without also
+   updating `waterfall.py`, the only thing that catches the drift is this
+   one test actually running — a quick hotfix, a skipped test, or a
+   non-gated deploy path would let the pipeline's "confident" gate silently
+   diverge from what the extractor now considers its least-ambiguous tier.
+   Recommend `from reel2movie.text_extraction.regex_extractor import
+   HIGH_CONFIDENCE as CONFIDENCE_THRESHOLD` (or a shared constant in
+   `core/`) instead of a re-declared literal + guard test — this removes the
+   drift window entirely rather than just detecting it after the fact.
+   Non-blocking because it is correct as shipped, but flagged prominently
+   since the task called this out as the module's other highest-risk area
+   besides the short-circuit logic.
+4. **Also worth noting, not newly discovered:** the build agent's own
+   Subtask 7 "Open questions / risks" already flags that `_resolve_all`
+   catches `resolve_candidate` exceptions even though `flow.md`'s explicit
+   error-handling section only names steps [1]-[4], not step [5] (TMDB
+   resolution), as needing "catch and treat as empty" handling. Reviewed
+   this choice directly: it's a reasonable robustness extension beyond the
+   letter of the spec (one candidate's TMDB lookup failing shouldn't lose
+   every other candidate's recommendation), not a contradiction of it.
+   Non-blocking, agree with the build agent's own call.
+
+**Verified correct (traced/executed directly, not accepted from the build
+report):**
+
+- **Short-circuit control flow** (`run_pipeline`, L168-193): caption
+  confident → `comment_candidates`/visual are never computed at all (the
+  `if not _is_confident(candidates):` block is skipped entirely — confirmed
+  by reading the branch structure, not just the tests). Caption not
+  confident but creator-comment confident → `candidates` is *reassigned* to
+  `comment_candidates` (the non-confident caption list is discarded, not
+  accumulated) and `_extract_from_visual` is never called. Both text
+  sources not confident → `candidates` is reassigned to the visual step's
+  output unconditionally (no confidence re-check on visual candidates,
+  correct per `flow.md` step [4], which has no "confident" gate, only "≥1
+  candidate"). This matches `flow.md`'s "only one step's list proceeds"
+  semantics exactly, confirmed independently via
+  `test_caption_confident_short_circuits_comment_and_visual` and
+  `test_creator_comment_confident_short_circuits_visual_and_filters_comments`
+  both asserting zero calls into the skipped step(s), not just the right
+  final output.
+- **Creator-comment filter** (L71-76): the exact condition
+  `comment.author_id == result.creator_account_id and not comment.is_reply`
+  is what's applied — confirmed by reading the line directly, field names
+  (`author_id`, `is_reply`) match `core/models.py`'s `Comment` dataclass
+  exactly. `test_creator_comment_confident_short_circuits_visual_and_filters_comments`
+  genuinely exercises both exclusion cases (a different author's top-level
+  comment, and the creator's own *reply*) and asserts their text never
+  reached the extractor, not just that the right candidate came out the
+  other end.
+- **Error-handling rules**: step [1] (`deps.ingestor.fetch_metadata`, L181)
+  has no try/except anywhere around it in `run_pipeline` — confirmed by
+  reading the function body — so any exception propagates straight out,
+  matching `flow.md`'s "fail immediately" rule; verified by
+  `test_step1_ingestor_failure_propagates`. Steps [2]-[4] each wrap their
+  body in `try/except Exception: logger.exception(...); return []` inside
+  their own helper, confirmed by reading each of the three functions in
+  full; verified live for both the caption-step and visual-step failure
+  cases by `test_caption_extraction_internal_error_falls_through_to_comment_step`
+  and `test_visual_fallback_internal_error_is_swallowed_not_raised`.
+- **"Keep candidate with tmdb=None" rule**: `_resolve_all` (L108-137)
+  appends a `Recommendation(..., tmdb=resolved)` unconditionally, whether
+  `resolved` is a real `ResolvedMovie` or `None` — there is no branch that
+  drops the candidate. Confirmed directly by reading the function (no
+  `if resolved is not None` guard exists) and by re-running
+  `test_unresolved_candidate_is_kept_with_tmdb_none`.
+- **Dedupe-by-tmdb-id merge logic** (`_dedupe`, L140-165): confirmed by
+  reading the function and by direct execution that (a) two different
+  unresolved (`tmdb=None`) recommendations are never merged with each other
+  (`unresolved` is carried through untouched, grouping only happens on
+  `resolved`) — reproduced directly: two distinct `tmdb=None` recommendations
+  in, two distinct ones out; (b) two recommendations resolving to the same
+  `tmdb.id` correctly collapse to one, keeping the higher-confidence one
+  verbatim (`test_two_candidates_resolving_to_same_tmdb_id_are_deduped`);
+  (c) distinct `tmdb.id` groups are never conflated with each other.
+- **Protocol-only import boundary** (`waterfall.py` vs. `deps.py`):
+  `grep -n "^from\|^import" reel2movie/pipeline/waterfall.py` shows imports
+  only from `reel2movie.core.models`, `reel2movie.pipeline.deps`,
+  `reel2movie.tmdb.resolver` (the `resolve_candidate` free function, per the
+  task's explicit "already built, call it directly" instruction), and
+  `reel2movie.visual.frame_sampler` (`sample_frames`, same rule). A targeted
+  grep for `ingest.`, `text_extraction.`, `visual.vision_llm_detector`, and
+  `tmdb.client` inside `waterfall.py` returns zero matches — none of those
+  concrete-implementation modules are imported there. `deps.py` is
+  confirmed as the sole place importing `InstagramIngestor`, `YtDlpClient`,
+  `RegexCandidateExtractor`, `TMDBHttpClient`, `AnthropicVisionChatClient`,
+  and `VisionLLMPosterDetector`.
+- **Fakes genuinely exercise what's claimed**: read `test_waterfall.py` in
+  full. Each of the four fakes (`FakeIngestor`, `FakeCandidateExtractor`,
+  `FakePosterDetector`, `FakeTMDBClient`) records every call it receives
+  into a `calls`/`*_calls` list, and multiple tests assert on those lists
+  being empty or containing exactly the expected entries (e.g.
+  `assert poster_detector.calls == []`, `assert ingestor.ensure_video_calls
+  == []`, `assert extractor.calls == [("Inception (2010)", SourceTag.CAPTION)]`)
+  — these are real assertions checked by the test, not fakes that record
+  calls no test ever inspects.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity, both
+non-blocking):**
+
+- `waterfall.py` L50-105: `shrink:` three near-identical
+  `try/except Exception: logger.exception(...); return []` wrappers
+  (`_extract_from_caption`, `_extract_from_creator_comments`,
+  `_extract_from_visual`) differing only in the log label and body. One
+  `_run_step(label, fn)` helper taking a thunk, called 3x, would replace all
+  three bodies.
+- `deps.py` L36: `yagni:` `_DEFAULT_FRAME_COUNT` module constant used by
+  exactly one call site (the dataclass field default). Could inline
+  `frame_count: int = 6` directly.
+- Everything else (`PipelineDeps`'s four Protocol fields + one config knob,
+  `_dedupe`'s split/group/sort, `_resolve_all`'s per-candidate try/except,
+  the four Protocol fakes each exercised by multiple tests) is load-bearing
+  for the branches the 12 waterfall tests + 1 deps test actually exercise.
+  No reinvented stdlib, no unneeded dependency, no speculative abstraction.
+  `net: -12 lines possible` (both cosmetic).
+
+VERDICT: NEEDS FIXES
+
+#### cycle 2 review (current — fresh re-review of the post-fix-cycle-1 working tree)
+
+Scope: the full current diff — `reel2movie/pipeline/{__init__,deps,waterfall}.py`
++ `tests/unit/pipeline/`, as they stand after fix cycle 1 (temp-dir cleanup,
+the `None`/`<=0` duration guard, and the `CONFIDENCE_THRESHOLD` import-binding).
+Run as a clean re-review, not a continuation of the cycle-0 session: fresh
+`/code-review` (medium) and `/ponytail:ponytail-review` invocations against
+the current diff, a full manual read of `_extract_from_visual` end to end,
+direct reproduction (not trusted from the "Fixes applied" narration) of both
+original BLOCKING bugs' fixes, a direct check of the `CONFIDENCE_THRESHOLD`
+binding, and a from-scratch `python3 -m pytest tests/unit -q` run.
+
+**Primary question — are both cycle-0 BLOCKING bugs actually fixed? Yes, confirmed by direct reproduction, not by reading the fix report:**
+
+- **Temp-dir leak** — called `_extract_from_visual` with fake deps three ways:
+  (a) a `sample_frames` fake that records the `output_dir` it was handed,
+  asserts it's non-`None` and already exists, and writes a real file into
+  it; after `_extract_from_visual` returned, `output_dir.exists()` was
+  `False` — the directory is genuinely created by `waterfall.py` (not by
+  `frame_sampler.py`, which is never called in this fake) and genuinely
+  removed. (b) Same setup but with `poster_detector.detect()` raising
+  `RuntimeError` on the one sampled frame, to exercise the `finally` path
+  specifically, not just the happy path: the directory was still gone
+  afterward, and `_extract_from_visual` returned `[]` (the exception is
+  swallowed by the existing `except Exception` per this module's "step
+  fails → empty" rule) rather than propagating. Both reproduced directly in
+  a standalone script, not inferred from `test_waterfall.py`'s own claims.
+- **`None`-duration TypeError** — called `_extract_from_visual` with
+  `duration_seconds=None` and fakes for `ensure_video`/`sample_frames`/
+  `detect` that each raise `AssertionError` if invoked at all: no
+  `TypeError` escaped, the result was `[]`, and none of the three fakes
+  were ever called (confirmed via the raising fakes never firing, not just
+  via a call-count field). Also checked `duration_seconds=0` (the `<= 0`
+  half of the guard, not just the `is None` half) — same short-circuit,
+  same result. Both the `is None` and the `<= 0` branches of
+  `result.duration_seconds is None or result.duration_seconds <= 0` are
+  therefore confirmed live, not just one of the two.
+- **`CONFIDENCE_THRESHOLD` binding** — read `waterfall.py` L31 and L48
+  directly: `from reel2movie.text_extraction.regex_extractor import
+  HIGH_CONFIDENCE` followed by `CONFIDENCE_THRESHOLD = HIGH_CONFIDENCE`.
+  Confirmed via `inspect.getsource` in the same verification script that
+  this exact import line and binding line are present in the live module
+  (not just in a diff that could have been reverted), and that
+  `waterfall.CONFIDENCE_THRESHOLD == regex_extractor.HIGH_CONFIDENCE`
+  (`0.9 == 0.9`) at runtime. This is a direct import-binding, not a
+  parallel literal re-declaration — the drift-window finding from cycle 0
+  is genuinely closed, not just newly covered by a guard test.
+
+**From `/code-review` (medium, forked) on the current diff — two new findings, both non-blocking:**
+
+5. **Non-blocking** — `waterfall.py` L142-156 / L83-92: both
+   `_extract_from_visual`'s per-frame `poster_detector.detect()` loop and
+   `_extract_from_creator_comments`'s per-comment `extract()` loop are
+   wrapped by one outer `try/except` around the *entire* loop, not a
+   try/except per iteration. If `detect()`/`extract()` raises on, say, the
+   3rd of 6 frames (or the 2nd of 2 creator comments) after succeeding on
+   earlier ones, every candidate already found from the earlier
+   frames/comments in that same call is discarded along with the one that
+   failed — the whole step degrades to `[]` rather than keeping the
+   partial results. This is most consequential for the visual step
+   specifically because it is the *last* fallback with nothing further to
+   fall through to. Judged non-blocking rather than blocking: this is the
+   same "a source step fails internally → treat the whole step as empty,
+   fall through" semantics `flow.md`'s error-handling section explicitly
+   describes at the step level (not the item level), it's unchanged
+   pre-existing control flow from the original build (not introduced or
+   touched by fix cycle 1's diff, which only edited the duration-guard,
+   temp-dir, and `CONFIDENCE_THRESHOLD` lines), and cycle 0's review did
+   not flag it either. Still worth a follow-up — e.g. catching per-frame/
+   per-comment the way `_resolve_all` already does per-candidate — so one
+   bad frame doesn't erase good ones already found, but it's a design
+   question to revisit deliberately, not a defect introduced by this fix
+   cycle.
+
+**From `/ponytail:ponytail-review` on the current diff — both cycle-0 findings still present, still non-blocking; nothing new added by the fix cycle:**
+
+- `waterfall.py` L59-68, L75-92, L142-158: `shrink:` the same three
+  near-identical `try/except Exception: logger.exception(...); return []`
+  wrappers flagged in cycle 0 are still present, unchanged in shape. One
+  `_run_step(label, fn)` helper would still replace all three.
+- `deps.py` L36: `yagni:` `_DEFAULT_FRAME_COUNT` is still a module constant
+  used at exactly one call site. Still inlinable.
+- The fix cycle's own new code (the temp-dir create/try/finally block, the
+  duration guard, the `CONFIDENCE_THRESHOLD` import-binding) is lean —
+  nothing new to cut there.
+- `net: -12 lines possible` (both carried over unchanged from cycle 0, not
+  worth the scope-creep risk of a fix-only cycle, per the build agent's own
+  stated reasoning).
+
+**Independent test run:**
+
+- `python3 -m pytest tests/unit -q` → `131 passed`, run directly in this
+  review pass from a clean shell, matching the "Fixes applied" section's
+  reported count exactly, not just trusted from that report.
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+
+Fix cycle 1 of max 3, addressing both BLOCKING findings plus the one cheap
+non-blocking coupling fix, all in `reel2movie/pipeline/waterfall.py` only
+(no changes to `frame_sampler.py` or `regex_extractor.py`):
+
+1. **Temp-dir leak (blocking finding 1) — fixed.** `_extract_from_visual`
+   now creates its own temp directory
+   (`Path(tempfile.mkdtemp(prefix="reel2movie_frames_"))`), passes it
+   explicitly as `sample_frames(..., output_dir=frames_dir)`, and removes
+   it with `shutil.rmtree(frames_dir, ignore_errors=True)` in a `finally`
+   block wrapping `ensure_video` → `sample_frames` → the
+   `poster_detector.detect()` loop. Cleanup now runs even if poster
+   detection or frame extraction raises partway through, since it's
+   `finally`, not just a happy-path call at the end.
+   `frame_sampler.py` is untouched — per its own docstring, taking an
+   explicit `output_dir` and owning its cleanup was always the caller's
+   job, and `waterfall.py` is that caller.
+2. **`None`-duration crash silently swallowed (blocking finding 2) —
+   fixed.** `_extract_from_visual` now checks
+   `result.duration_seconds is None or result.duration_seconds <= 0`
+   *before* doing anything else (before creating the temp dir, before
+   calling `ensure_video`, before calling `sample_frames`), logs a
+   `logger.warning` naming the actual cause ("cannot run visual fallback:
+   unknown reel duration (duration_seconds=%r)...") and returns `[]`
+   immediately. This is a distinct code path/log message from the
+   existing `except Exception: logger.exception("visual fallback
+   extraction failed; ...")` branch that catches ffmpeg/extraction/poster-
+   detection failures, so "duration unknown, skipped" vs. "visual detector
+   ran and found nothing" vs. "ffmpeg actually failed" are now
+   distinguishable in logs, even though the return type is the same `[]`
+   either way.
+3. **`CONFIDENCE_THRESHOLD` coupling (non-blocking finding 3) — fixed,
+   since it was a clean one-line change.** Confirmed
+   `text_extraction/regex_extractor.py` exports `HIGH_CONFIDENCE = 0.9` as
+   a real importable module-level constant (no circular-import risk:
+   `regex_extractor.py` only imports from `core/models.py`). Replaced the
+   hardcoded `CONFIDENCE_THRESHOLD = 0.9` literal with
+   `from reel2movie.text_extraction.regex_extractor import HIGH_CONFIDENCE`
+   + `CONFIDENCE_THRESHOLD = HIGH_CONFIDENCE`, removing the drift window
+   entirely rather than only detecting it via
+   `test_confidence_threshold_matches_regex_extractor_high_tier` (left
+   in place — it still passes, now as a sanity check on the binding
+   itself rather than the only thing keeping two literals in sync).
+
+Left alone, as instructed: both `/ponytail:ponytail-review` cosmetic
+findings (collapsing the three near-identical try/except wrappers into a
+`_run_step` helper; inlining `_DEFAULT_FRAME_COUNT` in `deps.py`) — still
+non-blocking, not worth the scope-creep risk in a fix-only cycle.
+
+**New regression tests added to `tests/unit/pipeline/test_waterfall.py`:**
+
+- `test_visual_fallback_cleans_up_its_own_temp_frame_directory` — a fake
+  `sample_frames` asserts it's handed a real, already-existing `output_dir`
+  (proving `waterfall.py`, not `frame_sampler.py`, created it) and writes a
+  frame into it; after `run_pipeline` returns, asserts that directory no
+  longer exists.
+- `test_visual_fallback_cleans_up_temp_dir_even_if_poster_detection_raises`
+  — same shape, but the poster detector raises; asserts the temp dir is
+  still removed (proving the `finally` actually matters, not just the
+  happy path) and the step still degrades to `[]` per the existing
+  "internal failure → empty" rule.
+- `test_visual_fallback_with_none_duration_logs_warning_and_skips_sample_frames`
+  — `duration_seconds=None`, a `sample_frames` stub that raises
+  `AssertionError` if ever called (proving it's genuinely never invoked,
+  not just that the result happens to be empty), asserts
+  `ingestor.ensure_video_calls == []`, `result.recommendations == []`, and
+  (via `caplog`) that a warning containing "unknown reel duration" was
+  logged.
+
+**Manual verification performed directly (beyond the test suite), per the
+task's instructions:**
+
+- Called `waterfall._extract_from_visual` directly with
+  `duration_seconds=None` and fake deps whose `ensure_video`/`detect`
+  raise `AssertionError` if called at all, plus a `sample_frames` stub
+  that does the same: confirmed no `TypeError` escapes, `sample_frames`
+  is never invoked (call count 0), the result is `[]`, and the logged
+  warning (`cannot run visual fallback: unknown reel duration
+  (duration_seconds=None); ...`) is visible and distinct from the other
+  two "found nothing" log messages in this module.
+- Called `waterfall._extract_from_visual` directly with a real
+  `duration_seconds=30.0` and a fake `sample_frames` that asserts its
+  `output_dir` argument is non-`None` and already exists, writes a real
+  file into it, and returns a `FrameSample` pointing there: confirmed the
+  directory exists during the call and `.exists()` is `False` immediately
+  after `_extract_from_visual` returns — the temp directory is genuinely
+  created by `waterfall.py` and genuinely removed after use, not just
+  claimed by a mocked assertion.
+
+**Test run after fixes:** `python3 -m pytest tests/unit -q` →
+`131 passed` (128 before this fix cycle + 3 new regression tests above; no
+existing test needed modification, no regressions).
+
+### Open questions / risks
+
+- **No "Orchestration / pipeline module" section with a code sketch was
+  found in `/Users/apple/.claude/plans/vast-wobbling-owl.md`** — the plan
+  file (read in full, 214 lines) only lists `pipeline/` in the project
+  layout and subtask-breakdown sections (no dedicated orchestration
+  section exists in the file as it currently stands). Built directly from
+  `flow.md`'s step-by-step spec plus this subtask's own detailed
+  instructions instead; flagging the mismatch here rather than silently
+  proceeding as if the referenced section existed.
+- **Resolving the same raw candidate twice issues two TMDB searches** —
+  `_resolve_all` calls `resolve_candidate` once per pooled candidate with
+  no memoization, even if two candidates happen to have identical
+  `raw_text` (e.g. the same title mentioned twice via two different regex
+  passes in a single source, though `regex_extractor.py`'s own
+  overlap-claiming should normally prevent that within one `extract()`
+  call). Not addressed here — out of scope, and no evidence it happens in
+  practice given the extractor's own dedup-by-span behavior.
+- **`resolve_candidate` exceptions are caught per-candidate in
+  `_resolve_all`**, even though flow.md's explicit error-handling section
+  only names steps [1]-[4] (ingest/extraction), not step [5] (TMDB
+  resolution), as needing "catch and treat as empty" handling. Chose to
+  catch here anyway (treating a raised exception the same as a clean
+  `None` return) as a deliberate robustness call: one candidate's lookup
+  failing (e.g. a transient `requests` network error inside
+  `TMDBHttpClient.search_movie`) isn't a reason to lose every other
+  resolved candidate or abort the whole pipeline run. If this turns out
+  to be the wrong call (e.g. the user wants a flaky TMDB connection to
+  fail the whole run loudly rather than silently degrade), it's isolated
+  to the one `try/except` in `_resolve_all`.
+- **`PipelineDeps.frame_count` default of 6** is carried over as the
+  spec's own example default (`frame_count: int = 6`); not tuned against
+  any real visual-fallback run — same "isolated constant, easy to revisit"
+  caveat as `tmdb/scoring.py`'s `MIN_MATCH_SCORE` and
+  `vision_llm_detector.py`'s `CONFIDENCE_MAP`.
+- **Did not add a "resolve the same candidate concurrently" optimization**
+  (e.g. threading/async for multiple TMDB lookups) — out of scope per the
+  subtask spec, and premature before subtask 8's real-world latency is
+  ever measured.
+- Per the plan's loop, this subtask's `### Review findings` /
+  `### Fixes applied` sections are intentionally left as placeholders — a
+  `/code-review` + `/ponytail:ponytail-review` pass (plus the usual manual
+  spec check and independent test re-run) is the next step before this
+  can be marked `status: done` and committed. No `git commit` was made for
+  this subtask, per the task instructions.
