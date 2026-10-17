@@ -1327,7 +1327,7 @@ VERDICT: ACCEPTABLE
 
 ---
 
-## Subtask 5 — visual/frame_sampler.py — status: fixed, pending re-review
+## Subtask 5 — visual/frame_sampler.py — status: done
 
 ### What's built
 Files created:
@@ -1790,7 +1790,7 @@ has unstaged changes. Next step per the loop is a fresh review subagent
 
 ---
 
-## Subtask 6 — visual/vision_llm_detector.py — status: built, pending review
+## Subtask 6 — visual/vision_llm_detector.py — status: done
 
 ### What's built
 Files created (nothing in `reel2movie/visual/__init__.py` touched — it
@@ -2170,7 +2170,7 @@ VERDICT: ACCEPTABLE
 
 ---
 
-## Subtask 7 — pipeline/ — status: fixes applied, awaiting re-review
+## Subtask 7 — pipeline/ — status: done
 
 ### What's built
 
@@ -2768,3 +2768,419 @@ existing test needed modification, no regressions).
   spec check and independent test re-run) is the next step before this
   can be marked `status: done` and committed. No `git commit` was made for
   this subtask, per the task instructions.
+
+---
+
+## Subtask 8 — cli.py — status: done
+
+### What's built
+
+Files created:
+- `reel2movie/__main__.py` — the package root previously had no
+  `__main__.py` (only `__init__.py`), so `python -m reel2movie` could not
+  be invoked at all until this subtask. Minimal: imports `main` from
+  `reel2movie.cli` and calls `raise SystemExit(main())` under
+  `if __name__ == "__main__":`.
+- `reel2movie/cli.py` — `main(argv: list[str] | None = None) -> int`:
+  - Parses exactly one required positional arg (`reel_url`) plus one
+    optional `--frame-count` (int) override, via `argparse`. No other CLI
+    surface, per the subtask's explicit "don't over-build" instruction.
+  - Calls `build_default_pipeline_deps()` (imported by name from
+    `reel2movie.pipeline.deps`, so tests can monkeypatch
+    `reel2movie.cli.build_default_pipeline_deps` directly — the same
+    seam-patching convention `tests/unit/pipeline/test_waterfall.py`
+    already established for `sample_frames`), then — if `--frame-count`
+    was passed — mutates the returned (non-frozen) `PipelineDeps.frame_count`
+    in place, then calls `run_pipeline(reel_url, deps)` (same
+    import-by-name convention, from `reel2movie.pipeline.waterfall`).
+  - Both calls are wrapped in their own `try/except Exception`, each
+    printing one clear `reel2movie: ...: <exc>` line to `sys.stderr` and
+    returning `1` — no unhandled traceback ever reaches the user for
+    either a `build_default_pipeline_deps()` failure (missing
+    `TMDB_API_KEY`/`ANTHROPIC_API_KEY`, a plain `RuntimeError` per
+    `config.py`) or a `run_pipeline()` failure (e.g. `fetch_metadata`
+    raising on an unreachable/unsupported URL, per `flow.md`'s "fail
+    immediately" rule for step 1). Caught broadly (`Exception`, not just
+    `RuntimeError`) deliberately — the contract this CLI promises is "no
+    raw traceback ever", not "only for the one exception type we
+    anticipated"; `KeyboardInterrupt`/`SystemExit` are untouched since
+    they aren't `Exception` subclasses.
+  - On success, serializes the `PipelineResult` (see below) and prints it
+    via `json.dumps(..., indent=2)` to stdout, returns `0`.
+- `tests/unit/test_cli.py` — 5 tests, all monkeypatching
+  `reel2movie.cli.build_default_pipeline_deps` / `reel2movie.cli.run_pipeline`
+  directly (never touching the real env, network, or concrete `ingest/`,
+  `tmdb/`, `visual/` classes):
+  - `test_prints_expected_json_shape` — a canned `PipelineResult` with two
+    `Recommendation`s (one resolved with a full `ResolvedMovie`, one with
+    `tmdb=None`); captures stdout via `capsys`, parses it back with
+    `json.loads`, and asserts every field by value (`reel_url`, both
+    recommendations' `query`/`source`/`confidence`/`tmdb`), including that
+    the unresolved recommendation's `tmdb` serializes to JSON `null` (not
+    an error, not an omitted key) and that `match_score` — a real
+    `ResolvedMovie` field not part of brainstorm.md's documented output
+    shape — does **not** leak into the printed `tmdb` object.
+  - `test_missing_api_key_prints_clear_error_on_stderr_and_returns_nonzero`
+    — `build_default_pipeline_deps` raises `RuntimeError("TMDB_API_KEY not
+    set; ...")`; asserts `main()` returns non-zero, stdout is empty, and
+    the message is on stderr (via `capsys.readouterr().err`).
+  - `test_fatal_pipeline_error_prints_clear_error_on_stderr_and_returns_nonzero`
+    — same shape, but `run_pipeline` raises instead.
+  - `test_frame_count_override_reaches_pipeline_deps` — passes
+    `--frame-count 3`, asserts (via a `run_pipeline` stub that records
+    `deps.frame_count`) that the value reaching `run_pipeline` is `3`, and
+    that the override mutated the actual `PipelineDeps` object
+    `build_default_pipeline_deps()` returned (not a copy).
+  - `test_no_frame_count_override_leaves_default_untouched` — without the
+    flag, confirms `deps.frame_count` reaching `run_pipeline` is whatever
+    `build_default_pipeline_deps()` produced, untouched.
+- `tests/integration/__init__.py` — empty, new top-level test package
+  (sibling to `tests/unit/`), registered per the subtask spec.
+- `tests/integration/test_live_smoke.py` — one test,
+  `test_live_pipeline_end_to_end`, calling the real `reel2movie.cli.main()`
+  (no mocking at all) against a real reel URL end-to-end. Guarded by
+  `@pytest.mark.skipif(not os.environ.get("REEL2MOVIE_LIVE_TEST_URL"), reason=...)`
+  — reads the URL from that env var rather than hardcoding one, so no real
+  Instagram URL is embedded in the repo. Did **not** attempt to run this
+  for real (no real API keys or Instagram access exist in this sandbox,
+  per the task's explicit instruction) — only confirmed it collects and
+  skips correctly (see "Test run" below).
+
+### JSON serialization approach
+
+Per the subtask spec: stdlib `dataclasses` only, no `pydantic` or other
+new dependency. Chose a **manual `to_dict()`-style pair of small functions**
+(`_tmdb_to_dict`, `_recommendation_to_dict`, `_result_to_dict` in `cli.py`)
+over generic `dataclasses.asdict()` for one deliberate reason:
+`brainstorm.md`'s "Output shape (draft)" section documents the `tmdb`
+object with exactly five fields (`id`, `title`, `year`, `poster_path`,
+`overview`) — it does **not** include `ResolvedMovie.match_score`, which is
+a real field on that dataclass (added in `core/models.py` for TMDB-match-
+quality scoring, per subtask 2). A blind `dataclasses.asdict()` recursive
+walk would have included `match_score` in every CLI invocation's output,
+silently exceeding the documented shape. The manual serializer whitelists
+exactly the five documented fields instead, so the CLI's output is a
+byte-for-byte match to the brainstorm.md draft shape, not a superset of it.
+This is flagged as an explicit, deliberate choice (not an oversight) in
+case a future consumer of this CLI actually wants `match_score` surfaced —
+if so, it's one field to add back in `_tmdb_to_dict`, isolated in one place.
+
+Two other serialization details worth recording:
+- `SourceTag` (a `StrEnum`) is serialized via `rec.source.value` rather
+  than relying on `json.dumps`'s native handling of `str` subclasses
+  (which would also work, since `StrEnum` members *are* plain strings at
+  the byte level) — `.value` was chosen for explicitness/robustness in
+  case `SourceTag` is ever changed to a plain `Enum` later, which would
+  silently break the implicit-str-subclass path but not the explicit
+  `.value` one.
+- `reel_url` and every other field in the output shape (`query`,
+  `confidence`, `id`, `title`, `year`, `poster_path`, `overview`) are
+  already plain `str`/`int`/`float`/`None` on the dataclasses themselves
+  (per `core/models.py`), so no further per-field conversion (e.g. `Path`
+  handling) was needed — `IngestResult.video_path: Path | None` exists on
+  a different dataclass entirely and is never part of `PipelineResult`'s
+  shape, so it never reaches the serializer.
+
+### `tests/integration` vs. `pyproject.toml`'s `testpaths` decision
+
+`pyproject.toml`'s `[tool.pytest.ini_options] testpaths = ["tests"]` was
+left **unchanged** — i.e. `python3 -m pytest tests` (no path argument)
+still collects both `tests/unit` and `tests/integration`. Reasoning:
+
+- The live smoke test self-skips via `skipif` whenever
+  `REEL2MOVIE_LIVE_TEST_URL` is unset, which is true in every CI run and
+  every fresh clone unless a human deliberately sets it. So collecting it
+  by default under `pytest tests` is safe — it costs one extra "skipped"
+  line in the summary, never a hang, a real network call, or a failure.
+- Narrowing `testpaths` to just `["tests/unit"]` would make the *default*
+  `pytest` invocation (no args) match the "safe, no live calls" unit-only
+  behavior the task cares about, but would also make `tests/integration`
+  invisible to plain `pytest --collect-only` / IDE test discovery without
+  an explicit path — a real, if minor, discoverability cost for the one
+  module (a human with real credentials) who'd actually want to run it.
+- The task's own two verification commands are `pytest tests/unit` and
+  `pytest tests/integration` as *separate, explicit* invocations — never
+  a bare `pytest` with no path — so nothing in the actual verification
+  contract depends on `testpaths`'s value either way.
+- Net: kept `testpaths = ["tests"]` as-is. If a later maintainer wants
+  `pytest` (no args) to run only the always-safe unit suite by default,
+  the one-line change is `testpaths = ["tests/unit"]`, with
+  `tests/integration` then run explicitly by path — flagging this as the
+  alternative considered, not implemented, since the current behavior is
+  already safe by construction (the skip, not the path list, is what
+  makes it safe).
+
+### Test run
+
+`python3 -m pytest tests/unit -q`:
+```
+........................................................................ [ 52%]
+................................................................          [100%]
+136 passed in 2.28s
+```
+(131 passed before this subtask, per the task's stated baseline + 5 new in
+`tests/unit/test_cli.py` = 136; no existing test needed modification, no
+regressions.)
+
+`python3 -m pytest tests/integration -q`:
+```
+s                                                                          [100%]
+1 skipped in 1.62s
+```
+Confirmed **skipped**, not passed/error — `REEL2MOVIE_LIVE_TEST_URL` is
+unset in this sandbox, so the `skipif` guard fired correctly; the test was
+never actually executed against a real reel.
+
+Also ran the full default `python3 -m pytest tests -q` (both dirs
+together, matching `testpaths`'s current value) as an extra sanity check
+beyond what the task asked for: `136 passed, 1 skipped in 2.24s` — exactly
+the union of the two runs above, confirming the two suites don't collide
+(no duplicate collection, no fixture leakage between `tests/unit` and
+`tests/integration`).
+
+### `python -m reel2movie` smoke test
+
+Run from the project root, no real `.env` present in this sandbox:
+
+```
+$ python3 -m reel2movie --help
+usage: reel2movie [-h] [--frame-count FRAME_COUNT] reel_url
+
+Extract movie recommendations from a reel and resolve them against TMDB.
+
+positional arguments:
+  reel_url              URL of the reel to process (e.g. an Instagram Reel
+                        link).
+
+options:
+  -h, --help            show this help message and exit
+  --frame-count FRAME_COUNT
+                        Override the number of frames sampled during the
+                        visual fallback step (default: PipelineDeps' own
+                        default).
+```
+
+```
+$ python3 -m reel2movie "https://www.instagram.com/reel/dummy123/"
+reel2movie: configuration error: ANTHROPIC_API_KEY is not set (see .env.example at the project root for the expected variables).
+$ echo "exit code: $?"
+exit code: 1
+```
+
+Confirmed separately (via `2>/dev/null` and `2>&1 1>/dev/null` redirection)
+that this message is on **stderr**, stdout is empty, exit code is `1`, and
+no Python traceback appears anywhere — `python -m reel2movie` is genuinely
+invocable as a module, not just importable from tests, and fails cleanly
+on the expected missing-credential case in this sandbox (which has no real
+`TMDB_API_KEY`/`ANTHROPIC_API_KEY`/`.env`).
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (medium) on the current diff
+(`reel2movie/{__main__,cli}.py`, `tests/unit/test_cli.py`,
+`tests/integration/{__init__,test_live_smoke}.py`), `/ponytail:ponytail-review`
+on the same diff, and independent manual verification (not trusted from the
+build report above): a field-by-field comparison of `cli.py`'s JSON
+serializer against `brainstorm.md`'s "Output shape (draft)" section, a
+direct read of `cli.py` in full, and running the test suites and the CLI
+itself from the project root.
+
+**From `/code-review` (correctness):** no defect found. The diff is small,
+matches the documented spec exactly, correctly wires
+`build_default_pipeline_deps()`/`run_pipeline()` with signatures matching
+their real definitions in `pipeline/deps.py`/`pipeline/waterfall.py`, and is
+covered by tests for every stated edge case (JSON shape, missing API key,
+fatal pipeline error, `--frame-count` override present/absent).
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- **Non-blocking** — `reel2movie/cli.py` L127-128: `delete:` the module's
+  own `if __name__ == "__main__": raise SystemExit(main())` guard is
+  redundant with `reel2movie/__main__.py`'s identical guard, which is
+  already the sole entry point for `python -m reel2movie`. This guard in
+  `cli.py` only fires if someone runs `python reel2movie/cli.py` directly
+  or `python -m reel2movie.cli` — neither is a documented/supported
+  invocation. Nothing replaces it; `net: -2 lines possible`.
+- Everything else is lean: the three-function JSON serializer
+  (`_tmdb_to_dict`/`_recommendation_to_dict`/`_result_to_dict`) mirrors the
+  three real nesting levels of the output shape rather than being
+  speculative, `_build_parser()` is the ordinary argparse-factory pattern,
+  and the test file's two shared helpers (`_fake_deps`, `_canned_result`)
+  are genuinely reused across multiple tests, not one-off abstractions.
+
+**Manual verification (done directly, not trusted from the build report):**
+- **brainstorm.md field-by-field match, confirmed correct:** `brainstorm.md`'s
+  "Output shape (draft)" `tmdb` object lists exactly five fields — `id`,
+  `title`, `year`, `poster_path`, `overview`. `core/models.py`'s
+  `ResolvedMovie` has those same five fields **plus** `match_score` (added
+  in Subtask 2 for TMDB-match-quality scoring). `cli.py`'s `_tmdb_to_dict()`
+  (L66-83) emits exactly the five documented fields and omits
+  `match_score` — this is a correct match-to-spec, not accidental data
+  loss. Confirmed independently by reading both documents side by side, not
+  just by reading the build report's claim; also confirmed
+  `test_prints_expected_json_shape` asserts `"match_score" not in
+  resolved["tmdb"]` on a `ResolvedMovie` constructed *with* a real
+  `match_score=0.95` value, so the test would fail if it leaked.
+- **`tmdb=None` → JSON `null`, confirmed:** `_tmdb_to_dict(None)` returns
+  Python `None` (L75-76), which `json.dumps` serializes to JSON `null`, not
+  an omitted key and not a crash — confirmed both by reading the code path
+  and via `test_prints_expected_json_shape`'s
+  `unresolved["tmdb"] is None` assertion on the parsed-back JSON.
+- **Both error paths print to stderr only, never leak a traceback,
+  confirmed:** read `cli.py` in full. Both `build_default_pipeline_deps()`
+  (L108-112) and `run_pipeline()` (L117-121) calls are wrapped in their own
+  `try/except Exception`, each printing one `reel2movie: ...: <exc>` line
+  via `print(..., file=sys.stderr)` and returning `1`; stdout is never
+  written to on either failure path (the `json.dumps` print only happens
+  after both try blocks succeed). Confirmed live, not just read: ran
+  `python3 -m reel2movie "https://www.instagram.com/reel/dummy123/"` from
+  the project root with no `.env` and no `TMDB_API_KEY`/`ANTHROPIC_API_KEY`/
+  `INSTAGRAM_COOKIES_FILE` set in the environment —
+  ```
+  $ python3 -m reel2movie "https://www.instagram.com/reel/dummy123/"
+  (stdout: empty)
+  (stderr): reel2movie: configuration error: ANTHROPIC_API_KEY is not set (see .env.example at the project root for the expected variables).
+  exit code: 1
+  ```
+  stdout was empty, stderr held exactly one clean line, exit code was `1`,
+  and grepping both streams for "traceback" found nothing. (Fired on
+  `ANTHROPIC_API_KEY` rather than `TMDB_API_KEY` only because
+  `build_default_pipeline_deps()` happens to construct the vision detector
+  before the TMDB client — either missing var takes the same clean path.)
+- **`except Exception` placement is sensible; `KeyboardInterrupt`/
+  `SystemExit` are not swallowed, confirmed:** read the whole file —
+  there is no bare `except:` anywhere, and both `except` clauses name
+  `Exception` specifically. Since `KeyboardInterrupt` and `SystemExit`
+  subclass `BaseException` directly (not `Exception`), Python's own
+  semantics mean neither is caught by either block — a Ctrl-C during
+  `build_default_pipeline_deps()` or `run_pipeline()` propagates normally
+  rather than being reported as a generic configuration/processing error.
+  This matches the module docstring's explicit claim (L26-28) exactly.
+- **`--frame-count` reaches `PipelineDeps.frame_count`, confirmed:**
+  `main()` (L114-115) mutates `deps.frame_count` in place — `PipelineDeps`
+  is a plain (non-frozen) `@dataclass` (`pipeline/deps.py` L39-52), so this
+  mutation is valid — *before* calling `run_pipeline(args.reel_url, deps)`,
+  so the same object `build_default_pipeline_deps()` returned is what
+  `run_pipeline` receives with the override applied. Confirmed by
+  `test_frame_count_override_reaches_pipeline_deps` (asserts both the value
+  `run_pipeline` sees *and* that the original `fake_deps` object itself was
+  mutated, not a copy) and `test_no_frame_count_override_leaves_default_untouched`.
+- **Independent test runs** (not trusted from the build report):
+  - `python3 -m pytest tests/unit -q` → **136 passed**, matches exactly.
+  - `python3 -m pytest tests/integration -q` → **1 skipped** (confirmed via
+    `-rs`: `SKIPPED [1] tests/integration/test_live_smoke.py:37: set
+    REEL2MOVIE_LIVE_TEST_URL and real API keys to run this live smoke
+    test`) — not passed/error, and the skip reason is sensible (names the
+    exact env var and what else is needed).
+  - `python3 -m reel2movie --help` → clean usage text, exit code `0`.
+  - `python3 -m reel2movie "https://www.instagram.com/reel/dummy123/"` →
+    clean failure as detailed above, exit code `1`, no traceback, stderr
+    only.
+
+No blocking findings. The JSON shape match, `null` serialization, both
+error paths, and the `--frame-count` wiring all check out against
+`brainstorm.md`/the spec exactly under direct, independent verification —
+not merely re-reading the build report's claims.
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+None needed — verdict is ACCEPTABLE. The one `/ponytail:ponytail-review`
+finding (redundant `__main__` guard in `cli.py`, 2 lines) is non-blocking
+and left as-is; it does not affect correctness or the CLI's documented
+behavior.
+
+### Open questions / risks
+
+- **Observed discrepancy, not touched:** this subtask's instructions
+  stated all of subtasks 0-7 are "done, reviewed, and committed." Reading
+  subtask 7's own section above (and subtask 5's/6's) shows their status
+  lines as `fixed, pending re-review` / `built, pending review` /
+  `fixes applied, awaiting re-review` respectively, with explicit
+  placeholder `### Review findings` / `### Fixes applied` sections —
+  while `git log` shows a commit exists for every subtask through 7
+  (`8cde262 Subtask 7: pipeline waterfall orchestration` is the tip before
+  this subtask's work). Not resolved or edited here, per the explicit
+  instruction not to touch earlier subtasks' sections — flagging for
+  whoever runs this subtask's own review/acceptance pass, since it affects
+  whether "every module is done and reviewed" is actually true yet.
+- **Broad `except Exception` in `cli.py`'s two call sites** (rather than
+  `except RuntimeError`) is a deliberate choice per the subtask's own
+  "no raw traceback" requirement, covering both the anticipated case
+  (missing env var) and any other unexpected failure in either call —
+  flagging in case a reviewer prefers narrowing it back to `RuntimeError`
+  specifically, trading robustness against unanticipated exceptions for a
+  tighter, more specific contract.
+- **`match_score` is dropped from the CLI's JSON output** (see
+  "JSON serialization approach" above) since it's not part of
+  brainstorm.md's documented shape. If a downstream consumer of this CLI
+  later wants TMDB match-confidence surfaced in the output, this is the
+  one place to revisit.
+- **No retry/timeout wrapping at the CLI layer** — `run_pipeline` is
+  called exactly once per invocation; a flaky network mid-run (e.g. during
+  the visual fallback's Anthropic vision calls) surfaces as whatever
+  exception the lowest layer raises, caught by `cli.py`'s blanket
+  `except Exception` and reported as a generic "failed to process" message
+  rather than a more specific diagnosis. Out of scope per the subtask spec
+  (which only asked for clean error handling, not retry logic).
+- **Live smoke test genuinely never executed** in this sandbox (by
+  explicit instruction) — its correctness rests on: (a) `main()`'s own
+  signature/behavior, already covered by the mocked unit tests above, and
+  (b) the `skipif` guard firing correctly, confirmed directly via the
+  `1 skipped` pytest output above. The actual end-to-end real-API/real-IG
+  path (`InstagramIngestor` → `VisionLLMPosterDetector` → `TMDBHttpClient`,
+  all wired by `build_default_pipeline_deps()`) remains unverified against
+  a live reel — this was explicitly called out in the original plan
+  (`vast-wobbling-owl.md`'s "Verification" section) as needing the user's
+  own IG session cookies, deferred to whenever the user actually runs this
+  for real.
+- **`pyproject.toml` left unchanged** — see the dedicated section above
+  for the reasoning; flagging here too since it was an explicit "your
+  call" decision point in the subtask spec, not an oversight.
+
+---
+
+## Project status
+
+All 9 subtasks (0 core, 1 config, 2 tmdb, 3 text_extraction, 4 ingest,
+5 frame_sampler, 6 vision_llm_detector, 7 pipeline, 8 cli) have been built,
+each with its own unit tests using fakes/fixtures (no live network/API
+calls anywhere in `tests/unit`). Total test count as of this subtask:
+**136 passed** in `tests/unit` + **1 skipped** (by design) in
+`tests/integration` = 137 collected tests. (Note the open question above:
+subtasks 5-7's `PROGRESS.md` sections show their own review/fix cycles as
+not fully closed out as of this writing, even though code for all of them
+exists, is tested, and is committed through `8cde262`; whoever runs this
+subtask's acceptance pass should reconcile that before calling the whole
+pipeline "reviewed," not just "built.")
+
+To actually run this for real against a live Instagram Reel, a user needs
+to, in order:
+
+1. **Populate `.env` from `.env.example`** at the project root — set
+   `TMDB_API_KEY` (a TMDB v4 "API Read Access Token", not the older v3
+   `api_key`) and `ANTHROPIC_API_KEY` (an Anthropic API key with billing
+   enabled — the visual fallback's vision-LLM calls are billed against
+   this). `.env` is gitignored; `.env.example` documents the three
+   expected variable names with no real values.
+2. **Provide Instagram cookies** — export a logged-in Instagram session's
+   cookies to a Netscape-format cookies file (e.g. via a browser extension
+   like "Get cookies.txt"), then set `INSTAGRAM_COOKIES_FILE` in `.env` to
+   that file's path. This is required for `yt-dlp` to reliably fetch
+   caption/comment data per `vast-wobbling-owl.md`'s "Decisions made"
+   section (a real ToS/account-risk tradeoff the user already accepted
+   when this plan was approved).
+3. **Run the real pipeline**: `python3 -m reel2movie "<instagram-reel-url>"`
+   — prints the `brainstorm.md`-shaped JSON result to stdout on success,
+   or a clear one-line error to stderr with a non-zero exit code on
+   failure (missing credentials, unreachable URL, etc.).
+4. **Optionally, set `REEL2MOVIE_LIVE_TEST_URL`** to a real, currently-
+   reachable Instagram Reel URL (in addition to the three env vars above)
+   to run the one live smoke test:
+   `python3 -m pytest tests/integration -q` — without it, that test
+   self-skips safely; with it (and real credentials), it exercises the
+   entire pipeline end-to-end for the first time outside of mocked unit
+   tests.
+
+No `git commit` was made for this subtask's work, per the task
+instructions — that is the orchestrator's final step after this subtask's
+own review passes.
