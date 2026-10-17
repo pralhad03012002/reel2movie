@@ -3205,3 +3205,466 @@ was tested at the `YtDlpClient` layer already but not end-to-end through
 `tests/unit/ingest/test_instagram.py` to close that gap. 137 tests passing.
 Also clarified `.env.example`'s `INSTAGRAM_COOKIES_FILE` comment to state
 plainly that it's optional and what the reliability tradeoff is.
+
+---
+
+## Follow-up — Claude Code CLI vision backend — status: done
+
+### Why this exists (not in the original 9-subtask plan)
+
+`vast-wobbling-owl.md`'s original "Visual detection approach" decision was
+"Anthropic Claude vision-LLM, billed against Claude credits" — i.e. a
+separate, metered `ANTHROPIC_API_KEY`. The user asked for an alternative:
+drive the visual-fallback step through the locally-installed `claude` CLI
+instead, so it draws on an existing Claude Pro/Max subscription's usage
+instead of requiring separate API billing. This updates that framing: the
+plan's original decision isn't wrong, it's just no longer the default —
+see below for exactly what changed and why.
+
+### What's built
+
+- `reel2movie/visual/vision_llm_detector.py` — added
+  `ClaudeCodeVisionError(RuntimeError)` and `ClaudeCodeVisionChatClient`,
+  a second `VisionChatClient` implementation alongside the existing
+  `AnthropicVisionChatClient`. `VisionLLMPosterDetector` itself was **not**
+  touched at all — confirming by construction that it really is agnostic
+  to which `VisionChatClient` it's given, exactly as the existing module
+  docstring claims.
+  - `ClaudeCodeVisionChatClient.__init__(claude_binary="claude",
+    timeout_seconds=60.0)`.
+  - `.chat(image_path, prompt)` builds a combined instruction
+    (`f"Read the image file at {image_path} using your Read tool. {prompt}"`),
+    then runs:
+    `subprocess.run([claude_binary, "-p", "--output-format", "json",
+    "--tools", "Read", "--permission-mode", "bypassPermissions",
+    "--no-session-persistence", combined_prompt], capture_output=True,
+    text=True, timeout=timeout_seconds)`.
+  - Raises `ClaudeCodeVisionError` (clear message each time, reusing the
+    same "custom `RuntimeError` subclass with a message that always
+    includes the relevant captured detail" pattern `frame_sampler.py`'s
+    `FrameExtractionError` already established in this codebase) on:
+    `subprocess.TimeoutExpired` (caught explicitly, re-raised as
+    `ClaudeCodeVisionError` naming the timeout — never lets the raw
+    exception propagate), non-zero exit code (message includes captured
+    stderr), non-JSON stdout (`json.JSONDecodeError` caught, message
+    includes the raw stdout), parsed `is_error: true`, and non-empty
+    `permission_denials` — this last check runs *in addition to* the
+    `is_error` check, not instead of it, so a response that passes
+    `is_error` but has a non-empty `permission_denials` still raises
+    rather than being trusted. On success, returns `parsed["result"]`.
+  - The class docstring documents explicitly that the exact JSON shape
+    parsed (`result`, `is_error`, `permission_denials`, `subtype`, `type`,
+    plus the other fields) is grounded in a **real, user-captured**
+    response from running the actual `claude` CLI command (quoted in
+    full in the docstring), not guessed from documentation or simulated —
+    and points future maintainers at this PROGRESS.md section (here) for
+    the full captured response if the parsing ever needs revisiting,
+    since this JSON shape isn't part of any published/versioned API
+    contract.
+
+  Real captured response this was built against (verbatim, as given):
+  ```json
+  {
+    "duration_api_ms": 4057, "stop_reason": "end_turn",
+    "session_id": "aa89cba6-ce5b-4089-978a-a77f37a9e9dc",
+    "total_cost_usd": 0.0609246, "usage": {"...": "..."},
+    "modelUsage": {"claude-sonnet-5": {"...": "...", "costBasis": "list"}},
+    "permission_denials": [], "terminal_reason": "completed",
+    "is_error": false, "num_turns": 2, "subtype": "success",
+    "api_error_status": null,
+    "result": "This is a classic TV color bar test pattern with vertical stripes of white, yellow, cyan, green, magenta, red, and blue arranged in a circle on a black background, with a horizontal rainbow gradient bar across the bottom and a small black rectangle with a white outline on the right side.",
+    "type": "result", "duration_ms": 4195,
+    "uuid": "6784baa3-fa8b-48b5-9871-2e34909c7397"
+  }
+  ```
+  (from `claude -p --output-format json --tools Read --permission-mode
+  bypassPermissions --no-session-persistence "Read the image file at
+  /tmp/test_poster.jpg using your Read tool, then describe the
+  colors/pattern you see in exactly one sentence."`, ~4.2s end to end.)
+
+- `reel2movie/config.py` — added `get_vision_backend() -> str`. Reads
+  `VISION_BACKEND`; unset/empty defaults to `"claude_code"` (does **not**
+  raise — this is the deliberate new default, not an error condition);
+  explicitly set to `"claude_code"` or `"anthropic_api"` returns that
+  value; any other explicitly-set value raises `RuntimeError` naming the
+  bad value and the two valid options. `get_tmdb_token()` and
+  `get_anthropic_key()` are unchanged.
+
+- `reel2movie/pipeline/deps.py` — `build_default_pipeline_deps()` now
+  calls `config.get_vision_backend()` and branches:
+  `"claude_code"` → `ClaudeCodeVisionChatClient()` (no key needed);
+  `"anthropic_api"` → `AnthropicVisionChatClient(config.get_anthropic_key())`;
+  anything else → `RuntimeError` (unreachable in practice since
+  `get_vision_backend()` already validates, but kept as a defensive
+  explicit branch per the task's exact requested shape, and cheap
+  insurance against the two functions' valid-value sets ever drifting
+  apart). **Critical property, directly verified by test**:
+  `config.get_anthropic_key()` is called *only* inside the
+  `"anthropic_api"` branch — never eagerly, never unconditionally, so a
+  caller who leaves `ANTHROPIC_API_KEY` entirely unset (using the default
+  `claude_code` backend) never hits a missing-key error anywhere during
+  construction. `config.get_tmdb_token()` remains unconditionally
+  required, as before — unrelated to this change.
+
+- `.env.example` — added `VISION_BACKEND` (optional, documents both valid
+  values and the cost/dependency tradeoff of each: `claude_code` needs
+  the `claude` CLI installed and logged into a subscription on the
+  machine running the pipeline; `anthropic_api` needs a separate billed
+  API key but no CLI dependency). Re-labeled `ANTHROPIC_API_KEY` as
+  optional, only required when `VISION_BACKEND=anthropic_api` is
+  explicitly set.
+
+### Tests added (no real `claude` subprocess calls anywhere)
+
+- `tests/unit/visual/test_vision_llm_detector.py` — new
+  `TestClaudeCodeVisionChatClient` class, mocking
+  `reel2movie.visual.vision_llm_detector.subprocess.run` (same patching
+  convention `tests/unit/visual/test_frame_sampler.py` already established
+  for ffmpeg). A `_canned_cli_json()` helper builds stdout matching the
+  real captured shape field-for-field. Covers: success (returns the
+  `result` string, and separately asserts the exact CLI invocation shape —
+  binary name, all five flags, the combined prompt containing both the
+  image path and the original prompt text, `capture_output`/`text`/
+  `timeout` kwargs); `is_error: true` → raises; **non-empty
+  `permission_denials` with `is_error: false` and a plausible-looking
+  `result`** → still raises (the subtlest case, called out explicitly in
+  its own test
+  `test_chat_raises_on_nonempty_permission_denials_even_if_result_looks_fine`,
+  specifically constructed so a naive implementation that only checks
+  `is_error` would wrongly pass); non-JSON stdout → raises; non-zero exit
+  code → raises (message includes captured stderr); `subprocess.TimeoutExpired`
+  → raises `ClaudeCodeVisionError` naming the timeout, not the raw
+  exception; a custom `claude_binary`/`timeout_seconds` constructor args
+  case confirming both are actually threaded through to the subprocess call.
+- `tests/unit/test_config.py` — `get_vision_backend()`: unset → default;
+  empty-string → default (consistent with the other getters' empty-is-unset
+  handling); explicitly `"claude_code"` → that value; explicitly
+  `"anthropic_api"` → that value; invalid value → raises naming
+  `VISION_BACKEND`.
+- `tests/unit/pipeline/test_deps.py` — four new tests using
+  `monkeypatch.setenv`/`delenv`: (1) `VISION_BACKEND` unset,
+  `ANTHROPIC_API_KEY` unset, `TMDB_API_KEY` set → construction succeeds
+  without raising (the key behavioral proof this whole change is for);
+  (2) same but `VISION_BACKEND` explicitly `"claude_code"` → also
+  succeeds without the key; (3) `VISION_BACKEND=anthropic_api`,
+  `ANTHROPIC_API_KEY` unset → raises `RuntimeError` matching
+  `ANTHROPIC_API_KEY` (proving the key is still required in that branch,
+  not silently skipped); (4) same but with the key set → succeeds.
+
+Ran `python3 -m pytest tests/unit -q`:
+
+```
+.........................................................................
+.........................................................................
+.........
+153 passed in 3.49s
+```
+
+(137 passing before this follow-up + 16 new: 7 in
+`test_vision_llm_detector.py`, 5 in `test_config.py`, 4 in
+`test_deps.py`. Confirmed directly, not just assumed.)
+
+### Explicit confirmation: `ANTHROPIC_API_KEY` is no longer required by default
+
+With `VISION_BACKEND` unset (or explicitly `"claude_code"`) and
+`ANTHROPIC_API_KEY` completely unset, `build_default_pipeline_deps()`
+succeeds — `get_anthropic_key()` is never called on that path at all.
+`ANTHROPIC_API_KEY` is only ever needed when `VISION_BACKEND=anthropic_api`
+is explicitly set. `TMDB_API_KEY` remains unconditionally required in all
+cases (unrelated to this change).
+
+### Framing update — reconciling with the original plan's decision
+
+`vast-wobbling-owl.md`'s original "Visual detection approach" decision
+("Anthropic Claude vision-LLM, billed against Claude credits") described
+what is now the `anthropic_api` backend — it's still fully present,
+unchanged, and still selectable. What changed here, as an explicit,
+deliberate deviation from that original framing (per the user's
+stated preference to avoid separate metered API billing where possible):
+`claude_code` is now the **default** backend when `VISION_BACKEND` is
+unset, not `anthropic_api`. This is not a contradiction left unexplained —
+it's a conscious reprioritization for a follow-up subtask outside the
+original plan's scope, made possible precisely because
+`VisionLLMPosterDetector`'s Protocol-based design (subtask 6) already
+decoupled the detector from any specific provider.
+
+### New tradeoff introduced — an environmental dependency, not a pip package
+
+Every dependency this project has taken on through subtask 8 has been a
+pip package (`anthropic`, `requests`, `imageio-ffmpeg`, `rapidfuzz`,
+`yt-dlp`, etc.) — something `pip install -e .` fully resolves. The
+`claude_code` backend is different in kind: it depends on the `claude`
+CLI binary being **installed and authenticated** (logged into a Claude
+subscription) on whatever machine actually executes the pipeline at
+runtime, which is an environmental/system-level dependency no
+`pyproject.toml` entry can express or guarantee. If the binary is missing,
+not on `PATH`, or not logged in, `ClaudeCodeVisionChatClient.chat()` fails
+at call time (a non-zero exit or a clear subprocess error, not a silent
+wrong answer) rather than at install time or even at
+`build_default_pipeline_deps()` construction time — construction succeeds
+unconditionally for this backend since no credential-shaped check is
+possible for it the way `get_anthropic_key()` does for the other backend.
+This is a one-way tradeoff against the `anthropic_api` backend's pure-pip
+dependency profile, accepted here because it's exactly the point of the
+feature (reuse an existing subscription instead of a separate billed key),
+but worth remembering if this pipeline is ever deployed to an environment
+(e.g. a CI runner, a server) where no human has ever interactively logged
+the `claude` CLI into an account — `anthropic_api` remains the right
+choice for that kind of environment, via `VISION_BACKEND=anthropic_api`.
+
+### Review findings (latest pass)
+
+This section holds two review passes, kept distinct rather than letting the
+newer one overwrite the older (per the historical/current split convention
+already established in Subtasks 3, 5, and 7). **Cycle 0** (below) is the
+original pre-fix review; its outcome is narrated in `### Fixes applied`
+below (fix cycle 1) and is kept here verbatim for the record. **Cycle 2**
+(further down) is a fresh, from-scratch re-review of the current working
+tree — run independently of cycle 0/1, not a continuation of them.
+
+#### cycle 0 review (historical — pre-fix; see "Fixes applied" below for what changed in response)
+
+Ran `/code-review` and `/ponytail:ponytail-review` against the current diff
+(`.env.example`, `.gitignore`, `reel2movie/config.py`,
+`reel2movie/pipeline/deps.py`, `reel2movie/visual/vision_llm_detector.py`,
+and the three test files), plus independent manual verification (not just
+re-reading the build report's claims):
+
+- **`permission_denials` check — directly verified, not just read.**
+  Constructed a fake `subprocess.run` return value by hand with
+  `is_error: False`, a plausible-looking `result` string ("This image shows
+  a clearly readable movie poster for Inception (2010)."), and a non-empty
+  `permission_denials` list, monkeypatched
+  `reel2movie.visual.vision_llm_detector.subprocess.run` to return it, and
+  called `ClaudeCodeVisionChatClient().chat(...)` directly (no pytest, no
+  existing test file). It raised `ClaudeCodeVisionError` as claimed, not a
+  silently-trusted plausible-looking string. The `is_error` check and the
+  `permission_denials` check are both present and independent (code.py
+  lines ~213 and ~219), confirming the build report's claim field-for-field.
+
+- **JSON shape vs. the real captured response — compared field-for-field.**
+  Every key `chat()` reads (`is_error`, `permission_denials`, `result`) is
+  present, with matching types, in the real captured CLI response pasted
+  above (`is_error: false`, `permission_denials: []`, `result: "<string>"`,
+  plus `subtype`/`type` referenced only in the docstring, not parsed). No
+  mismatch found between the code and the pasted real JSON.
+
+- **`subprocess.TimeoutExpired` handling — directly verified.** Mocked
+  `subprocess.run` to raise `subprocess.TimeoutExpired` directly (bypassing
+  the existing test file) and confirmed `.chat()` raises
+  `ClaudeCodeVisionError` naming the timeout, not the raw
+  `TimeoutExpired`.
+
+- **BLOCKING: a missing/not-on-PATH `claude` binary is not caught, and
+  this contradicts the section's own documented claim.**
+  `chat()`'s `try/except` around `subprocess.run` only catches
+  `subprocess.TimeoutExpired` (`vision_llm_detector.py` ~line 175). If the
+  `claude` binary itself is missing or not on `PATH`, `subprocess.run`
+  raises a raw `FileNotFoundError`, which is not caught anywhere in
+  `chat()` and propagates unwrapped — never becoming a
+  `ClaudeCodeVisionError`. This directly contradicts this very
+  section's "New tradeoff introduced" paragraph above, which explicitly
+  claims "If the binary is missing, not on `PATH`, or not logged in,
+  `ClaudeCodeVisionChatClient.chat()` fails at call time (a non-zero exit
+  or **a clear subprocess error**...)" — a missing binary does not fail
+  with a non-zero exit (there is no process to exit) and the raw
+  `FileNotFoundError`, while not opaque, is not the documented
+  `ClaudeCodeVisionError` contract either, and the method's own docstring
+  "Raises" list only names `ClaudeCodeVisionError`. This is exactly the
+  failure mode most likely to be hit in practice now that `claude_code` is
+  the *default* backend — anyone who hasn't installed the `claude` CLI and
+  does nothing special will hit this on the very first visual-fallback
+  frame. Fix: wrap the `subprocess.run` call's except clause to also catch
+  `OSError` (covers `FileNotFoundError` and `PermissionError`) and re-raise
+  as `ClaudeCodeVisionError` naming the binary and the underlying OS error.
+
+- **Non-blocking (ponytail-review): dead unreachable branch.**
+  `build_default_pipeline_deps()`'s `else: raise RuntimeError(...)` branch
+  (`deps.py` ~lines 94-98) for an unrecognized `VISION_BACKEND` value can
+  never execute: `config.get_vision_backend()` already validates and only
+  ever returns `"claude_code"`/`"anthropic_api"` or raises first. It's
+  kept deliberately per the build report ("cheap insurance" against the
+  two functions' valid-value sets drifting apart), which is a defensible
+  judgment call, not a bug — flagged here as cuttable (~5 lines) if a
+  future pass wants the single validated source of truth to be the only
+  place this is checked, but not required to fix.
+
+- **No-eager-`get_anthropic_key()` proof — independently re-verified, not
+  just re-read.** `grep -rn "get_anthropic_key"` across the whole repo
+  shows exactly one call site outside `config.py`'s own definition and
+  docstrings/tests: `deps.py`'s `"anthropic_api"` branch
+  (`AnthropicVisionChatClient(config.get_anthropic_key())`). No other call
+  site exists anywhere, eager or otherwise. Separately ran
+  `python3 -m pytest tests/unit -q` directly: **153 passed**, confirming
+  the build report's count rather than trusting it. Also ran, outside
+  pytest entirely, a standalone subprocess script that sets `TMDB_API_KEY`,
+  unsets `VISION_BACKEND` and `ANTHROPIC_API_KEY`, and calls
+  `build_default_pipeline_deps()` directly: it succeeded and returned a
+  `PipelineDeps` whose `poster_detector._chat_client` is a
+  `ClaudeCodeVisionChatClient` — confirming the core claim of this
+  follow-up end-to-end, not just via the test suite that could itself be
+  wrong.
+
+No `git commit` was made for this follow-up, per the task instructions —
+that happens after review.
+
+Cycle 0 outcome: **NEEDS FIXES** (addressed by `### Fixes applied` below —
+fix cycle 1 — producing the working tree re-reviewed in cycle 2 below).
+
+#### cycle 2 review (current — fresh re-review of the post-fix working tree)
+
+Run as a clean re-review, not a continuation of the cycle 0/1 session: fresh
+reads of `PROGRESS.md`'s cycle 0 findings and fix-cycle-1 notes above, then
+`/code-review` (medium) and `/ponytail:ponytail-review` run independently
+against the current uncommitted diff (`.env.example`, `.gitignore`,
+`reel2movie/config.py`, `reel2movie/pipeline/deps.py`,
+`reel2movie/visual/vision_llm_detector.py`, and the three test files), plus
+direct manual reproduction rather than trusting the fix-cycle-1 report's
+claims.
+
+**Primary question — is the cycle 0 BLOCKING bug actually fixed? Yes,
+confirmed by direct reproduction, no mocking:** constructed
+`ClaudeCodeVisionChatClient(claude_binary="definitely-not-a-real-claude-binary-xyz")`
+directly and called `.chat(Path("/tmp/nonexistent_test_image.jpg"), "test")`
+for real — `subprocess.run` genuinely raised `FileNotFoundError` trying to
+exec a binary that doesn't exist on this machine's `PATH`, and it surfaced
+as:
+```
+ClaudeCodeVisionError: could not run the 'claude' CLI (binary: 'definitely-not-a-real-claude-binary-xyz') -- is it installed and on PATH? ([Errno 2] No such file or directory: 'definitely-not-a-real-claude-binary-xyz')
+```
+— a `ClaudeCodeVisionError` naming the exact configured binary string, not a
+raw `FileNotFoundError`/`OSError`. The cycle 0 BLOCKING finding is genuinely
+fixed, not just re-described as fixed.
+
+**Regression check — the two pre-existing checks the fix cycle didn't
+touch are still intact.** Read `chat()` in full (lines ~166-238) and
+separately re-verified both by direct reproduction (monkeypatched
+`subprocess.run`, no pytest):
+- `permission_denials` check: fed a canned reply with `is_error: False` and
+  a plausible-looking `result` ("This image shows a clearly readable movie
+  poster for Inception (2010).") but a non-empty `permission_denials` list
+  — still raised `ClaudeCodeVisionError` naming `permission_denials`, not
+  silently trusted. Unchanged by the fix.
+- `subprocess.TimeoutExpired` handling: mocked `subprocess.run` to raise
+  `TimeoutExpired` directly — still raised `ClaudeCodeVisionError` naming
+  the timeout, not the raw exception. Unchanged by the fix. The new
+  `except OSError` clause sits alongside (not instead of) the existing
+  `except subprocess.TimeoutExpired` clause, and the two exception types
+  are disjoint, so there's no shadowing risk between them.
+
+**From `/code-review` (correctness):**
+- **Non-blocking** — `vision_llm_detector.py` L238 (`return
+  parsed["result"]`): direct-key access instead of `.get("result")`, so a
+  parsed CLI reply with `is_error: false` and empty `permission_denials` but
+  no `result` key raises a bare `KeyError` instead of the documented
+  `ClaudeCodeVisionError`. Reproduced directly: fed `json.dumps({"is_error":
+  False, "permission_denials": []})` (no `result` key) as canned stdout —
+  `client.chat(...)` raised `KeyError: 'result'`, not
+  `ClaudeCodeVisionError`, contradicting `chat()`'s own `Raises:` docstring
+  (which names only `ClaudeCodeVisionError`). Non-blocking: this JSON shape
+  isn't part of any versioned contract (per the class's own docstring) and
+  every real captured response — including the one this parsing is grounded
+  in — always includes `result` when `is_error` is false, so this is a
+  defensive-robustness gap against a hypothetical future CLI output change,
+  not a failure mode hit in normal operation today. Pre-existing from
+  cycle 0 (the `parsed["result"]` line itself wasn't touched by fix cycle
+  1's `except OSError` addition), not introduced by this fix cycle. Fix (if
+  taken up): `parsed.get("result")`, or an explicit `if "result" not in
+  parsed: raise ClaudeCodeVisionError(...)` guard.
+- **Non-blocking** — `deps.py` ~L94-98 (`else: raise RuntimeError("Unknown
+  VISION_BACKEND...")`): still unreachable dead code, unchanged from cycle
+  0 — `config.get_vision_backend()` already validates and only ever returns
+  `"claude_code"`/`"anthropic_api"` or raises first, so this branch can
+  never execute. Carried over verbatim from cycle 0's non-blocking finding
+  (not touched by fix cycle 1, which only edited
+  `vision_llm_detector.py`'s exception handling); still a defensible
+  judgment call per the build report ("cheap insurance" against the two
+  functions' valid-value sets drifting apart), not required to fix.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- Same dead-branch finding as above (`deps.py` ~L94-98): `delete:` the
+  unreachable `else` branch; nothing replaces it, since
+  `config.get_vision_backend()` is already the single source of truth for
+  valid values.
+- The fix cycle 1 diff itself (the two-line `except OSError` clause in
+  `vision_llm_detector.py`) introduces no new bloat: it's the minimum
+  addition, directly mirrors the existing `except
+  subprocess.TimeoutExpired` clause's shape, and the one new regression
+  test (`test_chat_raises_clear_error_when_binary_missing_not_raw_exception`)
+  follows the same mocking convention as its six siblings rather than
+  inventing a new pattern. The seven near-identical
+  `tmp_path / "frame_000.jpg"; image_path.write_bytes(...)` setup lines
+  across `TestClaudeCodeVisionChatClient`'s tests are not flagged — this
+  duplication is a pre-existing convention already present in the untouched
+  `TestAnthropicVisionChatClient` tests above it in the same file (e.g.
+  L236, L277, L306), not something this diff introduced.
+- `net: -5 lines possible` (the dead branch only; non-blocking).
+
+**Independent test run:** ran `python3 -m pytest tests/unit -q` directly in
+this review pass (not trusting the reported 154): **154 passed**, matching
+the fix-cycle-1 report's count exactly.
+
+No BLOCKING findings remain. The one BLOCKING finding from cycle 0 is
+confirmed fixed by direct reproduction; both findings surfaced this pass are
+non-blocking (one pre-existing edge case untouched by this fix cycle, one
+carried-over dead branch already judged acceptable to leave).
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+
+Addressed the one BLOCKING finding above (missing-binary case). Left the
+non-blocking `deps.py` dead-branch finding untouched, per the review's own
+"defensible judgment call, not required to fix."
+
+- `reel2movie/visual/vision_llm_detector.py` — `ClaudeCodeVisionChatClient.chat()`'s
+  `try/except` around `subprocess.run` now has a second `except OSError`
+  clause alongside the existing `except subprocess.TimeoutExpired` (added,
+  not replaced — the two are disjoint exception hierarchies, so order
+  between them doesn't matter; `OSError` catches `FileNotFoundError`
+  (missing binary/not on `PATH`) and `PermissionError` (not executable)
+  alike). Re-raises as `ClaudeCodeVisionError` with message
+  `"could not run the 'claude' CLI (binary: {claude_binary!r}) -- is it "
+  "installed and on PATH? ({exc})"` — names the configured binary and
+  includes the underlying `OSError`'s own text, so "it hung" (timeout
+  message) and "the binary doesn't exist" (this message) read as visibly
+  different problems. Also updated `chat()`'s docstring `Raises:` section
+  and the `ClaudeCodeVisionError` class docstring's "Covers:" list to
+  name this case explicitly, so the documented contract now matches the
+  code (closing the exact gap the review flagged against this section's
+  "New tradeoff introduced" paragraph).
+
+- `tests/unit/visual/test_vision_llm_detector.py` — added
+  `test_chat_raises_clear_error_when_binary_missing_not_raw_exception`
+  to `TestClaudeCodeVisionChatClient`: mocks `subprocess.run` with
+  `side_effect=FileNotFoundError("[Errno 2] No such file or directory: "
+  "'claude'")`, calls `.chat(...)`, and asserts it raises
+  `ClaudeCodeVisionError` (matching `"claude"` in the message) rather
+  than the raw `FileNotFoundError`.
+
+Ran `python3 -m pytest tests/unit -q`:
+
+```
+154 passed in 3.59s
+```
+
+(153 passing before this fix + 1 new regression test, confirmed directly.)
+
+**Direct manual verification, independent of pytest** (same approach the
+reviewer used for the `permission_denials` finding): ran a standalone
+script (no pytest) that (1) monkeypatches
+`reel2movie.visual.vision_llm_detector.subprocess.run` with
+`side_effect=FileNotFoundError(...)` and calls
+`ClaudeCodeVisionChatClient().chat(...)` directly — raised
+`ClaudeCodeVisionError` with message `"could not run the 'claude' CLI "
+"(binary: 'claude') -- is it installed and on PATH? ([Errno 2] No such "
+"file or directory: 'claude')"`, not the raw exception; and (2), with no
+mocking at all, constructed `ClaudeCodeVisionChatClient(claude_binary=`
+`"definitely-not-a-real-claude-binary-xyz")` and called `.chat(...)` for
+real against an image path that doesn't even need to exist for this
+failure mode — `subprocess.run` genuinely raised `FileNotFoundError`
+trying to exec a binary that doesn't exist on this machine's `PATH`, and
+it came back as `ClaudeCodeVisionError` naming that exact binary string.
+Both confirm the fix end-to-end, not just via the mocked test.
+
+VERDICT: fix applied for the BLOCKING finding; ready for re-review.

@@ -41,6 +41,36 @@ def get_anthropic_key() -> str:
     return value
 
 
+_VALID_VISION_BACKENDS = {"claude_code", "anthropic_api"}
+
+
+def get_vision_backend() -> str:
+    """Return the vision backend to use, from ``VISION_BACKEND``.
+
+    Defaults to ``"claude_code"`` when the env var is unset or empty --
+    this is the free/subscription-based path (shells out to the `claude`
+    CLI, billed against an existing Claude Pro/Max subscription) and is
+    the deliberate default going forward, to avoid requiring a separate
+    metered Anthropic API key unless the caller opts in. The other valid
+    value is ``"anthropic_api"`` (calls the Anthropic API directly via
+    ``get_anthropic_key()``, separately billed, no CLI dependency).
+
+    Raises:
+        RuntimeError: if the env var is explicitly set to anything other
+            than ``"claude_code"`` or ``"anthropic_api"``. An unset var
+            never raises -- the default silently applies.
+    """
+    value = os.environ.get("VISION_BACKEND", "")
+    if not value:
+        return "claude_code"
+    if value not in _VALID_VISION_BACKENDS:
+        raise RuntimeError(
+            f"VISION_BACKEND={value!r} is not a recognized value; expected "
+            f"one of {sorted(_VALID_VISION_BACKENDS)} ({_ENV_EXAMPLE_HINT})."
+        )
+    return value
+
+
 def get_instagram_cookies_file() -> Path | None:
     """Return the configured Instagram cookies file path, if any.
 
