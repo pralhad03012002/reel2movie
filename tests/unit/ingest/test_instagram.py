@@ -172,6 +172,24 @@ def test_fetch_metadata_passes_cookies_file_through_to_client():
     assert client.calls[0]["download"] is False
 
 
+def test_fetch_metadata_runs_cookieless_when_no_cookies_file_given():
+    """Anonymous/unauthenticated access: cookies are optional, not required.
+
+    No ``cookies_file`` means the ingestor still runs end-to-end, just
+    without a logged-in session. Reliability against real Instagram is a
+    separate, documented risk (see brainstorm.md) - this only confirms the
+    code path itself doesn't require cookies to function.
+    """
+    fixture = _load_fixture()
+    client = FakeYtDlpClient(metadata_response=fixture)
+    ingestor = InstagramIngestor(client)  # cookies_file omitted entirely
+
+    result = ingestor.fetch_metadata("https://www.instagram.com/reel/x/")
+
+    assert client.calls[0]["cookies_file"] is None
+    assert result.creator_account_id  # metadata still resolves without cookies
+
+
 def test_ensure_video_returns_path_from_requested_downloads_filepath():
     fixture = _load_fixture()
     client = FakeYtDlpClient(metadata_response=fixture)

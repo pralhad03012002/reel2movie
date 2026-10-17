@@ -3184,3 +3184,24 @@ to, in order:
 No `git commit` was made for this subtask's work, per the task
 instructions — that is the orchestrator's final step after this subtask's
 own review passes.
+
+---
+
+## Post-ship follow-up — anonymous Instagram access confirmed + tested
+
+User asked whether Instagram cookies could be avoided entirely (initially
+asked about a username/password login script; checked the installed yt-dlp
+package directly and confirmed its Instagram extractor has no `_perform_login`
+method at all, so that path isn't technically viable, separate from the
+security concerns with handling a password). `cookies_from_browser` was
+offered as the recommended alternative but not yet built.
+
+In the meantime: confirmed `InstagramIngestor`/`YtDlpClient` already support
+running with `cookies_file=None` (anonymous/unauthenticated access) as a
+built-in default from Subtask 4 — no production code change was needed. This
+was tested at the `YtDlpClient` layer already but not end-to-end through
+`InstagramIngestor`; added
+`test_fetch_metadata_runs_cookieless_when_no_cookies_file_given` to
+`tests/unit/ingest/test_instagram.py` to close that gap. 137 tests passing.
+Also clarified `.env.example`'s `INSTAGRAM_COOKIES_FILE` comment to state
+plainly that it's optional and what the reliability tradeoff is.
