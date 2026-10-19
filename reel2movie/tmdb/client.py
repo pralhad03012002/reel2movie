@@ -1,8 +1,17 @@
-"""HTTP client for TMDB's `search/movie` endpoint.
+"""HTTP client for TMDB's `search/multi` endpoint.
 
 Uses TMDB's v4 Bearer "API Read Access Token" auth style (per
 vast-wobbling-owl.md's "TMDB auth style" decision), not the older v3
 `api_key` query-param style.
+
+Searches movies AND TV shows (see PROGRESS.md's "Follow-up" section for
+why: a reel can recommend either, and resolving against `/search/movie`
+alone let an unrelated movie win over the actually-correct TV show when
+both happen to share a title). Verified live against the real TMDB API:
+each `/search/multi` result row carries a `media_type` of `"movie"`,
+`"tv"`, or `"person"`; movie rows use `title`/`release_date`, TV rows use
+`name`/`first_air_date`. `person` rows are filtered out entirely -- a
+person is never a valid recommendation target.
 """
 
 from __future__ import annotations
@@ -13,7 +22,7 @@ import requests
 
 from reel2movie.core.models import TMDBSearchResult
 
-_SEARCH_MOVIE_URL = "https://api.themoviedb.org/3/search/movie"
+_SEARCH_MULTI_URL = "https://api.themoviedb.org/3/search/multi"
 
 # Retry budget for transient connection-level failures only (confirmed via
 # real-world testing: TLS handshake resets against the real TMDB API,
@@ -51,10 +60,16 @@ class TMDBHttpClient:
     def __init__(self, bearer_token: str) -> None:
         self._bearer_token = bearer_token
 
-    def search_movie(
+    def search(
         self, query: str, year: int | None = None
     ) -> list[TMDBSearchResult]:
-        """Search TMDB movies (movies only — TV is out of scope).
+        """Search TMDB movies AND TV shows via `/search/multi`.
+
+        `person` rows are filtered out (not valid recommendation targets).
+        Each remaining row is normalized into `TMDBSearchResult`: `title`
+        comes from `title` (movie rows) or `name` (tv rows); `year` is
+        parsed from `release_date` (movie) or `first_air_date` (tv), via
+        the same `_parse_year` logic either way.
 
         Raises on HTTP errors via `response.raise_for_status()` rather than
         swallowing them; it's the caller's job to decide how to handle
@@ -73,6 +88,15 @@ class TMDBHttpClient:
         (`tmdb/resolver.py`'s `resolve_candidate`, via `pipeline/
         waterfall.py`'s `_resolve_all`) already catches and logs this
         per-candidate.
+
+        Note (confirmed live against the real API): unlike `/search/movie`,
+        `/search/multi` does NOT support a `year` filter at all — passing
+        `year` is silently ignored server-side (identical `total_results`
+        and ordering with `year=1999` vs. an impossible `year=2199` against
+        the same query, verified during this change). `year` is still sent
+        here (harmless) and, more importantly, still passed straight
+        through to `scoring.py`'s `year_bonus` term client-side — that's
+        where year-based disambiguation now actually happens.
         """
         params: dict[str, str | int] = {"query": query}
         if year is not None:
@@ -81,7 +105,7 @@ class TMDBHttpClient:
         for attempt in range(_MAX_ATTEMPTS):
             try:
                 response = requests.get(
-                    _SEARCH_MOVIE_URL,
+                    _SEARCH_MULTI_URL,
                     headers={"Authorization": f"Bearer {self._bearer_token}"},
                     params=params,
                     timeout=10,
@@ -96,15 +120,30 @@ class TMDBHttpClient:
         response.raise_for_status()
         payload = response.json()
 
-        return [
-            TMDBSearchResult(
-                id=item["id"],
-                title=item["title"],
-                year=_parse_year(item.get("release_date")),
-                poster_path=item.get("poster_path"),
-                overview=item.get("overview", ""),
-                popularity=item.get("popularity", 0.0),
-                original_rank=rank,
+        results = []
+        rank = 0
+        for item in payload.get("results", []):
+            media_type = item.get("media_type")
+            if media_type == "person":
+                continue
+            if media_type == "tv":
+                title = item["name"]
+                date_field = item.get("first_air_date")
+            else:
+                title = item["title"]
+                date_field = item.get("release_date")
+            results.append(
+                TMDBSearchResult(
+                    id=item["id"],
+                    title=title,
+                    year=_parse_year(date_field),
+                    poster_path=item.get("poster_path"),
+                    overview=item.get("overview", ""),
+                    popularity=item.get("popularity", 0.0),
+                    original_rank=rank,
+                    media_type=media_type,
+                )
             )
-            for rank, item in enumerate(payload.get("results", []))
-        ]
+            rank += 1
+
+        return results

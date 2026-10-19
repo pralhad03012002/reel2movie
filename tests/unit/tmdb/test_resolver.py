@@ -14,7 +14,7 @@ class FakeTMDBClient:
         self.last_query: str | None = None
         self.last_year: int | None = None
 
-    def search_movie(
+    def search(
         self, query: str, year: int | None = None
     ) -> list[TMDBSearchResult]:
         self.last_query = query
@@ -35,6 +35,7 @@ def _search_result(**overrides) -> TMDBSearchResult:
         overview="A hacker learns the truth.",
         popularity=80.0,
         original_rank=0,
+        media_type="movie",
     )
     defaults.update(overrides)
     return TMDBSearchResult(**defaults)
@@ -74,9 +75,34 @@ def test_maps_winning_result_to_resolved_movie():
     assert resolved.poster_path == "/matrix.jpg"
     assert resolved.overview == "A hacker learns the truth."
     assert isinstance(resolved.match_score, float)
+    assert resolved.media_type == "movie"
     # popularity/original_rank are dropped, not present on ResolvedMovie
     assert not hasattr(resolved, "popularity")
     assert not hasattr(resolved, "original_rank")
+
+
+def test_maps_tv_result_to_resolved_movie_with_tv_media_type():
+    """Regression for the real "The Mentalist" bug: a fake client returning
+    a tv-show-shaped `TMDBSearchResult` (media_type="tv") must produce a
+    `ResolvedMovie` with `media_type="tv"` correctly populated, not
+    silently dropped or defaulted to "movie".
+    """
+    tv_result = _search_result(
+        id=5920,
+        title="The Mentalist",
+        year=2008,
+        poster_path="/mentalist.jpg",
+        overview="A former psychic medium solves crimes.",
+        media_type="tv",
+    )
+    client = FakeTMDBClient([tv_result])
+
+    resolved = resolve_candidate(_candidate("The Mentalist"), client)
+
+    assert resolved is not None
+    assert resolved.id == 5920
+    assert resolved.title == "The Mentalist"
+    assert resolved.media_type == "tv"
 
 
 def test_returns_none_when_nothing_resolves():

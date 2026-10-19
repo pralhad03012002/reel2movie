@@ -8,9 +8,14 @@ each to a canonical record (title, year, TMDB ID, poster, overview) via TMDB.
 
 ## Scope (v1)
 
-- Output: movie **name + year** per recommendation, resolved against TMDB.
-- Single reel in, one or more movie recommendations out.
-- Not in scope for v1: TV shows, batch processing many reels, a UI — just the
+- Output: a title **name + year** per recommendation, resolved against TMDB.
+  Both movies and TV shows are valid recommendation targets (see "Follow-up"
+  in `PROGRESS.md`: a reel can recommend either, and resolving against
+  movies only let an unrelated movie win over the actually-correct TV show
+  when both happened to share a title) — the TMDB resolution step searches
+  both and the output says which (`media_type`).
+- Single reel in, one or more recommendations (movie or TV) out.
+- Not in scope for v1: batch processing many reels, a UI — just the
   extraction pipeline as an importable/CLI module.
 
 ## Signal sources, in priority order
@@ -69,7 +74,8 @@ hit outranks a loosely related result TMDB returns first.
         "title": "...",
         "year": 0,
         "poster_path": "...",
-        "overview": "..."
+        "overview": "...",
+        "media_type": "movie | tv"
       }
     }
   ]

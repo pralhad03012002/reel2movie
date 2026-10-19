@@ -6085,3 +6085,314 @@ works, and the diff genuinely touches nothing outside `_dedupe()` and its
 tests.
 
 VERDICT: ACCEPTABLE
+
+---
+
+## Follow-up — widen TMDB resolution scope to include TV shows — status: done
+
+### Motivation
+
+Live testing showed a reel recommending "The Mentalist" (explicitly
+described in its own caption as "this cop consultant mystery **show**...
+on Netflix") got confidently resolved to an unrelated 2011 Indonesian
+MOVIE (TMDB id 648544) that happens to share the exact title — because the
+pipeline only ever searched TMDB's `/search/movie` endpoint, which cannot
+return TV results at all. This follow-up widens scope so TV shows are
+valid resolution targets too, not just movies.
+
+### Live `/search/multi` verification (done BEFORE writing any code)
+
+Hit the real TMDB API directly (via `load_dotenv()` +
+`config.get_tmdb_token()` + `requests`, scratch script, not committed) with
+`GET /3/search/multi?query=The%20Mentalist`. Observed, verbatim (abridged):
+
+```json
+{
+  "id": 5920,
+  "name": "The Mentalist",
+  "media_type": "tv",
+  "first_air_date": "2008-09-23",
+  ...
+},
+{
+  "id": 648544,
+  "title": "The Mentalist",
+  "media_type": "movie",
+  "release_date": "2011-11-10",
+  ...
+}
+```
+
+Confirmed:
+- Every result row carries `media_type`: `"movie"`, `"tv"`, or `"person"`
+  (confirmed `"person"` separately via `query=Tom Hanks`, e.g.
+  `{"id": 31, "name": "Tom Hanks", "media_type": "person", ...}` — no
+  `title`/`release_date`/usable-as-a-recommendation shape at all).
+- Movie rows use `title` + `release_date`; TV rows use `name` +
+  `first_air_date` — exactly the field-name split the task described.
+- The real TV id for "The Mentalist" is **5920**, not 1622 as guessed in
+  the task brief — confirmed against the live call, not assumed.
+- **New finding, not in the task brief:** `/search/multi` does **not**
+  support a `year` query param at all — `query=The Matrix&year=1999` and
+  `query=The Matrix&year=2199` (an impossible year) returned identical
+  `total_results` and ordering. Unlike `/search/movie`, TMDB silently
+  ignores `year` on this endpoint server-side. `year` is still sent (it's
+  harmless) but the real year-based disambiguation now happens entirely
+  client-side via `scoring.py`'s existing `year_bonus` term — this was
+  already true in spirit (scoring always re-checked the year), but now
+  it's the *only* place year filtering happens.
+
+### Naming decision: renamed `search_movie` → `search`
+
+Chose to rename rather than keep the old name, since `search_movie` would
+now be actively misleading (it searches TV too) and the task explicitly
+permitted a rename as long as every call site/fake was updated
+consistently. Updated every one of them — confirmed via grep before
+starting and a full `pytest` run after:
+- `reel2movie/core/protocols.py` — `TMDBClient.search_movie` → `.search`.
+- `reel2movie/tmdb/client.py` — `TMDBHttpClient.search_movie` → `.search`;
+  endpoint constant `_SEARCH_MOVIE_URL` → `_SEARCH_MULTI_URL`, now pointing
+  at `/3/search/multi`.
+- `reel2movie/tmdb/resolver.py` — `client.search_movie(...)` →
+  `client.search(...)`.
+- Fakes in `tests/unit/core/test_protocols.py`,
+  `tests/unit/tmdb/test_resolver.py`,
+  `tests/unit/pipeline/test_waterfall.py` — all renamed to `.search`.
+- `tests/unit/tmdb/test_client.py` — every `client.search_movie(...)` call
+  site renamed to `client.search(...)`; test function names that
+  referenced `search_movie`/the old endpoint renamed to match (e.g.
+  `test_search_hits_search_multi_endpoint`).
+
+### What changed, file by file
+
+- **`reel2movie/core/models.py`** — added `media_type: str` to both
+  `TMDBSearchResult` and `ResolvedMovie`. Class names kept as-is (not
+  renamed) per the task's instruction, with a docstring note on each that
+  it may now represent a TV show despite the name.
+- **`reel2movie/core/protocols.py`** — `TMDBClient.search_movie` renamed to
+  `.search`; docstring updated to say "movies AND TV shows."
+- **`reel2movie/tmdb/client.py`** — `search()` now calls
+  `GET /3/search/multi` instead of `/3/search/movie`. Filters out any
+  result with `media_type == "person"`. For kept rows: `title` <- `title`
+  (movie) or `name` (tv); `year` <- `_parse_year()` of `release_date`
+  (movie) or `first_air_date` (tv) — same parsing logic as before, just
+  applied to whichever date field matches the row's `media_type`;
+  `media_type` <- the raw TMDB value. `original_rank` is now a **sequential
+  rank over the kept (non-person) rows**, not the raw payload index — a
+  person result sitting between two valid candidates in TMDB's raw
+  ordering no longer dilutes the loser's rank number, which is more
+  correct for `scoring.py`'s `rank_bonus` term (TMDB's *own relevance
+  order among valid candidates*, not among everything it decided to
+  return).
+- **`reel2movie/tmdb/resolver.py`** — `resolve_candidate()` now calls
+  `client.search(...)` and threads `best.media_type` through into the
+  `ResolvedMovie` it constructs. No other logic changes.
+- **`reel2movie/tmdb/scoring.py`** — confirmed, not assumed: unchanged.
+  Re-read `score_result`, `pick_best`, `_exact_tier_rank`,
+  `_is_exact_title_match` line by line — every one reads only
+  `result.title`, `result.year`, and `result.original_rank`; none ever
+  touches `media_type`. A movie and a TV show sharing an exact title now
+  compete on equal footing through the existing tiered exact-match logic,
+  with TMDB's own relevance ordering (via `rank_bonus`) as the tiebreaker
+  — exactly the same mechanism that already breaks ties between two
+  movies, which is the correct behavior here.
+- **`reel2movie/cli.py`** — `_tmdb_to_dict()` now emits `media_type` as a
+  6th key, a deliberate documented deviation from `brainstorm.md`'s
+  original 5-field shape (brainstorm.md's "Output shape" section updated
+  to match).
+- **`brainstorm.md`** — "Scope (v1)" bullet that said "Not in scope for
+  v1: TV shows..." rewritten to state both movies and TV shows are valid
+  recommendation targets; "Output shape (draft)" JSON example gets a
+  `"media_type": "movie | tv"` key. No other section asserted movie-only
+  scope, so nothing else in that document was touched.
+
+### Tests
+
+Updated every existing fake `TMDBClient` (grepped for `search_movie` across
+the whole `tests/` tree first — 6 files had call sites/fakes: `test_client.py`,
+`test_resolver.py`, `test_waterfall.py`, `test_protocols.py`, plus
+`TMDBSearchResult(`/`ResolvedMovie(` construction sites needing the new
+required `media_type` field in `test_models.py` and `test_scoring.py`;
+`test_deps.py` had no `search_movie` references at all, confirmed by grep).
+
+New tests added:
+- `tests/unit/tmdb/test_client.py::test_search_filters_out_person_and_maps_movie_and_tv_distinctly`
+  — mocks a `/search/multi`-shaped response with a movie (The Mentalist,
+  the Indonesian one), a tv show (The Mentalist, the Netflix one), and a
+  person (Tom Hanks); asserts the person is dropped, the tv row's
+  `name`/`first_air_date` map to `title`/`year` with `media_type="tv"`,
+  and the movie row's `title`/`release_date` still map correctly with
+  `media_type="movie"`.
+- `tests/unit/tmdb/test_resolver.py::test_maps_tv_result_to_resolved_movie_with_tv_media_type`
+  — fake client returns a tv-shaped `TMDBSearchResult`; confirms
+  `resolve_candidate()` produces a `ResolvedMovie` with
+  `media_type="tv"`.
+- `tests/unit/test_cli.py` — extended `test_prints_expected_json_shape`
+  with explicit assertions that `media_type` appears (and equals
+  `"movie"` for the canned `ResolvedMovie`) in the serialized JSON.
+
+`python3 -m pytest tests/unit -q`:
+
+```
+209 passed in 3.82s
+```
+
+(207 before this change, +2 new test functions; existing tests' assertion
+counts grew in-place without adding new test functions for `test_cli.py`
+and `test_models.py`/`test_scoring.py`.)
+
+### Live-API verification of the actual real-world bug case
+
+Ran the exact real candidate from the bug report —
+`Candidate(raw_text="The Mentalist", source=SourceTag.CAPTION,
+confidence=0.9)` (no year hint, matching the real caption) — through the
+real `resolve_candidate()` end to end against the live API (real
+`TMDBHttpClient`, real bearer token via `config.get_tmdb_token()`):
+
+```
+resolved: ResolvedMovie(id=5920, title='The Mentalist', year=2008,
+poster_path='/acYXu4KaDj1NIkMgObnhe4C4a0T.jpg', overview='Patrick Jane, a
+former celebrity psychic medium, uses his razor sharp skills of
+observation and expertise at "reading" people to solve serious crimes
+with the California Bureau of Investigation.', match_score=0.9,
+media_type='tv')
+```
+
+Confirms the fix: resolves to the Netflix crime-drama TV series (id 5920,
+`media_type="tv"`), NOT the unrelated 2011 Indonesian movie (id 648544)
+from before. `media_type='tv'` correctly flags this as a TV show, not a
+movie, in the final pipeline output.
+
+### Verification scripts
+
+Both the live `/search/multi` shape probe and the end-to-end
+"The Mentalist" resolution script were throwaway scripts written only to
+the session scratchpad, never committed to the repo.
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (medium, forked) on the current diff (all 13
+non-`PROGRESS.md` touched files), `/ponytail:ponytail-review` on the same
+diff, a from-scratch `python3 -m pytest tests/unit -q` run, and an
+independent live-API re-verification script (own script, own
+`Candidate`/`resolve_candidate()` call, not the build report's pasted
+output) — plus a direct repo-wide `grep -rn "search_movie"` sweep.
+
+**Non-blocking — rename completeness confirmed by direct grep, not
+trusted from the build report:** `grep -rn "search_movie" --include="*.py"
+--include="*.md"` across the whole repo turns up zero remaining call
+sites, zero remaining fakes, and zero production references. The only
+survivors are: (1) `PROGRESS.md`'s own older sections (expected —
+historical record of earlier follow-ups, correctly left untouched), and
+(2) one docstring comment in `tests/unit/tmdb/test_resolver.py` (around
+`test_query_strips_adjacent_double_trailing_year`) that narrates a
+*different, older* follow-up's live-API verification ("confirmed live:
+`search_movie("Se7en (1995)", year=2015)` -> 0 results...") — this
+docstring predates this diff (confirmed: `git diff` shows this file's only
+changes are the fake's rename and the new TV test; this comment block is
+untouched) and describes a historical finding, not a current call site.
+Cosmetically stale now that the method is renamed, but it is prose
+documentation of a past experiment, not a missed rename — harmless.
+
+**Non-blocking — every renamed fake is actually exercised, not just
+present:** checked each of the 4 fakes individually
+(`tests/unit/core/test_protocols.py`, `tests/unit/tmdb/test_resolver.py`,
+`tests/unit/pipeline/test_waterfall.py`, plus the real `TMDBHttpClient` in
+`tests/unit/tmdb/test_client.py`) — every one has at least one test that
+calls `.search(...)` and asserts on either the return value or a recorded
+call (`last_query`/`last_year`/`calls`). None of the 4 is a silently
+orphaned definition that would pass vacuously if left as `search_movie`.
+
+**Non-blocking — `person` filtering traced directly in
+`reel2movie/tmdb/client.py:123-149`:** the loop does
+`if media_type == "person": continue` *before* `results.append(...)` and
+*before* `rank += 1` — a person row is dropped from the returned list
+entirely and never consumes a rank slot. Confirmed structurally (not just
+via the new test) by reading the loop body directly.
+
+**Non-blocking — `original_rank` renumbering verified correct, including
+the person-before-valid-row ordering case:** traced the same loop —
+`rank` only increments on the `rank += 1` line, which sits after the
+`continue`, so skipped (person) rows never increment it. The new
+`test_search_filters_out_person_and_maps_movie_and_tv_distinctly` test's
+raw payload is TV (idx 0), movie (idx 1), person (idx 2) — doesn't actually
+cover a person sitting *between* two kept rows in raw order. Traced it by
+hand anyway with a payload shaped [movie, person, tv]: movie gets
+`original_rank=0` (rank 0, then increments to 1), person is skipped (rank
+stays 1, not incremented), tv gets `original_rank=1` (not 2). Confirmed:
+TMDB's relevance order among the *kept* results is preserved contiguously
+as 0, 1, 2... regardless of where person rows fall in the raw payload —
+exactly the claimed behavior, and `rank_bonus` in `scoring.py` (which
+reads `original_rank` directly, unchanged) therefore still means "TMDB's
+own relevance order among valid candidates" and is not diluted by person
+rows in any raw-payload position.
+
+**Non-blocking — movie/TV field mapping read directly, not trusted from
+the report:** `reel2movie/tmdb/client.py:129-134` —
+`if media_type == "tv": title = item["name"]; date_field =
+item.get("first_air_date")` vs. the `else` branch using `item["title"]` /
+`item.get("release_date")`. Matches the live-verified field-name split
+exactly (movie: `title`+`release_date`; tv: `name`+`first_air_date`).
+Note: any `media_type` other than `"tv"` or `"person"` falls into the
+`else` (movie-shaped) branch — fine today since TMDB's documented
+`/search/multi` only ever returns `movie`/`tv`/`person`, but worth
+flagging that an unrecognized future `media_type` would hard-`KeyError`
+on `item["title"]` rather than being skipped or defaulting gracefully.
+Judged non-blocking: matches the live-verified real-world API shape, and
+a `KeyError` (loud failure) is arguably safer than silently mis-mapping a
+TV field onto a movie shape.
+
+**Non-blocking — `scoring.py` genuinely untouched, confirmed by reading
+it directly:** `git diff -- reel2movie/tmdb/scoring.py` is empty, and a
+direct read of `score_result`, `pick_best`, `_exact_tier_rank`, and
+`_is_exact_title_match` confirms none references `media_type` anywhere —
+each reads only `result.title`, `result.year`, and `result.original_rank`.
+The claim in the build report is accurate.
+
+**Non-blocking — `/code-review` (medium, forked):** no findings. Forked
+run independently grepped for `search_movie`/`_SEARCH_MOVIE_URL`, traced
+the person-filter/rank logic against the new test, confirmed every
+`TMDBSearchResult`/`ResolvedMovie` construction site updated (frozen/slots
+dataclasses would hard-fail at collection on a miss), confirmed
+`brainstorm.md` matches `cli.py`'s `_tmdb_to_dict` exactly, and ran
+`python3 -m pytest tests/ -q` → 209 passed, 1 skipped.
+
+**Non-blocking — `/ponytail:ponytail-review`:** "Lean already. Ship."
+`net: 0 lines possible.` The imperative loop in `client.py`'s `search()`
+(replacing the old one-line comprehension) is justified: the
+movie/TV conditional field mapping plus person-filtering doesn't fit a
+one-liner without an equally-long helper function, so it's not meaningful
+bloat. All other changes are mechanical, necessary additions (threading
+the new required `media_type` field through models, fakes, and
+assertions).
+
+**Independent verification (run directly in this review pass, not
+trusted from the build report):**
+- `python3 -m pytest tests/unit -q` → **209 passed**, matching the build
+  report's count exactly, confirmed independently.
+- Own live-API script (`Candidate(raw_text="The Mentalist",
+  source=SourceTag.CAPTION, confidence=0.9)` through the real
+  `resolve_candidate()` against the live TMDB API, real bearer token via
+  `config.get_tmdb_token()`) →
+  `ResolvedMovie(id=5920, title='The Mentalist', year=2008, ...,
+  media_type='tv')`. Matches the build report's claim exactly — confirms
+  the real bug case now resolves to the Netflix TV series, not the
+  unrelated 2011 Indonesian movie (id 648544).
+- Own live-API spot-check of `Candidate(raw_text="Dhobi Ghat (2010)",
+  source=SourceTag.CAPTION, confidence=0.9)` (the first real bug case from
+  earlier this session) against the same real `resolve_candidate()` →
+  `ResolvedMovie(id=54890, title='Dhobi Ghat', year=2010, ...,
+  match_score=1.0, media_type='movie')`. Confirms the TMDB-scope widening
+  did not regress plain movie resolution — a pure movie still resolves
+  correctly with `media_type='movie'` and a perfect match score.
+
+No blocking findings. The rename is complete across production code and
+every fake (confirmed by direct grep and by confirming each fake is
+actually exercised), `person` filtering and `original_rank` renumbering
+are both correct by direct trace (including the person-row-in-the-middle
+ordering case, hand-verified), movie/TV field mapping matches the live-
+verified API shape, `scoring.py` is genuinely untouched, and both
+independent live-API checks (the TV regression case and the movie
+regression spot-check) match the build report's claims exactly.
+
+VERDICT: ACCEPTABLE

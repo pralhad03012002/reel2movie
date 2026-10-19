@@ -15,6 +15,7 @@ def _result(**overrides) -> TMDBSearchResult:
         overview="A hacker learns the truth.",
         popularity=80.0,
         original_rank=0,
+        media_type="movie",
     )
     defaults.update(overrides)
     return TMDBSearchResult(**defaults)

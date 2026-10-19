@@ -64,9 +64,10 @@ class PosterDetector(Protocol):
 
 @runtime_checkable
 class TMDBClient(Protocol):
-    """Looks up candidate titles against TMDB's movie search endpoint."""
+    """Looks up candidate titles against TMDB's multi-search endpoint
+    (movies AND TV shows -- see PROGRESS.md's "Follow-up" section)."""
 
-    def search_movie(
+    def search(
         self, query: str, year: int | None = None
     ) -> list[TMDBSearchResult]:
         ...

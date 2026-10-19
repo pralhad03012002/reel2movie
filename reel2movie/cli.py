@@ -74,11 +74,14 @@ def _build_parser() -> argparse.ArgumentParser:
 def _tmdb_to_dict(tmdb: ResolvedMovie | None) -> dict | None:
     """One `ResolvedMovie` -> the `tmdb` object in brainstorm.md's draft shape.
 
-    Deliberately emits only the five fields the draft shape documents
-    (`id`, `title`, `year`, `poster_path`, `overview`) -- `match_score` is
-    a real field on `ResolvedMovie` but is not part of the documented
-    output contract, so it's left out here rather than leaking an
-    undocumented extra key into every CLI invocation's output.
+    Emits the five original documented fields (`id`, `title`, `year`,
+    `poster_path`, `overview`) plus `media_type` ("movie" or "tv") -- a
+    deliberate, documented deviation from brainstorm.md's original
+    movie-only output shape (see PROGRESS.md's "Follow-up" section and
+    brainstorm.md's updated "Output shape" section), added so the output
+    says whether a recommendation resolved to a movie or a TV show.
+    `match_score` is still left out -- it remains a real `ResolvedMovie`
+    field but not part of the documented output contract.
     """
     if tmdb is None:
         return None
@@ -88,6 +91,7 @@ def _tmdb_to_dict(tmdb: ResolvedMovie | None) -> dict | None:
         "year": tmdb.year,
         "poster_path": tmdb.poster_path,
         "overview": tmdb.overview,
+        "media_type": tmdb.media_type,
     }
 
 

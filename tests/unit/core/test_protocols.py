@@ -55,7 +55,7 @@ class FakePosterDetector:
 
 
 class FakeTMDBClient:
-    def search_movie(self, query: str, year: int | None = None) -> list[TMDBSearchResult]:
+    def search(self, query: str, year: int | None = None) -> list[TMDBSearchResult]:
         return [
             TMDBSearchResult(
                 id=1,
@@ -65,6 +65,7 @@ class FakeTMDBClient:
                 overview="",
                 popularity=1.0,
                 original_rank=0,
+                media_type="movie",
             )
         ]
 
@@ -95,7 +96,7 @@ def test_fake_poster_detector_satisfies_protocol():
 def test_fake_tmdb_client_satisfies_protocol():
     fake = FakeTMDBClient()
     assert isinstance(fake, TMDBClient)
-    results = fake.search_movie("Her", year=2013)
+    results = fake.search("Her", year=2013)
     assert all(isinstance(r, TMDBSearchResult) for r in results)
 
 

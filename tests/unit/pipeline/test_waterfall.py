@@ -107,7 +107,7 @@ class FakeTMDBClient:
     default_results: list[TMDBSearchResult] = field(default_factory=list)
     calls: list[tuple[str, int | None]] = field(default_factory=list)
 
-    def search_movie(
+    def search(
         self, query: str, year: int | None = None
     ) -> list[TMDBSearchResult]:
         self.calls.append((query, year))
@@ -151,6 +151,7 @@ def _exact_match_result(query: str, *, tmdb_id: int = 1) -> TMDBSearchResult:
         overview="",
         popularity=10.0,
         original_rank=0,
+        media_type="movie",
     )
 
 
@@ -438,6 +439,7 @@ def test_unresolved_duplicate_dropped_when_same_query_candidate_already_resolved
         poster_path=None,
         overview="",
         match_score=1.0,
+        media_type="movie",
     )
     resolved_rec = Recommendation(
         query="Om Dar-B-Dar (1988)",

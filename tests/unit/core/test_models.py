@@ -120,9 +120,11 @@ def test_tmdb_search_result_construction():
         overview="A man falls in love with an AI.",
         popularity=12.3,
         original_rank=0,
+        media_type="movie",
     )
     assert r.original_rank == 0
     assert r.year == 2013
+    assert r.media_type == "movie"
 
 
 def test_resolved_movie_construction():
@@ -133,8 +135,10 @@ def test_resolved_movie_construction():
         poster_path="/poster.jpg",
         overview="overview",
         match_score=0.95,
+        media_type="movie",
     )
     assert rm.match_score == 0.95
+    assert rm.media_type == "movie"
 
 
 def test_recommendation_defaults_tmdb_to_none():
@@ -156,7 +160,13 @@ def test_recommendation_unresolved_candidate_is_kept_not_dropped():
 
 def test_recommendation_with_resolved_tmdb():
     rm = ResolvedMovie(
-        id=1, title="Her", year=2013, poster_path=None, overview="o", match_score=1.0
+        id=1,
+        title="Her",
+        year=2013,
+        poster_path=None,
+        overview="o",
+        match_score=1.0,
+        media_type="movie",
     )
     rec = Recommendation(query="Her", source=SourceTag.CAPTION, confidence=0.9, tmdb=rm)
     assert rec.tmdb is rm

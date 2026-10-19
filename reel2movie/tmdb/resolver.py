@@ -86,7 +86,7 @@ def resolve_candidate(
     """
     year_hint = _extract_year_hint(candidate.raw_text)
     query_title = _strip_trailing_year(candidate.raw_text)
-    results = client.search_movie(query_title, year=year_hint)
+    results = client.search(query_title, year=year_hint)
     best = pick_best(query_title, year_hint, results)
     if best is None:
         return None
@@ -98,4 +98,5 @@ def resolve_candidate(
         poster_path=best.poster_path,
         overview=best.overview,
         match_score=score_result(query_title, year_hint, best),
+        media_type=best.media_type,
     )

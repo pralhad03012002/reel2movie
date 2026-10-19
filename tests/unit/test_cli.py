@@ -54,6 +54,7 @@ def _canned_result(url: str) -> PipelineResult:
                     poster_path="/poster.jpg",
                     overview="A hacker discovers reality is a simulation.",
                     match_score=0.95,
+                    media_type="movie",
                 ),
             ),
             Recommendation(
@@ -99,10 +100,16 @@ def test_prints_expected_json_shape(monkeypatch, capsys):
         "year": 1999,
         "poster_path": "/poster.jpg",
         "overview": "A hacker discovers reality is a simulation.",
+        "media_type": "movie",
     }
     # match_score is a real ResolvedMovie field but is not part of
     # brainstorm.md's documented output shape, so it must not leak in.
     assert "match_score" not in resolved["tmdb"]
+    # media_type is new: a deliberate, documented deviation from
+    # brainstorm.md's original movie-only output shape -- confirms the
+    # final JSON shows whether a recommendation resolved to a movie or
+    # a TV show.
+    assert resolved["tmdb"]["media_type"] == "movie"
 
     unresolved = payload["recommendations"][1]
     assert unresolved["query"] == "Some Obscure Title"
