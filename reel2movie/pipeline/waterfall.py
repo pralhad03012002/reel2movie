@@ -256,11 +256,21 @@ def _dedupe(recommendations: list[Recommendation]) -> list[Recommendation]:
     report for one winning extraction per movie, not averaged/combined
     across several near-duplicate extractions of the same movie.
     Unresolved recommendations (`tmdb is None`) have no id to group on, so
-    they are never merged with anything or with each other. The final
-    list is sorted by `confidence` descending.
+    they are never merged with anything or with each other -- EXCEPT: if
+    an unresolved recommendation's `query` string exactly matches the
+    `query` of some other recommendation that DID resolve (e.g. the same
+    poster detected in two sampled frames, one TMDB lookup transiently
+    failing), that unresolved copy is a redundant duplicate of an already-
+    answered question, not a genuinely-unresolved candidate, so it's
+    dropped. An unresolved recommendation with no same-query resolved
+    sibling is kept as-is, per flow.md's rule. The final list is sorted by
+    `confidence` descending.
     """
     unresolved = [rec for rec in recommendations if rec.tmdb is None]
     resolved = [rec for rec in recommendations if rec.tmdb is not None]
+
+    resolved_queries = {rec.query for rec in resolved}
+    unresolved = [rec for rec in unresolved if rec.query not in resolved_queries]
 
     best_by_tmdb_id: dict[int, Recommendation] = {}
     for rec in resolved:

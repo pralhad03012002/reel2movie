@@ -5957,3 +5957,131 @@ coverage for staying in sync). Tests (204 passed) and the live-API
 Triangle case were independently re-run from scratch and matched.
 
 VERDICT: ACCEPTABLE
+
+## Follow-up — drop unresolved duplicate when same-query candidate already resolved — status: DONE
+
+**Bug (confirmed via live testing):** a reel with no caption/comment match
+fell through to the visual fallback, which sampled multiple frames and
+detected the SAME movie poster across two different frames, producing two
+separate `Candidate`s with identical `raw_text` (e.g. `"Om Dar-B-Dar
+(1988)"`). One copy's TMDB resolution succeeded; the other hit a transient
+network error and came back `tmdb=None`. `_dedupe()` in
+`reel2movie/pipeline/waterfall.py` groups resolved recommendations by
+`tmdb.id`, so it correctly merges two recommendations that both resolve —
+but an unresolved recommendation has no id to group by, so it was invisible
+to that logic even when another recommendation with the exact same `query`
+string had resolved. Final output showed both: the real resolved movie and
+a redundant, confusing `tmdb: null` duplicate.
+
+**Fix (minimal, additive, nothing else touched):** in `_dedupe()`, after
+splitting recommendations into `unresolved`/`resolved` (unchanged), added
+one line computing the set of `query` strings among `resolved`, then
+filtered `unresolved` to drop any whose `query` appears in that set, before
+the existing dedupe-by-`tmdb.id` grouping (unchanged) runs. An unresolved
+recommendation with no same-query resolved sibling is unaffected and still
+kept, per flow.md's existing rule. Docstring updated to describe the new
+behavior. No other function in `waterfall.py` was touched — no renaming, no
+restructuring of the existing dedupe-by-id logic, `_resolve_all` untouched.
+
+**Tests added** (`tests/unit/pipeline/test_waterfall.py`), calling `_dedupe`
+directly:
+- `test_unresolved_duplicate_dropped_when_same_query_candidate_already_resolved`
+  — exact real-world repro shape (same `query="Om Dar-B-Dar (1988)"`, one
+  `Recommendation` with a real `ResolvedMovie`, one with `tmdb=None`) ->
+  asserts only the resolved one survives.
+- `test_unresolved_candidate_with_no_resolved_sibling_is_still_kept` —
+  confirms existing behavior unchanged: a genuinely-unresolved
+  recommendation with no same-query resolved sibling is kept, not
+  accidentally dropped.
+- `test_two_different_unresolved_candidates_with_different_queries_both_kept`
+  — confirms the new logic doesn't merge unrelated unresolved candidates
+  with each other.
+
+```
+python3 -m pytest tests/unit -q
+207 passed in 3.69s
+```
+(204 prior + 3 new, all passing.)
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (medium, forked) on the current diff
+(`reel2movie/pipeline/waterfall.py`, `tests/unit/pipeline/test_waterfall.py`,
+`PROGRESS.md`), `/ponytail:ponytail-review` on the same diff, a from-scratch
+`python3 -m pytest tests/unit -q` run, and a direct, independent `_dedupe()`
+repro (own script, own constructed `Recommendation`s, not the build report's
+pasted output).
+
+**Non-blocking — order-of-operations confirmed safe:** traced the actual
+code (`reel2movie/pipeline/waterfall.py:269-284`). The two new lines run
+immediately after the existing `unresolved`/`resolved` split and *before*
+the `best_by_tmdb_id` grouping loop, but the two steps are independent
+regardless of ordering: the new query-based filter only ever reads/writes
+the `unresolved` list, and the id-based merge only ever reads the (full,
+unfiltered) `resolved` list to build `best_by_tmdb_id`. Neither step's
+input depends on the other step's output, so placing the query filter
+before vs. after the id-merge loop would produce the identical final
+`deduped` list either way. No bad interaction.
+
+**Non-blocking — same-query-but-different-candidate edge case, judged safe:**
+traced `resolve_candidate` (`reel2movie/tmdb/resolver.py:78-101`): it is a
+pure function of `candidate.raw_text` (== `Recommendation.query`) and the
+TMDB client's search results — `year_hint`/`query_title` are both derived
+from `raw_text` alone, with no other disambiguating input. `_resolve_all`
+only ever converts an *exception* from that call into `tmdb=None`; it never
+introduces a legitimate "different movie" branch for the same input text.
+Consequence: two `Recommendation`s that share the exact same literal
+`query` string necessarily went through the identical TMDB search, so any
+resolved/unresolved split between them can only be transient-failure noise
+(network blip, as the bug report itself describes), never two genuinely
+distinct real-world candidates that happen to print the same raw text with
+different correct outcomes. Verified this directly rather than just
+reasoning about it — constructed a "lookalike" case deliberately shaped like
+the worry (same literal query, one resolved to a real TMDB id, one
+`tmdb=None`, framed as if they were different candidates) and ran it through
+`_dedupe()`: the unresolved copy is dropped, which is the *correct* outcome
+given the above, not a bug. **Judgment: the edge case the task asked about
+cannot occur in this codebase's design — the fix is safe without
+qualification.**
+
+**Non-blocking — scope confirmed minimal, nothing else touched:**
+`git diff -- reel2movie/pipeline/waterfall.py` shows exactly one hunk,
+confined to `_dedupe()` (lines 256-284: the expanded docstring plus the two
+logic lines). `_extract_from_caption`, `_extract_from_creator_comments`,
+`_extract_from_visual`, `_resolve_all`, and `run_pipeline` all have zero
+diff lines — confirmed by the diff itself, not by trusting the build
+report's claim.
+
+**Non-blocking — `/ponytail:ponytail-review`:** "Lean already. Ship."
+`net: -0 lines possible.` The 2-line fix (set comprehension + list-comp
+filter) is already the minimal idiomatic form; the docstring expansion
+matches this file's existing verbose-docstring convention elsewhere; the 3
+new tests each cover a distinct behavioral case and, per the skill's own
+rule, test/assert code is the ponytail minimum and is never flagged for
+deletion.
+
+**Non-blocking — `/code-review` (medium):** no findings. Assessed as a
+deliberate, well-documented, narrowly-scoped bugfix with matching tests;
+no correctness, reuse, or efficiency issue cleared the bar for a finding.
+
+**Independent verification (run directly in this review pass, not trusted
+from the build report):**
+- `python3 -m pytest tests/unit -q` → **207 passed**, matching the build
+  report's count exactly, confirmed independently.
+- Direct `_dedupe()` repro, own script, own constructed objects (not copy-
+  pasted from the test file): built one resolved `Recommendation` + one
+  `tmdb=None` `Recommendation` sharing `query="Om Dar-B-Dar (1988)"` →
+  `_dedupe()` returned exactly 1 item, the resolved one. Built a lone
+  `tmdb=None` `Recommendation` with no resolved sibling → `_dedupe()`
+  returned it unchanged. Built the same-query "lookalike distinct
+  candidate" edge case described above → `_dedupe()` dropped the unresolved
+  copy, confirmed correct per the judgment above. All three match the
+  claimed behavior exactly.
+
+No blocking findings. The fix is a correct, minimally-scoped 2-line
+addition that behaves exactly as documented, the same-query edge case the
+task raised cannot produce an incorrect drop given how `resolve_candidate`
+works, and the diff genuinely touches nothing outside `_dedupe()` and its
+tests.
+
+VERDICT: ACCEPTABLE

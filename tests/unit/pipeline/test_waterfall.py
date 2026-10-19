@@ -22,11 +22,13 @@ from reel2movie.core.models import (
     FrameSample,
     IngestResult,
     Platform,
+    Recommendation,
+    ResolvedMovie,
     SourceTag,
     TMDBSearchResult,
 )
 from reel2movie.pipeline.deps import PipelineDeps
-from reel2movie.pipeline.waterfall import CONFIDENCE_THRESHOLD, run_pipeline
+from reel2movie.pipeline.waterfall import CONFIDENCE_THRESHOLD, _dedupe, run_pipeline
 
 URL = "https://instagram.com/reel/fake123/"
 
@@ -419,6 +421,83 @@ def test_two_candidates_resolving_to_same_tmdb_id_are_deduped():
     # The higher-confidence of the two merged recommendations survives.
     assert rec.confidence == 1.0
     assert rec.query == "The Thing (1982) remastered"
+
+
+def test_unresolved_duplicate_dropped_when_same_query_candidate_already_resolved():
+    """Real-world bug repro: visual fallback detects the same poster in two
+    sampled frames, producing two `Recommendation`s with identical `query`.
+    One's TMDB resolution succeeds; the other hits a transient error and
+    comes back `tmdb=None`. The unresolved copy is a redundant duplicate of
+    an already-answered question, so `_dedupe` must drop it, leaving only
+    the resolved one.
+    """
+    resolved_movie = ResolvedMovie(
+        id=7,
+        title="Om Dar-B-Dar",
+        year=1988,
+        poster_path=None,
+        overview="",
+        match_score=1.0,
+    )
+    resolved_rec = Recommendation(
+        query="Om Dar-B-Dar (1988)",
+        source=SourceTag.FRAME_VISUAL,
+        confidence=0.8,
+        tmdb=resolved_movie,
+    )
+    unresolved_duplicate_rec = Recommendation(
+        query="Om Dar-B-Dar (1988)",
+        source=SourceTag.FRAME_VISUAL,
+        confidence=0.8,
+        tmdb=None,
+    )
+
+    deduped = _dedupe([resolved_rec, unresolved_duplicate_rec])
+
+    assert len(deduped) == 1
+    assert deduped[0].tmdb is resolved_movie
+
+
+def test_unresolved_candidate_with_no_resolved_sibling_is_still_kept():
+    """Existing behavior must be unchanged: a genuinely-unresolved
+    recommendation with no same-query resolved sibling is kept, not
+    accidentally dropped by the new duplicate-dropping logic.
+    """
+    lone_unresolved_rec = Recommendation(
+        query="Some Obscure Title (2010)",
+        source=SourceTag.CAPTION,
+        confidence=0.9,
+        tmdb=None,
+    )
+
+    deduped = _dedupe([lone_unresolved_rec])
+
+    assert deduped == [lone_unresolved_rec]
+
+
+def test_two_different_unresolved_candidates_with_different_queries_both_kept():
+    """The new logic must not merge unrelated unresolved candidates with
+    each other -- only an unresolved rec whose query matches a *resolved*
+    sibling's query is dropped.
+    """
+    first_unresolved_rec = Recommendation(
+        query="First Obscure Title (2001)",
+        source=SourceTag.CAPTION,
+        confidence=0.9,
+        tmdb=None,
+    )
+    second_unresolved_rec = Recommendation(
+        query="Second Obscure Title (2002)",
+        source=SourceTag.CAPTION,
+        confidence=0.85,
+        tmdb=None,
+    )
+
+    deduped = _dedupe([first_unresolved_rec, second_unresolved_rec])
+
+    assert len(deduped) == 2
+    assert first_unresolved_rec in deduped
+    assert second_unresolved_rec in deduped
 
 
 def test_recommendations_sorted_by_confidence_descending():
