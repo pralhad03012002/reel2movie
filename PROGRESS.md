@@ -4726,3 +4726,668 @@ retry branch unreachable dead code and left an unbounded-hang failure mode).
 One-line fix, applied directly (not re-run through a full build/fix subagent
 cycle given how small and unambiguous it was). Verified: `tests/unit/tmdb`
 (23 passed) and the full suite (191 passed) both still pass.
+
+## Follow-up — fix TMDB query dilution from embedded year — status: done
+
+A real end-to-end test against a real Instagram reel exposed a live,
+confirmed-severe bug: `resolve_candidate()` in `tmdb/resolver.py` was
+sending `candidate.raw_text` — the FULL candidate text, including its
+literal trailing `"(YYYY)"` — as the TMDB search query string, instead of
+just the title. Confirmed directly against the live TMDB API (not
+mocked): querying `"Dhobi Ghat (2010)"` returns **zero** results, while
+querying `"Dhobi Ghat"` alone (title only, year passed separately via the
+already-correct `year=` param) returns a perfect-score match. This hit
+every HIGH-confidence candidate (every `"Title (YYYY)"`-shaped candidate
+out of `text_extraction/regex_extractor.py` or the Claude Code CLI
+extractor) — the most common, most important tier in the whole pipeline.
+This exact risk was flagged as non-blocking ("risk to watch against live
+TMDB data later") during the original `tmdb/` module's review; it's now
+confirmed real.
+
+### What's built
+
+`reel2movie/tmdb/resolver.py`:
+- Added `_TRAILING_YEAR_IN_PARENS = re.compile(r"\s*\((\d{4})\)\s*$")` and
+  a new `_strip_trailing_year(raw_text)` helper that strips a `"(YYYY)"`
+  anchored at the very **end** of the string only, returning the original
+  string unchanged (defensively) if stripping would somehow leave nothing.
+- `resolve_candidate()` now computes
+  `query_title = _strip_trailing_year(candidate.raw_text) if year_hint is not None else candidate.raw_text`
+  and uses `query_title` — not `candidate.raw_text` — for all three of
+  `client.search_movie(query_title, year=year_hint)`,
+  `pick_best(query_title, year_hint, results)`, and
+  `score_result(query_title, year_hint, best)` when building the
+  `ResolvedMovie`. `pick_best`/`score_result` needed the same cleaned
+  string because the fuzzy title-similarity comparand is diluted by the
+  same trailing `"(YYYY)"` noise the search query was.
+- Scoped entirely to what `resolver.py` sends to/compares against TMDB.
+  `Candidate.raw_text` and `Recommendation.query` (`pipeline/waterfall.py`)
+  are untouched — the candidate's own identity elsewhere in the pipeline
+  (display, dedup keys, logging) is unaffected; only the TMDB-facing query
+  string changed.
+
+**Why "trailing only" stripping, not "strip any `(YYYY)` anywhere":**
+`_extract_year_hint()` already had to solve this same problem for a
+different reason — a title can contain its own embedded parenthetical
+year that isn't the release year (e.g.
+`"Experience Paris (1920) like never before (2023)"`, where 2023 is the
+real year and 1920 is part of the title's own content). It solves this by
+taking the LAST `"(YYYY)"` match, i.e. searching from the right.
+`_strip_trailing_year()` uses the same philosophy via an end-anchored
+regex (`\s*\((\d{4})\)\s*$`): it only strips a year-in-parens that is
+literally the last thing in the string, which is exactly the shape
+`text_extraction/regex_extractor.py` (and the Claude Code CLI extractor)
+always produce (`f"{title} ({year})"`, confirmed by reading
+`regex_extractor.py`). A title with its own embedded, non-trailing
+parenthetical year is left completely untouched, since the regex's `$`
+anchor simply won't match there.
+
+### Tests
+
+`tests/unit/tmdb/test_resolver.py`:
+- Updated the pre-existing `test_extracts_year_hint_from_candidate_text`
+  — it previously asserted the (buggy) `client.last_query ==
+  "The Matrix (1999)"`; now asserts `client.last_query == "The Matrix"`
+  (year still passed separately via `last_year == 1999`).
+- `test_query_strips_trailing_year_for_high_confidence_candidate` — the
+  exact bug-shaped case: `"Inception (2010)"` → query sent is exactly
+  `"Inception"`, year sent is `2010`.
+- `test_query_strips_only_trailing_year_not_embedded_one` — the
+  embedded-year edge case: `"Experience Paris (1920) like never before
+  (2023)"` → only the trailing `"(2023)"` is stripped, leaving
+  `"Experience Paris (1920) like never before"` as the query; the
+  embedded `"(1920)"` survives untouched.
+- `test_query_unchanged_when_no_year_present` — a MEDIUM-confidence bare
+  title (`"Interstellar"`, no year): query passed is unchanged, exactly
+  `"Interstellar"` — no stripping attempted.
+- `test_match_score_uses_stripped_query_not_raw_text_with_year` — proves
+  `score_result`/`pick_best` also receive the stripped query: computes
+  `score_result` directly for both the stripped (`"Inception"`) and
+  unstripped (`"Inception (2010)"`) query against the same result,
+  confirms the two scores measurably differ, and asserts the resolved
+  candidate's `match_score` equals the stripped-query score.
+
+Also had to update one pre-existing pipeline-level test,
+`tests/unit/pipeline/test_waterfall.py::test_two_candidates_resolving_to_same_tmdb_id_are_deduped`:
+its `FakeTMDBClient` is keyed by exact query string
+(`results_by_query`), and one of its two candidates
+(`"The Thing (1982)"`) now gets searched as `"The Thing"` post-fix, so
+the dict key was updated from `"The Thing (1982)"` to `"The Thing"` (its
+sibling candidate, `"The Thing (1982) remastered"`, has no *trailing*
+year — `"(1982)"` is followed by `" remastered"`, not end-of-string — so
+it's searched unstripped and needed no key change). This is pre-existing
+test infrastructure asserting on the literal query string, not a design
+change; it had to move in lockstep with the real fix.
+
+`python3 -m pytest tests/unit -q` → **195 passed** (191 before this
+change + 4 new resolver tests; the existing
+`test_extracts_year_hint_from_candidate_text` was updated in place, not
+counted as new).
+
+### Live-API verification (the actual confirmed-real bug case)
+
+Per the task, wrote a standalone (uncommitted, not in `tests/`) script
+that loaded the real `.env` TMDB token via `config.get_tmdb_token()`,
+built a real `TMDBHttpClient`, constructed
+`Candidate(raw_text="Dhobi Ghat (2010)", source=SourceTag.CAPTION,
+confidence=0.9)`, and called the real `resolve_candidate()` end-to-end
+against the live TMDB API. Output:
+
+```
+resolved: ResolvedMovie(id=54890, title='Dhobi Ghat', year=2010, poster_path='/hSNbvyrRbfAxz29yJSz7bJ1Ujuu.jpg', overview='Arun is a reclusive and lonely modern art painter. Shai is an American banker who is on a visit to Mumbai. Munna is a washerboy also living near Arun and Yasmin. The movie is about these four characters from different class of society and how the lives of four characters are intertwined.', match_score=1.0)
+VERIFIED: live TMDB resolution of 'Dhobi Ghat (2010)' succeeded.
+```
+
+`id=54890`, `title="Dhobi Ghat"`, `year=2010`, `match_score=1.0` — exactly
+the real-world case that exposed the bug, now resolving correctly against
+the live API (no mocks). Script deleted after verification, per the
+task's instructions (kept out of `tests/`).
+
+### Review findings (latest pass)
+
+This section holds two review passes, kept distinct rather than letting the
+newer one overwrite the older (per the historical/current split convention
+already established in earlier subtasks). **Cycle 0** (below) is the
+original pre-fix review; its outcome is narrated in `### Fixes applied`
+below and is kept here verbatim for the record. **Cycle 2** (further down)
+is a fresh, from-scratch re-review of the current working tree — including
+the loop-based `_strip_trailing_year()` fix and both ponytail
+simplifications from fix cycle 1 — run independently of cycle 0, not a
+continuation of it.
+
+#### cycle 0 review (historical — pre-fix; see "Fixes applied" below for what changed in response)
+
+Reviewed via `/code-review` (high, forked) on the current diff
+(`reel2movie/tmdb/resolver.py`, `tests/unit/pipeline/test_waterfall.py`,
+`tests/unit/tmdb/test_resolver.py`, `PROGRESS.md`),
+`/ponytail:ponytail-review` on the same diff, a manual hand-trace of
+`_TRAILING_YEAR_IN_PARENS` against the embedded-year edge case, a
+from-scratch `python3 -m pytest tests/unit -q` run, and an independent
+live-TMDB-API re-verification (own script, own API call, not the build
+report's pasted output).
+
+**Manual trace — regex anchoring (read directly, not trusted from the
+build report):**
+- **Confirmed**: `_TRAILING_YEAR_IN_PARENS = re.compile(r"\s*\((\d{4})\)\s*$")`.
+  Because `$` only ever matches once per string (the end position),
+  `.sub()` can replace at most the one occurrence anchored there — an
+  earlier `"(YYYY)"` elsewhere in the string cannot also satisfy `$` and
+  is structurally untouched. Hand-traced against
+  `"Experience Paris (1920) like never before (2023)"`: only the trailing
+  `" (2023)"` matches and is removed, leaving
+  `"Experience Paris (1920) like never before"` with `"(1920)"` intact —
+  exactly what `test_query_strips_only_trailing_year_not_embedded_one`
+  asserts. Confirmed by running that test and also by re-running the
+  substitution directly at a Python prompt.
+- **Confirmed**: all three call sites inside `resolve_candidate()` —
+  `client.search_movie(query_title, ...)`, `pick_best(query_title, ...)`,
+  and `score_result(query_title, ...)` in the `ResolvedMovie(...)`
+  construction — use `query_title`, not a mix with `candidate.raw_text`.
+  Read the full current file; no half-fixed call site.
+- **Confirmed**: `candidate.raw_text` and `Recommendation.query` are
+  genuinely unchanged by this fix. Grepped `pipeline/waterfall.py`:
+  `_resolve_all()` builds `Recommendation(query=candidate.raw_text, ...)`
+  directly from the candidate, never touching `resolve_candidate`'s
+  internal `query_title` — the final CLI JSON's `query` field still shows
+  the original raw text, including any trailing `"(YYYY)"`, by design
+  (this fix is scoped to TMDB-facing lookup only).
+- **Confirmed**: the `test_waterfall.py` fixture change
+  (`"The Thing (1982)"` → `"The Thing"` as the fake client's dict key) is
+  genuine fallout, not papering over anything. `"The Thing (1982)"` has a
+  trailing year and now gets searched as `"The Thing"` post-fix; its
+  sibling `"The Thing (1982) remastered"` has `"(1982)"` followed by
+  `" remastered"` — not end-of-string — so it is correctly left
+  unstripped and its dict key is correctly left unchanged. The test's own
+  assertion (both candidates dedupe to the same tmdb id) is untouched.
+
+**BLOCKING — found independently, and reproduced against the live TMDB
+API (not just theoretical):** `_strip_trailing_year()` performs only a
+single, non-repeated substitution. A candidate whose raw_text ends in
+*two* adjacent `"(YYYY)"` groups — reachable via the real
+`RegexCandidateExtractor`'s `_QUOTED_TITLE_YEAR` pattern, whose quoted-title
+capture group has no restriction against parentheses, so a caption like
+`Rewatching "Se7en (1995)" (2015) tonight` produces
+`Candidate(raw_text='Se7en (1995) (2015)', confidence=0.9)` — only has its
+outer trailing `" (2015)"` stripped, leaving `query_title = "Se7en (1995)"`,
+which *itself* is still trailing-year-shaped. Verified mechanically by
+running the real extractor + resolver helpers (confirmed the exact
+`raw_text`/`query_title` values above), then verified against the live
+TMDB API directly: `search_movie("Se7en (1995)", year=2015)` → **0
+results**; `search_movie("Se7en", year=2015)` → **7 results** (top hit
+`"Se7en"`). This is the identical zero-result failure mode this entire
+fix cycle exists to close, recurring through a gap in the fix itself. Fix
+is cheap: loop the substitution until no further trailing match is found
+(or apply the pattern with a trailing `*` repetition), e.g.
+```python
+def _strip_trailing_year(raw_text: str) -> str:
+    stripped = raw_text
+    while True:
+        new = _TRAILING_YEAR_IN_PARENS.sub("", stripped).strip()
+        if new == stripped:
+            break
+        stripped = new
+    return stripped or raw_text
+```
+- Related, same root cause: `test_query_strips_only_trailing_year_not_embedded_one`
+  only covers an embedded year *separated* from the trailing year by other
+  text; no test covers the adjacent-double-year shape, so the suite gives
+  false confidence that "embedded year" is fully handled.
+
+**Non-blocking — architectural note (pre-existing, not introduced by this
+diff):** the fix re-derives title/year via a second anchored regex that
+must stay byte-for-byte compatible with the `f"{title} ({year})"` format
+independently produced at four separate construction sites
+(`regex_extractor.py` ×2, `claude_code_extractor.py`, `vision_llm_detector.py`
+— confirmed by grep). Nothing couples the regex to that format except
+convention; a future drift at any site would silently reintroduce query
+dilution with no test signal. Root cause is `Candidate` conflating
+title+year into one string, which predates this fix and is out of scope
+to redesign here.
+
+**Non-blocking:** `return stripped or raw_text` (the empty-query
+fallback) only fires when `raw_text` is pure whitespace plus a year
+(e.g. `" (2010)"`), and even then returns the *unstripped* original,
+which still carries the trailing `"(YYYY)"` — so the fallback doesn't
+actually prevent the dilution bug it's defensively guarding against.
+Realistically unreachable from any real extractor (title is never empty
+upstream), so low-severity.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- `L62-66` **yagni**: the `if year_hint is not None else candidate.raw_text`
+  branch in `resolve_candidate()` duplicates what `_strip_trailing_year`
+  already does safely on its own (no match → string returned unchanged).
+  Calling it unconditionally — `query_title = _strip_trailing_year(candidate.raw_text)`
+  — drops the branch, 1 line instead of 5.
+- `L49` **delete**: same empty-query fallback flagged above as
+  non-blocking from the correctness angle — also flagged here as
+  unneeded defensive code; nothing replaces it.
+- net: -4 lines possible. No unused dependency, no speculative
+  config, no reinvented stdlib otherwise; the second compiled regex is
+  justified (genuinely different semantics — trailing-only vs.
+  last-match-anywhere — from the pre-existing `_YEAR_IN_PARENS`).
+
+**Independent test run (run directly in this review pass, not trusted
+from the build report):**
+- `python3 -m pytest tests/unit -q` → **195 passed**, matching the build
+  report's count exactly.
+
+**Independent live-API re-verification (own script, own call, not the
+build report's pasted output):** loaded the real `.env` `TMDB_API_KEY`
+via `config.get_tmdb_token()` + `load_dotenv()`, built a real
+`TMDBHttpClient`, constructed
+`Candidate(raw_text="Dhobi Ghat (2010)", source=SourceTag.CAPTION,
+confidence=0.9)`, and called the real `resolve_candidate()` end-to-end
+against the live TMDB API (no mocks, no retry needed — succeeded on the
+first attempt, no `ConnectionResetError` hit). Result:
+```
+resolved: ResolvedMovie(id=54890, title='Dhobi Ghat', year=2010, poster_path='/hSNbvyrRbfAxz29yJSz7bJ1Ujuu.jpg', overview='...', match_score=1.0)
+INDEPENDENT VERIFICATION PASSED: id=54890, title='Dhobi Ghat', year=2010
+```
+Matches `id=54890`, `title="Dhobi Ghat"`, `year=2010` exactly — the
+original fix's core claim independently confirmed.
+
+One blocking finding: `_strip_trailing_year()`'s single-pass substitution
+leaves an adjacent-double-trailing-year shape (reachable via the real
+quoted-title extractor path) still trailing-year-shaped after stripping,
+reproducing — confirmed against the live TMDB API — the exact zero-result
+failure mode this fix cycle exists to close. All other findings
+(regex-to-construction-format coupling, the self-defeating empty-query
+fallback, the two ponytail simplification notes) are non-blocking. The
+regex anchoring for the originally-specified embedded-year case, the
+three-call-site consistency, the `raw_text`/`Recommendation.query` blast
+radius, and the `test_waterfall.py` fixture fallout were all independently
+confirmed correct by direct code reading and grep. Tests (195 passed) and
+the live-API Dhobi Ghat case were independently re-run and matched.
+
+VERDICT: NEEDS FIXES
+
+#### cycle 2 review (current — fresh re-review of the post-fix-cycle-1 working tree)
+
+Scope: the full current diff — `reel2movie/tmdb/resolver.py` (now with the
+looped `_strip_trailing_year()` and both ponytail simplifications from fix
+cycle 1 applied), `tests/unit/pipeline/test_waterfall.py`,
+`tests/unit/tmdb/test_resolver.py`, `PROGRESS.md`. Run as a clean re-review,
+not a continuation of the cycle 0/1 session: fresh `/code-review` (high,
+forked) and `/ponytail:ponytail-review` invocations against the current
+diff, plus independent manual verification (a from-scratch full-suite run,
+a direct read of `_strip_trailing_year()`/`resolve_candidate()`, a
+three-adjacent-year loop-termination stress test built from scratch, and an
+independent reproduction of the fix's own Se7en regression case against a
+hand-written fake client).
+
+**Primary question — is the cycle 0 BLOCKING double-adjacent-year bug
+actually fixed? Yes, confirmed by direct reproduction, including a
+three-adjacent-year case beyond what cycle 0 required:**
+- The task's own suggested stress-test string, `"Title (1) (2) (2020)"`,
+  turns out not to exercise what it was meant to: `_TRAILING_YEAR_IN_PARENS`
+  is anchored on exactly `\d{4}`, so the single-digit `(1)`/`(2)` groups
+  never match it at all. Run directly: `_strip_trailing_year("Title (1) (2) (2020)")`
+  → `"Title (1) (2)"` — correct, not a bug (those groups aren't
+  year-shaped), but not a 3-iteration stress test either.
+- Built a genuine three-adjacent-4-digit-year case instead:
+  `_strip_trailing_year("Title (1111) (2222) (2020)")` → runs the `while
+  True` loop exactly 3 times and returns exactly `"Title"`. Confirmed by
+  direct execution.
+- Termination/no-infinite-loop check: ran `_strip_trailing_year("X" + "
+  (1999)" * 50)` (50 chained trailing groups) → reduces to `"X"` in under
+  1ms. The loop is structurally guaranteed to terminate for any finite
+  input: each iteration either strictly shortens the string (one more
+  trailing group consumed) or produces no change, and "no change" is the
+  loop's own exit condition (`if new == stripped: break`) — there is no
+  path that re-lengthens or oscillates the string.
+- Re-confirmed the zero/one/two-adjacent cases directly:
+  `_strip_trailing_year("Interstellar")` → unchanged;
+  `_strip_trailing_year("Inception (2010)")` → `"Inception"`;
+  `_strip_trailing_year("Se7en (1995) (2015)")` → `"Se7en"` (the fix's own
+  cycle-0 regression case, exactly as fixed).
+- Independently reproduced the fix's own regression test case end-to-end
+  (own hand-written fake `TMDBClient`, not the test suite's
+  `FakeTMDBClient`): `resolve_candidate(Candidate(raw_text="Se7en (1995)
+  (2015)", source=SourceTag.CAPTION, confidence=0.9), client)` → the query
+  sent is exactly `"Se7en"`, year sent is `2015`. Matches
+  `test_query_strips_adjacent_double_trailing_year` exactly.
+- Read the full current `_strip_trailing_year()` and `resolve_candidate()`:
+  confirmed the loop fix is applied, both ponytail simplifications from fix
+  cycle 1 (`query_title = _strip_trailing_year(candidate.raw_text)` called
+  unconditionally; the `return stripped or raw_text` fallback removed in
+  favor of `return stripped` directly) are applied exactly as the fix
+  report describes, and all three TMDB-facing call sites
+  (`client.search_movie`, `pick_best`, `score_result`) consistently use
+  `query_title` — no half-fixed call site.
+
+**BLOCKING — found independently via `/code-review`, and reproduced
+directly against the real extractor (not just theoretical):** removing the
+`return stripped or raw_text` fallback (per cycle 0's non-blocking
+"self-defeating, realistically unreachable" note and the matching ponytail
+`delete:` suggestion) reintroduces a real, worse failure mode that cycle
+0's "unreachable" reasoning did not anticipate. `_strip_trailing_year()`'s
+loop can now reduce `query_title` all the way to the **empty string**, not
+just a still-year-shaped remainder, whenever the quoted title content
+captured by `RegexCandidateExtractor`'s `_QUOTED_TITLE_YEAR` pattern is
+*itself* entirely `"(YYYY)"`-shaped. Confirmed by direct reproduction
+through the real extractor, not a synthetic string:
+```python
+RegexCandidateExtractor().extract('Watch "(1999)" (2010) now', SourceTag.CAPTION)
+# -> [Candidate(raw_text='(1999) (2010)', confidence=0.9)]   # HIGH confidence
+_strip_trailing_year('(1999) (2010)')
+# -> ''   # loop: "(1999) (2010)" -> "(1999)" -> "" -> break
+```
+`resolve_candidate()` has no guard against an empty `query_title` and calls
+`client.search_movie("", year=2010)` directly — against the real
+`TMDBHttpClient` this sends a blank `query` param to TMDB's search
+endpoint with no local validation, likely surfacing as an HTTP error
+(caught by `_resolve_all`'s broad `except Exception` in
+`pipeline/waterfall.py`, silently dropping a HIGH-confidence candidate)
+rather than the "just zero relevant results" degradation the pre-fix code
+(which sent `candidate.raw_text` unstripped, i.e. the non-empty
+`"(1999) (2010)"`) would have produced for this same contrived input. This
+is strictly worse than the pre-this-fix-cycle behavior for this input
+shape, and a direct consequence of this diff: the loop's own fixed-point
+termination behaves correctly (per the three/fifty-adjacent-year checks
+above), but nothing stops it from consuming the *entire* string when the
+"title" portion is itself year-shaped. Narrow/contrived input (a quoted
+span whose entire content looks like a year), same rarity class as cycle
+0's Se7en case, but demonstrated reachable through the real production
+extractor at HIGH confidence (0.9) — the tier this whole fix cycle is
+about. Cheap fix: guard the final return, e.g. `return stripped or
+raw_text` (restoring cycle 1's removed fallback) or `return stripped if
+stripped else raw_text`, so a would-be-empty result falls back to the
+original (still non-empty, if diluted) raw_text instead of an empty query
+string.
+
+**Non-blocking — re-confirmed, carried over from cycle 0, unchanged by fix
+cycle 1:** the architectural note about `_strip_trailing_year()` needing to
+stay byte-for-byte compatible with the `f"{title} ({year})"` format
+produced independently at four separate construction sites — still valid,
+still out of scope to redesign here, still just a latent-drift risk with no
+test signal.
+
+**From `/code-review` (correctness) and `/ponytail:ponytail-review`
+(complexity) — same simplification, found independently by both:**
+- `_strip_trailing_year()`'s 7-line hand-written `while True` loop
+  (re-running `_TRAILING_YEAR_IN_PARENS.sub(...)` to a fixed point) can be
+  replaced by a single non-looping regex using a repeated-group quantifier:
+  `_TRAILING_YEARS_IN_PARENS = re.compile(r"(?:\s*\(\d{4}\)\s*)+$")`, then
+  `return _TRAILING_YEARS_IN_PARENS.sub("", raw_text).strip()` — one `.sub()`
+  call instead of a loop, handling any number of chained trailing year
+  groups (including the three/fifty-adjacent cases stress-tested above) in
+  one pass. Removes the loop body and the ~9-line docstring paragraph
+  justifying why a loop is needed. Note: this simplification does **not**
+  fix the BLOCKING empty-query finding above on its own — the single-regex
+  version has the identical "can consume the entire string" behavior for
+  all-year-shaped input, so the `return stripped or raw_text`-style guard
+  is still needed regardless of which implementation (loop vs. quantifier)
+  is used.
+- `net: -10 lines possible` (non-blocking; independent of the BLOCKING fix
+  above, which must land either way).
+
+**Independent test run (run directly in this review pass, not trusted from
+the build report):**
+- `python3 -m pytest tests/unit -q` → **196 passed**, matching the fix
+  report's count exactly.
+
+Cycle 2 outcome: one BLOCKING finding (the empty-query collapse above),
+newly found in this pass and not present in cycle 0's findings — the
+double-adjacent-year loop-termination bug cycle 0 flagged is genuinely
+fixed and holds up under a three- and fifty-adjacent-year stress test, but
+removing the defensive fallback (per cycle 0's own "realistically
+unreachable" judgment call, which this pass shows was incorrect for the
+quoted-title-is-itself-year-shaped sub-case) opened a new, reachable gap.
+Everything else — the loop's correctness and termination, all three
+TMDB-facing call sites, the `raw_text`/`Recommendation.query` blast radius,
+the `test_waterfall.py` fixture fallout, and the test count — was
+independently re-confirmed correct.
+
+VERDICT: NEEDS FIXES
+
+#### cycle 3 review (current — fresh re-review of the post-cycle-2-fix working tree; final cycle per the project's 3-cycle cap)
+
+Scope: the full current diff as it stands uncommitted right now —
+`reel2movie/tmdb/resolver.py` (cycle 2's empty-query guard restored:
+`return stripped or raw_text`), `tests/unit/tmdb/test_resolver.py` (with
+both of cycle 2's new regression tests,
+`test_query_falls_back_to_raw_text_when_fully_stripped_to_empty` and
+`test_query_strips_three_adjacent_trailing_years`),
+`tests/unit/pipeline/test_waterfall.py`, `PROGRESS.md`. Run as a clean
+re-review, not a continuation of cycles 0/2: fresh `/code-review` (high,
+forked) and `/ponytail:ponytail-review` invocations against the current
+diff, plus independent manual verification done directly in this pass (a
+from-scratch `python3 -m pytest tests/unit -q` run, a full read of the
+final `_strip_trailing_year()`/`resolve_candidate()`, and hand
+reproduction — outside pytest — of both of cycle 2's own regression
+cases plus several adversarial cases beyond what's already tested).
+
+**`/code-review` (high, forked) — no correctness bug found.** Scope was
+`reel2movie/tmdb/resolver.py` + its two test files (`PROGRESS.md` is
+documentation, out of scope); cross-checked callers in
+`pipeline/waterfall.py`, `text_extraction/regex_extractor.py`, and
+`text_extraction/claude_code_extractor.py` to re-verify the
+"`raw_text` is always `f'{title} ({year})'`" assumption
+`_strip_trailing_year` depends on, and confirmed `Recommendation.query`
+still intentionally uses the original unstripped `candidate.raw_text`
+(display vs. search-query correctly kept separate). Returned `[]`
+(empty findings). One cosmetic **non-blocking** nit: `reel2movie/tmdb/resolver.py:12`
+— `_TRAILING_YEAR_IN_PARENS = re.compile(r"\s*\((\d{4})\)\s*$")`'s
+capturing group `(\d{4})` is never read (`.sub()` discards the whole
+match); a non-capturing `(?:\d{4})` would be clearer, but this has zero
+behavioral effect.
+
+**`/ponytail:ponytail-review` — one finding, carried over from cycle 2,
+already explicitly considered and deliberately deferred by the cycle 2
+fix itself (non-blocking both times):**
+- `reel2movie/tmdb/resolver.py:L69-75`: `shrink:` the 7-line hand-written
+  `while True` fixed-point loop re-running `_TRAILING_YEAR_IN_PARENS.sub(...)`
+  can be replaced by one non-looping regex with a repeated-group
+  quantifier: `_TRAILING_YEARS_IN_PARENS = re.compile(r"(?:\s*\(\d{4}\)\s*)+$")`,
+  then `return _TRAILING_YEARS_IN_PARENS.sub("", raw_text).strip() or raw_text`.
+  This is the identical suggestion cycle 2's review made; the cycle 2 fix
+  report explicitly chose to keep the loop as-is ("to keep the change
+  minimal and the fix cycle's diff easy to re-review") since the reviewer
+  itself flagged the style choice as non-blocking. Re-raising it here only
+  for completeness/traceability, not as a new finding — it is not
+  reasserted as something that must land in this cycle.
+- `reel2movie/tmdb/resolver.py:L11-12`: `shrink:` same capturing-group nit
+  `/code-review` found independently (see above) — `(\d{4})` → `(?:\d{4})`.
+- `net: -6 lines possible` (both non-blocking, carried over / cosmetic).
+- Lean otherwise: the two test files add coverage, not production
+  complexity, and are out of this skill's scope.
+
+**Manual verification (done directly in this pass, not trusted from
+either skill's report or from cycle 2's writeup):**
+- Read the full current `_strip_trailing_year()` and `resolve_candidate()`
+  in `reel2movie/tmdb/resolver.py` end to end. Confirmed: the loop body is
+  `new = _TRAILING_YEAR_IN_PARENS.sub("", stripped).strip()`, compared
+  against `stripped` for the fixed-point break, and the function ends
+  with `return stripped or raw_text` — the empty-query guard cycle 2
+  re-added is present and intact. `resolve_candidate()` calls
+  `_strip_trailing_year(candidate.raw_text)` unconditionally and threads
+  the single `query_title` result into all three of
+  `client.search_movie`, `pick_best`, and `score_result` — no half-fixed
+  call site.
+- `python3 -m pytest tests/unit -q`, run independently, from scratch →
+  **198 passed** — matches the reported count exactly, not merely
+  trusted from the build report.
+- **Hand-reproduced both of cycle 2's own regression tests directly**,
+  bypassing pytest entirely — constructed `Candidate` objects and a
+  hand-written `FakeTMDBClient` inline and called `resolve_candidate()`
+  myself:
+  - `Candidate(raw_text="(1999) (2010)", ...)` → `client.last_query ==
+    "(1999) (2010)"` (the full original, non-empty, unchanged) and
+    `client.last_query != ""`, `client.last_year == 2010`. Matches
+    `test_query_falls_back_to_raw_text_when_fully_stripped_to_empty`
+    exactly.
+  - `Candidate(raw_text="Title (1111) (2222) (2020)", ...)` →
+    `client.last_query == "Title"`, `client.last_year == 2020`. Matches
+    `test_query_strips_three_adjacent_trailing_years` exactly.
+  - Also re-ran `RegexCandidateExtractor().extract('Watch "(1999)" (2010)
+    now', SourceTag.CAPTION)` directly (not trusted from the test's
+    docstring claim) → confirmed it genuinely produces
+    `Candidate(raw_text='(1999) (2010)', confidence=0.9)` against the real
+    extractor, so the fully-empty-collapse guard is reachable through real
+    production code, not just a synthetic string — both regression tests
+    are genuinely testing what they claim, not vacuously passing.
+- **Adversarial case beyond what's already tested — whitespace-only
+  intermediate, run directly at a Python prompt, not reasoned about only
+  on paper:** traced `_strip_trailing_year()`'s iteration-by-iteration
+  `stripped` values for inputs designed to probe whether a whitespace-only
+  (not literally `""`) intermediate could ever survive a full iteration
+  and defeat the `stripped or raw_text` falsy check (which only catches
+  literal `""` — a truthy `" "` would slip past it). Tested
+  `"   (2020)   "` (whitespace-padded lone year, no title content),
+  `"(1999)  (2010)"` (double internal space between adjacent groups), and
+  `" "` (pure whitespace, no year at all). In every case the iteration
+  trace showed `stripped` collapsing straight from a non-whitespace (or
+  non-empty) value directly to exactly `""` in one step — never pausing on
+  a truthy, whitespace-only value — because `.strip()` is applied to
+  `new` on *every* iteration of the loop, before the fixed-point
+  comparison, so any would-be whitespace-only remainder is normalized to
+  `""` in the same iteration it would otherwise arise. This confirms the
+  `.strip()` placement inside the loop body is load-bearing, not cosmetic:
+  without it, a case producing a lone-whitespace remainder could in
+  principle produce a truthy `" "` that slips past `stripped or raw_text`
+  undetected; with it, no such state is reachable. (`"   (2020)   "` →
+  falls back to itself unchanged, including its own leading/trailing
+  padding — see next point.)
+- **Confirmed the fallback returns the literal, byte-for-byte ORIGINAL
+  `raw_text`, not a partially-stripped intermediate:** read the code —
+  `raw_text` is the function's parameter and is never reassigned anywhere
+  in the loop (only the local `stripped` variable is mutated), so
+  `stripped or raw_text` genuinely falls back to the exact original
+  argument. Confirmed concretely: `_strip_trailing_year("   (2020)   ")`
+  (padding included) returns `"   (2020)   "` — the original padding and
+  all — not e.g. `"(2020)"` or `""`; this is consistent with the
+  function's own docstring ("Falls back to the original, unstripped
+  `raw_text`") and is the intended, documented behavior, not a bug.
+
+No new BLOCKING issue found in this cycle. Both items above (the
+loop-vs-single-regex shrink and the unused capturing group) are
+non-blocking cosmetic carryovers/nits with zero behavioral effect, not
+correctness defects, and the loop-vs-regex one was already explicitly
+and deliberately deferred by name in the cycle 2 fix report. All of
+cycle 0's and cycle 2's BLOCKING findings were independently
+re-confirmed fixed and holding up under additional adversarial cases
+(whitespace-only intermediates, the three-adjacent-year stress case, and
+direct hand reproduction of both regression tests outside the test
+runner).
+
+VERDICT: ACCEPTABLE
+
+### Fixes applied
+
+`reel2movie/tmdb/resolver.py`:
+- `_strip_trailing_year()` now loops the `_TRAILING_YEAR_IN_PARENS.sub(...)`
+  substitution until the string stops changing, instead of a single
+  non-repeated `.sub()` call. Fixes the BLOCKING finding: an adjacent
+  double-trailing-year `raw_text` (e.g. `"Se7en (1995) (2015)"`) now
+  strips all the way down to `"Se7en"` instead of stopping after one pass
+  at `"Se7en (1995)"` (itself still trailing-year-shaped).
+- Applied both non-blocking ponytail simplifications, since neither
+  conflicted with the loop fix: `resolve_candidate()` now calls
+  `_strip_trailing_year(candidate.raw_text)` unconditionally — dropped
+  the `if year_hint is not None else candidate.raw_text` branch, since
+  `_strip_trailing_year` already safely no-ops (returns the input
+  unchanged, module whitespace trimming) when there's no trailing-year
+  match. Also dropped the `return stripped or raw_text` empty-query
+  defensive fallback — `_strip_trailing_year` now always returns
+  `stripped` directly; the loop's own termination (`new == stripped` →
+  break) already handles the "nothing left to strip" case correctly, and
+  the reviewer judged the all-whitespace-input case it guarded as
+  unreachable from any real extractor.
+- Net line delta matches the review's "-4 lines possible" estimate.
+
+#### cycle 2 fix
+
+`reel2movie/tmdb/resolver.py`:
+- Re-added the empty-query guard that fix cycle 1 removed, fixing cycle
+  2's BLOCKING finding: `_strip_trailing_year()` now ends with
+  `return stripped or raw_text` instead of `return stripped`. Kept the
+  existing `while True` loop implementation rather than switching to the
+  reviewer's suggested single-regex-with-repeated-group form (`r"(?:\s*\(\d{4}\)\s*)+$"`)
+  — the reviewer explicitly flagged that style choice as non-blocking and
+  noted the guard is needed either way, so the loop was left as-is and
+  only the guard was restored, to keep the change minimal and the fix
+  cycle's diff easy to re-review.
+- Expanded `_strip_trailing_year()`'s docstring with a new paragraph
+  explaining why the fallback is reachable, not just defensive: a
+  candidate whose entire `raw_text` is chained `"(YYYY)"`-shaped groups
+  with nothing else (e.g. `'(1999) (2010)'`, produced by the real
+  `RegexCandidateExtractor`'s `_QUOTED_TITLE_YEAR` pattern from a caption
+  like `Watch "(1999)" (2010) now`) loops the strip all the way down to
+  `""`; falling back to the original unstripped `raw_text` sends TMDB a
+  non-empty (if imperfect) query instead of a blank one.
+
+`tests/unit/tmdb/test_resolver.py`:
+- Added `test_query_falls_back_to_raw_text_when_fully_stripped_to_empty` —
+  the exact BLOCKING regression case: `raw_text='(1999) (2010)'` against
+  a `FakeTMDBClient`, asserting `client.last_query == "(1999) (2010)"`
+  (the full original, non-empty fallback) and explicitly
+  `client.last_query != ""`.
+- Added `test_query_strips_three_adjacent_trailing_years` — the
+  reviewer's loop-termination stress-test case,
+  `raw_text="Title (1111) (2222) (2020)"`, asserting it still fully
+  reduces to `client.last_query == "Title"`, confirming the guard didn't
+  regress the already-working multi-strip behavior.
+- Manually verified (not just via the test suite) that
+  `RegexCandidateExtractor().extract('Watch "(1999)" (2010) now',
+  SourceTag.CAPTION)` really does produce
+  `Candidate(raw_text='(1999) (2010)', confidence=0.9)` against the real
+  extractor, then ran that exact candidate through `_strip_trailing_year`
+  and `resolve_candidate` end-to-end (fake client), confirming the query
+  sent is the non-empty `'(1999) (2010)'`, not `""`.
+
+`python3 -m pytest tests/unit -q` → **198 passed** (196 before this fix
+cycle + 2 new resolver tests).
+
+### Tests
+
+`tests/unit/tmdb/test_resolver.py`:
+- Added `test_query_strips_adjacent_double_trailing_year` — the exact
+  BLOCKING regression case: `raw_text='Se7en (1995) (2015)'` against a
+  `FakeTMDBClient`, asserting `client.last_query == "Se7en"` (fully
+  stripped, not `"Se7en (1995)"`) and `client.last_year == 2015`.
+
+`python3 -m pytest tests/unit -q` → **196 passed** (195 before this
+fix cycle + 1 new regression test).
+
+### Live-API verification
+
+Loaded the real `.env` `TMDB_API_KEY` via `config.get_tmdb_token()` +
+`load_dotenv()`, built a real `TMDBHttpClient`, constructed
+`Candidate(raw_text="Se7en (1995) (2015)", source=SourceTag.CAPTION,
+confidence=0.9)`, and called the real `resolve_candidate()` end-to-end
+against the live TMDB API (script written to a scratchpad outside the
+repo, not committed). Output:
+
+```
+stripped query_title: 'Se7en'
+resolved: None
+```
+
+The stripping fix itself is confirmed correct — `_strip_trailing_year`
+returns exactly `"Se7en"` for this input, matching the fake-client test.
+But the full `resolve_candidate()` call still returns `None` live, for a
+**separate, pre-existing reason outside this fix's scope**:
+`_extract_year_hint()` picks the LAST `"(YYYY)"` match in `raw_text`
+(by design, documented behavior, unrelated to the stripping bug), which
+for this exact caption shape is `2015` — not Se7en's real release year
+(`1995`). `TMDBHttpClient.search_movie()` passes `year` straight through
+to TMDB's `/search/movie?year=` parameter, which TMDB applies as a hard
+server-side filter. Confirmed directly against the live API:
+`search_movie("Se7en", year=2015)` → **0 results** (not the 7 the
+earlier review pass's writeup stated — re-ran this exact call twice,
+consistently 0; TMDB's `year` filter excludes the real 1995 release
+entirely once a non-matching year is supplied). Isolating the stripping
+fix from this separate year-filter interaction confirms it works as
+intended: `search_movie("Se7en", year=None)` → **7 results**, top hit
+(`original_rank=0`) `id=807, title='Se7en', year=1995`; feeding that
+result set through `pick_best`/`score_result` with the stripped query
+and the `2015` year hint still yields `id=807, title='Se7en', year=1995,
+match_score=0.9` as the best (non-rejected) result. This proves the
+BLOCKING stripping bug is fixed; the `None` on the literal end-to-end
+call is TMDB's live `year=` hard filter rejecting a year hint that, for
+this specific constructed example, happens not to be the film's real
+release year — a distinct, pre-existing ambiguity in `_extract_year_hint`
+("last parenthetical wins") colliding with a caption where the last
+parenthetical isn't the release year, not a regression from or scope of
+this fix cycle's assigned BLOCKING finding. Left unfixed as out of
+scope; flagged here for visibility rather than silently worked around.

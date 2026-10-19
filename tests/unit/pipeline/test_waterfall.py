@@ -392,10 +392,15 @@ def test_two_candidates_resolving_to_same_tmdb_id_are_deduped():
             SourceTag.CAPTION: [lower_confidence_candidate, higher_confidence_candidate]
         }
     )
-    # Both queries resolve to the SAME tmdb id (id=42), via per-query exact matches.
+    # Both queries resolve to the SAME tmdb id (id=42), via per-query exact
+    # matches. `resolver.py` strips the candidate's trailing "(YYYY)" before
+    # querying TMDB, so "The Thing (1982)" is searched as "The Thing" (the
+    # year is still passed separately via `year=`); "The Thing (1982)
+    # remastered" has no TRAILING year (year is mid-string, followed by
+    # "remastered"), so it's searched unstripped.
     tmdb_client = FakeTMDBClient(
         results_by_query={
-            "The Thing (1982)": [_exact_match_result("The Thing (1982)", tmdb_id=42)],
+            "The Thing": [_exact_match_result("The Thing", tmdb_id=42)],
             "The Thing (1982) remastered": [
                 _exact_match_result("The Thing (1982) remastered", tmdb_id=42)
             ],
