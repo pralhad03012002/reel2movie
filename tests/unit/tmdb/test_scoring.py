@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from reel2movie.core.models import TMDBSearchResult
-from reel2movie.tmdb.scoring import MIN_MATCH_SCORE, pick_best, score_result
+from reel2movie.tmdb.scoring import (
+    MIN_MATCH_SCORE,
+    find_exact_matches,
+    pick_best,
+    score_result,
+)
 
 
 def _result(**overrides) -> TMDBSearchResult:
@@ -185,3 +190,60 @@ def test_pick_best_exact_match_not_penalized_by_case_sensitive_wratio():
     assert result is not None
     assert result is up
     assert result.title == "Up"
+
+
+def test_find_exact_matches_returns_all_tied_exact_matches_in_order():
+    """Regression for the real "Don't Be Shy" disambiguation case: TMDB can
+    return several DIFFERENT entries that all exactly match the query --
+    `find_exact_matches` must return the whole tied group (for a caller
+    like the disambiguation step to pick among), not just one winner."""
+    exact_a = _result(id=1, title="Don't Be Shy", original_rank=0)
+    exact_b = _result(id=2, title="DON'T BE SHY", original_rank=3)
+    not_exact = _result(id=3, title="Don't Be Shy!", original_rank=1)
+    not_a_match = _result(id=4, title="Keine Scheu vor heiklen Fragen", original_rank=2)
+
+    result = find_exact_matches("Don't Be Shy", [exact_a, not_exact, not_a_match, exact_b])
+
+    assert result == [exact_a, exact_b]
+
+
+def test_find_exact_matches_returns_empty_list_when_none_match():
+    results = [_result(title="Completely Unrelated Thing", original_rank=0)]
+
+    assert find_exact_matches("The Matrix", results) == []
+
+
+def test_find_exact_matches_normalizes_curly_apostrophe_against_straight():
+    """Regression for the real "Don't Be Shy" bug: live TMDB data for this
+    exact title included rows using a Unicode right single quotation mark
+    (U+2019, "Don’t Be Shy") instead of a straight apostrophe
+    (U+0027), while the real extracted candidate text always uses the
+    straight form. Without normalizing both to one form first, the curly
+    variant would be silently excluded from the exact-match tier."""
+    straight = _result(id=1, title="Don't Be Shy", original_rank=0)
+    curly = _result(id=2, title="Don’t Be Shy", original_rank=1)
+
+    result = find_exact_matches("Don't Be Shy", [straight, curly])
+
+    assert result == [straight, curly]
+
+
+def test_find_exact_matches_normalizes_left_curly_apostrophe_too():
+    left_curly = _result(id=1, title="Don‘t Be Shy", original_rank=0)
+
+    result = find_exact_matches("Don't Be Shy", [left_curly])
+
+    assert result == [left_curly]
+
+
+def test_pick_best_uses_find_exact_matches_internally_for_curly_apostrophe():
+    """`pick_best()` itself must benefit from the same normalization --
+    not just the newly-extracted `find_exact_matches()` helper."""
+    curly = _result(id=1, title="Don’t Be Shy", original_rank=0, popularity=1.0)
+    unrelated_popular = _result(
+        id=2, title="Something Else Entirely", original_rank=0, popularity=500.0
+    )
+
+    result = pick_best("Don't Be Shy", None, [unrelated_popular, curly])
+
+    assert result is curly

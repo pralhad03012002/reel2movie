@@ -25,6 +25,7 @@ from reel2movie.ingest.ytdlp_client import YtDlpClient
 from reel2movie.text_extraction.claude_code_extractor import (
     ClaudeCodeCandidateExtractor,
     ClaudeCodeTextChatClient,
+    TextChatClient,
 )
 from reel2movie.text_extraction.fallback_extractor import FallbackCandidateExtractor
 from reel2movie.text_extraction.regex_extractor import RegexCandidateExtractor
@@ -56,6 +57,14 @@ class PipelineDeps:
     poster_detector: PosterDetector
     tmdb_client: TMDBClient
     frame_count: int = _DEFAULT_FRAME_COUNT
+    # Optional: a `TextChatClient` for `tmdb.resolver.resolve_candidate()`'s
+    # caption-context disambiguation step (see PROGRESS.md's "Follow-up —
+    # disambiguate tied exact matches" section). Defaults to `None` so any
+    # `PipelineDeps` built without one (e.g. existing tests) behaves
+    # exactly as before -- `resolve_candidate()` treats a missing
+    # chat_client as "disambiguation not available" and falls through to
+    # its pre-existing rank/year tiebreak.
+    disambiguation_chat_client: TextChatClient | None = None
 
 
 def build_default_pipeline_deps() -> PipelineDeps:
@@ -82,6 +91,12 @@ def build_default_pipeline_deps() -> PipelineDeps:
       with `config.get_anthropic_key()`.
     - `tmdb_client` -- `TMDBHttpClient` constructed with
       `config.get_tmdb_token()`.
+    - `disambiguation_chat_client` -- the SAME `ClaudeCodeTextChatClient`
+      instance constructed above for `text_extractor`'s fallback, reused
+      rather than constructing a second, identical "shell out to `claude`
+      for text" client. Threaded through `pipeline/waterfall.py` into
+      `tmdb.resolver.resolve_candidate()`'s caption-context
+      disambiguation step.
 
     Raises whatever `config.get_tmdb_token()` raises (a clear
     `RuntimeError` naming the missing env var) if that required credential
@@ -98,9 +113,13 @@ def build_default_pipeline_deps() -> PipelineDeps:
     ingestor = InstagramIngestor(
         YtDlpClient(), cookies_file=config.get_instagram_cookies_file()
     )
+    # Shared with `disambiguation_chat_client` below -- one instance, not
+    # two, since both uses are the identical "shell out to the `claude`
+    # CLI for a pure-text reply" primitive and the client is stateless.
+    claude_text_chat_client = ClaudeCodeTextChatClient()
     text_extractor = FallbackCandidateExtractor(
         RegexCandidateExtractor(),
-        ClaudeCodeCandidateExtractor(ClaudeCodeTextChatClient()),
+        ClaudeCodeCandidateExtractor(claude_text_chat_client),
     )
 
     backend = config.get_vision_backend()
@@ -122,4 +141,5 @@ def build_default_pipeline_deps() -> PipelineDeps:
         text_extractor=text_extractor,
         poster_detector=poster_detector,
         tmdb_client=tmdb_client,
+        disambiguation_chat_client=claude_text_chat_client,
     )

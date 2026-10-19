@@ -3,7 +3,28 @@
 from __future__ import annotations
 
 from reel2movie.core.models import Candidate, SourceTag, TMDBSearchResult
-from reel2movie.tmdb.resolver import resolve_candidate
+from reel2movie.tmdb.resolver import disambiguate_with_context, resolve_candidate
+
+
+class FakeChatClient:
+    """A minimal fake `TextChatClient`: configurable canned reply, or a raise.
+
+    Records every prompt it was asked so a test can assert disambiguation
+    was (or was never) attempted.
+    """
+
+    def __init__(self, reply: str = "unknown", error: Exception | None = None) -> None:
+        self.reply = reply
+        self.error = error
+        self.prompts: list[str] = []
+        self.call_count = 0
+
+    def chat(self, prompt: str) -> str:
+        self.call_count += 1
+        self.prompts.append(prompt)
+        if self.error is not None:
+            raise self.error
+        return self.reply
 
 
 class FakeTMDBClient:
@@ -258,3 +279,213 @@ def test_match_score_uses_stripped_query_not_raw_text_with_year():
     unstripped_score = score_result("Inception (2010)", 2010, result)
     assert stripped_score != unstripped_score
     assert resolved.match_score == stripped_score
+
+
+# ---------------------------------------------------------------------------
+# disambiguate_with_context() — direct tests
+# ---------------------------------------------------------------------------
+
+
+def _tied_rom_com_and_threesome_results() -> list[TMDBSearchResult]:
+    """The real-world "Don't Be Shy" shape: two different movies exactly
+    titled "Don't Be Shy", one the real Amazon Prime rom-com, one an
+    unrelated adult-themed movie -- TMDB popularity/rank alone can't
+    distinguish them."""
+    rom_com = _search_result(
+        id=111,
+        title="Don't Be Shy",
+        year=2025,
+        overview="A college student navigates chaotic campus life and a "
+        "budding romance as she figures out who she really is.",
+        original_rank=0,
+    )
+    unrelated_adult_themed = _search_result(
+        id=1586276,
+        title="Don't Be Shy",
+        year=2025,
+        overview="Three friends explore an unconventional relationship "
+        "together.",
+        original_rank=1,
+    )
+    return [rom_com, unrelated_adult_themed]
+
+
+def test_disambiguate_with_context_returns_candidate_the_model_picked_by_id():
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(reply="111")
+
+    result = disambiguate_with_context(
+        candidates, "A rom-com about college life, from Amazon Prime.", chat_client
+    )
+
+    assert result is candidates[0]
+    assert result.id == 111
+
+
+def test_disambiguate_with_context_returns_none_on_unknown_reply():
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(reply="unknown")
+
+    result = disambiguate_with_context(candidates, "some ambiguous context", chat_client)
+
+    assert result is None
+
+
+def test_disambiguate_with_context_returns_none_on_garbage_reply():
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(reply="not a number or unknown")
+
+    result = disambiguate_with_context(candidates, "some context", chat_client)
+
+    assert result is None
+
+
+def test_disambiguate_with_context_returns_none_when_id_not_among_candidates():
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(reply="999999999")
+
+    result = disambiguate_with_context(candidates, "some context", chat_client)
+
+    assert result is None
+
+
+def test_disambiguate_with_context_returns_none_when_chat_client_raises():
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(error=RuntimeError("the claude CLI blew up"))
+
+    result = disambiguate_with_context(candidates, "some context", chat_client)
+
+    assert result is None
+
+
+def test_disambiguate_with_context_prompt_includes_context_and_overviews():
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(reply="111")
+
+    disambiguate_with_context(candidates, "THE_UNIQUE_CONTEXT_MARKER", chat_client)
+
+    assert len(chat_client.prompts) == 1
+    prompt = chat_client.prompts[0]
+    assert "THE_UNIQUE_CONTEXT_MARKER" in prompt
+    assert "college student navigates chaotic campus life" in prompt
+    assert "unconventional relationship" in prompt
+    assert "111" in prompt
+    assert "1586276" in prompt
+
+
+# ---------------------------------------------------------------------------
+# resolve_candidate() — disambiguation wiring
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_candidate_uses_disambiguation_pick_when_confident():
+    """(a) disambiguation picks a specific id -> that exact
+    TMDBSearchResult is returned as `best`, confirmed via the resolved
+    ResolvedMovie's id."""
+    candidates = _tied_rom_com_and_threesome_results()
+    client = FakeTMDBClient(candidates)
+    chat_client = FakeChatClient(reply="111")
+
+    resolved = resolve_candidate(
+        _candidate("Don't Be Shy"),
+        client,
+        context="A rom-com about college life, from Amazon Prime.",
+        chat_client=chat_client,
+    )
+
+    assert resolved is not None
+    assert resolved.id == 111
+    assert chat_client.call_count == 1
+
+
+def test_resolve_candidate_falls_back_to_pick_best_when_disambiguation_unknown():
+    """(b) disambiguation returns "unknown" -> falls back to the existing
+    rank/year pick_best() behavior -- proved by asserting the SAME
+    ResolvedMovie comes back whether disambiguation is skipped entirely
+    or returns "unknown"."""
+    candidates = _tied_rom_com_and_threesome_results()
+
+    client_with_disambiguation = FakeTMDBClient(candidates)
+    chat_client = FakeChatClient(reply="unknown")
+    resolved_with_unknown = resolve_candidate(
+        _candidate("Don't Be Shy"),
+        client_with_disambiguation,
+        context="some ambiguous caption",
+        chat_client=chat_client,
+    )
+
+    client_without_disambiguation = FakeTMDBClient(candidates)
+    resolved_without_disambiguation = resolve_candidate(
+        _candidate("Don't Be Shy"), client_without_disambiguation
+    )
+
+    assert chat_client.call_count == 1
+    assert resolved_with_unknown is not None
+    assert resolved_without_disambiguation is not None
+    assert resolved_with_unknown == resolved_without_disambiguation
+
+
+def test_resolve_candidate_without_context_or_chat_client_is_unchanged():
+    """(c) context/chat_client not provided at all (both None, the
+    default) -> behavior is byte-for-byte identical to the pre-this-fix
+    resolve_candidate -- same two-exact-match setup, called with no new
+    arguments at all."""
+    candidates = _tied_rom_com_and_threesome_results()
+    client = FakeTMDBClient(candidates)
+
+    resolved = resolve_candidate(_candidate("Don't Be Shy"), client)
+
+    assert resolved is not None
+    # pick_best()'s own tiebreak (rank_bonus) wins: original_rank=0 beats
+    # original_rank=1 among the exact-match tier, with no disambiguation
+    # involved at all.
+    assert resolved.id == 111
+
+
+def test_resolve_candidate_never_attempts_disambiguation_with_only_one_exact_match():
+    """(d) only 1 exact match exists -> disambiguation is never even
+    attempted (the fake chat client's call count is 0), since there is
+    nothing to disambiguate."""
+    client = FakeTMDBClient([_search_result(id=603, title="The Matrix")])
+    chat_client = FakeChatClient(reply="603")
+
+    resolved = resolve_candidate(
+        _candidate("The Matrix"),
+        client,
+        context="some context",
+        chat_client=chat_client,
+    )
+
+    assert resolved is not None
+    assert resolved.id == 603
+    assert chat_client.call_count == 0
+
+
+def test_resolve_candidate_disambiguation_not_attempted_with_only_context_no_chat_client():
+    """Only one of `context`/`chat_client` provided -> disambiguation must
+    not run at all (both are required)."""
+    candidates = _tied_rom_com_and_threesome_results()
+    client = FakeTMDBClient(candidates)
+
+    resolved = resolve_candidate(
+        _candidate("Don't Be Shy"), client, context="some caption text"
+    )
+
+    assert resolved is not None
+    assert resolved.id == 111  # pick_best()'s rank tiebreak, unchanged
+
+
+def test_resolve_candidate_disambiguation_not_attempted_with_only_chat_client_no_context():
+    """Only `chat_client` provided, no `context` -> disambiguation must not
+    run at all (both are required)."""
+    candidates = _tied_rom_com_and_threesome_results()
+    client = FakeTMDBClient(candidates)
+    chat_client = FakeChatClient(reply="111")
+
+    resolved = resolve_candidate(
+        _candidate("Don't Be Shy"), client, chat_client=chat_client
+    )
+
+    assert resolved is not None
+    assert resolved.id == 111  # pick_best()'s rank tiebreak, unchanged
+    assert chat_client.call_count == 0

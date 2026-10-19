@@ -215,7 +215,7 @@ def _extract_from_visual(result: IngestResult, deps: PipelineDeps) -> list[Candi
 
 
 def _resolve_all(
-    candidates: list[Candidate], deps: PipelineDeps
+    candidates: list[Candidate], deps: PipelineDeps, result: IngestResult
 ) -> list[Recommendation]:
     """flow.md step [5]: resolve every winning candidate against TMDB.
 
@@ -224,11 +224,26 @@ def _resolve_all(
     raises (rather than cleanly returning `None`) is treated the same
     way -- one candidate's lookup failing is not a reason to lose every
     other candidate's recommendation or abort the run.
+
+    `result` (the original `IngestResult`) is threaded through here only
+    for `result.caption` -- passed as `resolve_candidate()`'s `context`
+    for its caption-context disambiguation step (see PROGRESS.md's
+    "Follow-up — disambiguate tied exact matches" section). The caption
+    is the most reliably-present single text signal per flow.md's own
+    design, which is why it -- not the comment/visual text that may have
+    actually produced the winning candidate -- is used as the
+    disambiguation context for every candidate, regardless of which
+    waterfall step it came from.
     """
     recommendations: list[Recommendation] = []
     for candidate in candidates:
         try:
-            resolved = resolve_candidate(candidate, deps.tmdb_client)
+            resolved = resolve_candidate(
+                candidate,
+                deps.tmdb_client,
+                context=result.caption,
+                chat_client=deps.disambiguation_chat_client,
+            )
         except Exception:
             logger.exception(
                 "TMDB resolution failed for %r; keeping as unresolved",
@@ -307,6 +322,6 @@ def run_pipeline(url: str, deps: PipelineDeps) -> PipelineResult:
         else:
             candidates = _extract_from_visual(result, deps)
 
-    recommendations = _resolve_all(candidates, deps)
+    recommendations = _resolve_all(candidates, deps, result)
     deduped_recommendations = _dedupe(recommendations)
     return PipelineResult(reel_url=url, recommendations=deduped_recommendations)

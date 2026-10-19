@@ -114,6 +114,21 @@ class FakeTMDBClient:
         return list(self.results_by_query.get(query, self.default_results))
 
 
+@dataclass
+class FakeChatClient:
+    """Fake `TextChatClient` for the disambiguation step -- records every
+    `context` it was asked to disambiguate with (via the full prompt
+    string, since `resolve_candidate`/`disambiguate_with_context` don't
+    pass `context` to the chat client any other way)."""
+
+    reply: str = "unknown"
+    prompts: list[str] = field(default_factory=list)
+
+    def chat(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.reply
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -475,6 +490,107 @@ def test_unresolved_candidate_with_no_resolved_sibling_is_still_kept():
     deduped = _dedupe([lone_unresolved_rec])
 
     assert deduped == [lone_unresolved_rec]
+
+
+def test_captions_context_is_threaded_into_disambiguation_chat_client():
+    """`result.caption` -- the original IngestResult's caption text -- must
+    reach `resolve_candidate()`'s `context` param, which in turn hands it
+    to the disambiguation chat client as part of its prompt. Set up two
+    TIED exact-title TMDB results so `resolve_candidate` actually
+    attempts disambiguation (and therefore actually calls the chat
+    client) during a real `run_pipeline()` run.
+    """
+    caption_text = "THE_UNIQUE_CAPTION_CONTEXT_MARKER, a rom-com on Prime."
+    candidate = Candidate(
+        raw_text="Don't Be Shy", source=SourceTag.CAPTION, confidence=0.9
+    )
+    ingestor = FakeIngestor(metadata=_ingest_result(caption=caption_text))
+    extractor = FakeCandidateExtractor(by_source={SourceTag.CAPTION: [candidate]})
+    tied_results = [
+        TMDBSearchResult(
+            id=111,
+            title="Don't Be Shy",
+            year=2025,
+            poster_path=None,
+            overview="A college rom-com.",
+            popularity=10.0,
+            original_rank=0,
+            media_type="movie",
+        ),
+        TMDBSearchResult(
+            id=222,
+            title="Don't Be Shy",
+            year=2025,
+            poster_path=None,
+            overview="An unrelated adult-themed film.",
+            popularity=5.0,
+            original_rank=1,
+            media_type="movie",
+        ),
+    ]
+    tmdb_client = FakeTMDBClient(default_results=tied_results)
+    chat_client = FakeChatClient(reply="111")
+    deps = PipelineDeps(
+        ingestor=ingestor,
+        text_extractor=extractor,
+        poster_detector=FakePosterDetector(),
+        tmdb_client=tmdb_client,
+        disambiguation_chat_client=chat_client,
+    )
+
+    result = run_pipeline(URL, deps)
+
+    assert len(chat_client.prompts) == 1
+    assert caption_text in chat_client.prompts[0]
+    assert len(result.recommendations) == 1
+    assert result.recommendations[0].tmdb is not None
+    assert result.recommendations[0].tmdb.id == 111
+
+
+def test_no_disambiguation_chat_client_falls_back_to_pick_best_in_real_pipeline():
+    """A `PipelineDeps` with no `disambiguation_chat_client` (the default,
+    matching every pre-existing test in this file) must behave exactly as
+    before: disambiguation never runs, and `pick_best()`'s rank tiebreak
+    picks the winner among tied exact matches."""
+    candidate = Candidate(
+        raw_text="Don't Be Shy", source=SourceTag.CAPTION, confidence=0.9
+    )
+    ingestor = FakeIngestor(metadata=_ingest_result(caption="some caption"))
+    extractor = FakeCandidateExtractor(by_source={SourceTag.CAPTION: [candidate]})
+    tied_results = [
+        TMDBSearchResult(
+            id=111,
+            title="Don't Be Shy",
+            year=2025,
+            poster_path=None,
+            overview="A college rom-com.",
+            popularity=10.0,
+            original_rank=0,
+            media_type="movie",
+        ),
+        TMDBSearchResult(
+            id=222,
+            title="Don't Be Shy",
+            year=2025,
+            poster_path=None,
+            overview="An unrelated adult-themed film.",
+            popularity=5.0,
+            original_rank=1,
+            media_type="movie",
+        ),
+    ]
+    tmdb_client = FakeTMDBClient(default_results=tied_results)
+    deps = _make_deps(
+        ingestor=ingestor, text_extractor=extractor, tmdb_client=tmdb_client
+    )
+
+    assert deps.disambiguation_chat_client is None
+
+    result = run_pipeline(URL, deps)
+
+    assert len(result.recommendations) == 1
+    assert result.recommendations[0].tmdb is not None
+    assert result.recommendations[0].tmdb.id == 111  # rank-0 wins the tiebreak
 
 
 def test_two_different_unresolved_candidates_with_different_queries_both_kept():

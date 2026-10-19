@@ -29,6 +29,33 @@ def score_result(
     return 0.65 * title_similarity + 0.25 * rank_bonus + 0.10 * year_bonus
 
 
+# Normalizes apostrophe lookalikes to a single straight-quote form before
+# comparing titles. Confirmed live against the real TMDB API (see
+# PROGRESS.md's "Follow-up — disambiguate tied exact matches" section):
+# a `/search/multi?query=Don%27t%20Be%20Shy` response for the real
+# "Don't Be Shy" bug case returned SOME rows titled with a straight
+# apostrophe (U+0027, e.g. "Don't Be Shy") and OTHER rows titled with a
+# Unicode right single quotation mark (U+2019, "Don’t Be Shy") -- while
+# the real candidate text (from both `RegexCandidateExtractor` and the
+# `claude`-CLI text extractor) always uses the straight apostrophe typed
+# on a normal keyboard. Without this normalization, a true exact match
+# that happens to use the curly form would be silently excluded from the
+# exact-match tier entirely, before any disambiguation logic (tied or
+# not) ever got a chance to consider it. U+2018 (left single quotation
+# mark) is normalized too, as the same kind of lookalike, even though no
+# live data forced that case specifically.
+_APOSTROPHE_LOOKALIKES = str.maketrans(
+    {
+        "’": "'",  # right single quotation mark, ’
+        "‘": "'",  # left single quotation mark, ‘
+    }
+)
+
+
+def _normalize_apostrophes(text: str) -> str:
+    return text.translate(_APOSTROPHE_LOOKALIKES)
+
+
 def _is_exact_title_match(query: str, title: str) -> bool:
     """True if `title` is a strict (case/whitespace-insensitive) match for `query`.
 
@@ -37,8 +64,29 @@ def _is_exact_title_match(query: str, title: str) -> bool:
     short query as a near-perfect match against a longer title that merely
     *contains* it as a substring (e.g. "Triangle" vs "Triangle of Sadness"),
     which is exactly the confusion this function exists to avoid.
+
+    Also normalizes straight vs. curly apostrophes (see
+    `_normalize_apostrophes`) before comparing, on top of the existing
+    case/whitespace normalization.
     """
-    return query.strip().casefold() == title.strip().casefold()
+    return (
+        _normalize_apostrophes(query).strip().casefold()
+        == _normalize_apostrophes(title).strip().casefold()
+    )
+
+
+def find_exact_matches(
+    query: str, results: list[TMDBSearchResult]
+) -> list[TMDBSearchResult]:
+    """Return every result in `results` that is a true exact title match for `query`.
+
+    Extracted out of `pick_best()`'s previously-inline exact-match
+    filtering so a caller (e.g. `tmdb/resolver.py`'s disambiguation step)
+    can see the *whole* tied group, not just `pick_best()`'s single
+    pre-selected winner. `pick_best()` itself calls this and keeps its
+    existing behavior unchanged.
+    """
+    return [r for r in results if _is_exact_title_match(query, r.title)]
 
 
 def _exact_tier_rank(result: TMDBSearchResult, year_hint: int | None) -> float:
@@ -87,7 +135,7 @@ def pick_best(
     if not results:
         return None
 
-    exact_matches = [r for r in results if _is_exact_title_match(query, r.title)]
+    exact_matches = find_exact_matches(query, results)
     if exact_matches:
         return max(exact_matches, key=lambda r: _exact_tier_rank(r, year_hint))
 

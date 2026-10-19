@@ -6396,3 +6396,458 @@ independent live-API checks (the TV regression case and the movie
 regression spot-check) match the build report's claims exactly.
 
 VERDICT: ACCEPTABLE
+
+## Follow-up — disambiguate tied exact matches using caption context — status: done
+
+### Motivation
+
+The real bug case: a reel's caption recommended "Don't Be Shy" (an Amazon
+Prime rom-com with Alia Bhatt, per the caption's own text and @-tags), but
+TMDB has several different, exact-titled "Don't Be Shy" entries — including
+a 2025 entry whose overview describes an unrelated adult-themed plot about
+a threesome. The tiered exact-match scoring built in the two previous
+follow-up cycles this session (`pick_best()`'s exact-match tier) only
+breaks ties using TMDB popularity/rank, which isn't a reliable
+disambiguator between unrelated movies that happen to share a title. This
+follow-up adds a surrounding-context (caption text) vs. candidate-overview
+disambiguation step, asked of the `claude` CLI, layered strictly on top of
+the existing tiebreak as a fallback-safe enhancement.
+
+### Step 1 — live-API apostrophe check (done BEFORE writing any code)
+
+Hit the real TMDB API via `load_dotenv()` + `config.get_tmdb_token()` +
+`requests` with `GET /3/search/multi?query=Don't Be Shy` (scratch script,
+not committed). Verbatim results (abridged to title/media_type/id/date):
+
+```
+"Don't Be Shy"   movie 1586276 2025-11-21   (straight apostrophe, U+0027)
+"Don't Be Shy!"  movie 1529372 2026-09-25   (straight apostrophe)
+"DON'T BE SHY"   movie 420599  2015-07-10   (straight apostrophe)
+"Don't Be Shy"   tv    198009  2022-04-19   (straight apostrophe)
+"Don’t Be Shy"   movie 1563521 (no date)    (CURLY apostrophe, U+2019)
+"Don’t Be Shy"   movie 1270005 2024-04-23   (CURLY apostrophe, U+2019)
+"Keine Scheu vor heiklen Fragen" movie 1245357 1965-11-19  (unrelated title)
+```
+
+**Confirmed real: a genuine straight-vs-curly apostrophe mismatch exists.**
+Two of the seven TMDB rows for this exact query use a Unicode right single
+quotation mark (`’`, U+2019) instead of a straight apostrophe (`'`,
+U+0027).
+
+Then checked which apostrophe the REAL candidate extraction pipeline
+actually produces for this reel's real caption. First confirmed
+`RegexCandidateExtractor().extract(caption, SourceTag.CAPTION)` returns
+**zero** candidates for "Don't Be Shy" at all — the caption never quotes
+the title or pairs it with a parenthesized year, so neither of
+`regex_extractor.py`'s HIGH-tier patterns match it (confirmed: the title
+appears twice in plain, unquoted prose). This means the real candidate for
+this reel can only have come from the `claude`-CLI text-extraction
+fallback (`ClaudeCodeCandidateExtractor`), not regex — contrary to the
+task brief's "whichever actually produced the real candidate" being
+ambiguous between the two, it's definitively the CLI path.
+
+Ran the real `ClaudeCodeCandidateExtractor` (real `claude` CLI subprocess
+call, no mocking) against the real caption text:
+
+```
+"Don't Be Shy" 0.9   (straight apostrophe, U+0027 — confirmed via hex dump)
+```
+
+**Finding: real, exploitable mismatch confirmed.** The real extracted
+candidate always uses the straight apostrophe, but TMDB's own data for
+this exact title includes rows using the curly apostrophe. Without
+normalizing both forms before comparing, `_is_exact_title_match()` would
+silently exclude ids 1563521 and 1270005 from the exact-match tier
+entirely — before any disambiguation logic (this follow-up's new feature
+or the pre-existing rank tiebreak) ever got a chance to consider them.
+
+**Fix applied** in `reel2movie/tmdb/scoring.py`: a small, targeted
+`_normalize_apostrophes()` helper (a `str.translate()` table mapping
+U+2019 and U+2018 to the plain `'`), applied to both `query` and `title`
+inside `_is_exact_title_match()` before the existing case/whitespace-
+insensitive comparison. Deliberately not a general Unicode-folding
+library — just the two apostrophe lookalikes actually observed live, plus
+the left-curly form as the same kind of lookalike (no live evidence
+forced that one specifically, but it's the same character class).
+
+### Step 2 — the disambiguation feature
+
+**`reel2movie/tmdb/scoring.py`:**
+- Extracted the exact-match-finding logic out of `pick_best()` into its
+  own `find_exact_matches(query, results) -> list[TMDBSearchResult]`,
+  which now also benefits from the apostrophe normalization above.
+  `pick_best()` calls it internally; `pick_best()`'s own behavior is
+  unchanged (confirmed by the full existing `test_scoring.py` suite
+  passing unmodified, plus new tests below).
+
+**`reel2movie/tmdb/resolver.py`:**
+- Added `disambiguate_with_context(candidates, context, chat_client) ->
+  TMDBSearchResult | None`. Builds a prompt giving the model `context`
+  verbatim plus each candidate as `{id, title, year, media_type,
+  overview}` (JSON), and asks which `id` the context is actually
+  describing/recommending, responding with ONLY a bare integer id or the
+  literal string `"unknown"`. Parses defensively: a chat-client exception,
+  a non-numeric/garbage reply, a bare `"unknown"`, or an id not actually
+  among the candidates, are all treated identically as an inconclusive
+  `None` — never raises.
+- `resolve_candidate()` gained two new, both-default-`None` parameters:
+  `context: str | None` and `chat_client: TextChatClient | None` (the
+  exact `TextChatClient` Protocol already defined in
+  `text_extraction/claude_code_extractor.py` — reused directly, not
+  redefined). New logic: after `client.search(...)`, call
+  `find_exact_matches(query_title, results)`. If 2+ exact matches AND both
+  `context`/`chat_client` are given, call `disambiguate_with_context(...)`;
+  a confident pick is used directly, skipping `pick_best()` entirely for
+  this candidate. An inconclusive (`None`) result, or 0-1 exact matches,
+  or either optional arg missing, falls through to the pre-existing
+  `pick_best(query_title, year_hint, results)` call, unchanged. This is a
+  strictly additive, backward-compatible signature change — every
+  existing call site keeps working identically.
+- Layering note: `tmdb/resolver.py` now imports `TextChatClient` from
+  `text_extraction/claude_code_extractor.py` — a new cross-subpackage
+  import not previously present. Considered moving the Protocol into
+  `core/protocols.py` instead, but the task explicitly directs reusing
+  this *exact* Protocol/client as-is, and `TextChatClient` is a tiny,
+  already-`runtime_checkable`, dependency-free structural type — moving it
+  would be a larger, out-of-scope refactor for a small follow-up. Noted
+  here as a deliberate, considered tradeoff, not an oversight.
+
+**`reel2movie/pipeline/deps.py`:**
+- `PipelineDeps` gained `disambiguation_chat_client: TextChatClient | None
+  = None` — defaults to `None` so any existing `PipelineDeps` construction
+  (every existing test) behaves exactly as before.
+- `build_default_pipeline_deps()`: the `ClaudeCodeTextChatClient()`
+  instance is now constructed once (`claude_text_chat_client`) and shared
+  between `text_extractor`'s `ClaudeCodeCandidateExtractor` fallback AND
+  the new `disambiguation_chat_client` field — not duplicated. Both are
+  the identical "shell out to the `claude` CLI for a stateless text reply"
+  primitive, so sharing one instance is strictly simpler than constructing
+  a second.
+
+**`reel2movie/pipeline/waterfall.py`:**
+- `_resolve_all(candidates, deps, result)` — gained a third parameter,
+  the original `IngestResult`, used only for `result.caption`. Threaded
+  through every `resolve_candidate(candidate, deps.tmdb_client,
+  context=result.caption, chat_client=deps.disambiguation_chat_client)`
+  call. `run_pipeline()`'s call site updated to
+  `_resolve_all(candidates, deps, result)` — `result` was already in
+  scope there. The caption (not whichever text actually produced the
+  winning candidate) is used as context for every candidate regardless of
+  source, per the task's instruction that it's "the most reliably-present
+  single text signal."
+
+### Tests
+
+`tests/unit/tmdb/test_scoring.py` — 5 new tests: `find_exact_matches()`
+returns the whole tied group in order; returns `[]` when nothing matches;
+normalizes curly-vs-straight apostrophes (right AND left curly forms);
+and a `pick_best()`-level test confirming the normalization benefits
+`pick_best()` too (not just the extracted helper).
+
+`tests/unit/tmdb/test_resolver.py` — 11 new tests, using a fake
+`FakeChatClient` (configurable reply or raise, records prompts/call
+count) alongside the existing fake `TMDBClient`:
+- `disambiguate_with_context()` direct tests: picks by id; returns `None`
+  on `"unknown"`, garbage, an id not among candidates, or a raising chat
+  client; and a prompt-content test confirming `context` and both
+  candidates' overviews/ids appear in the prompt sent to the chat client.
+- `resolve_candidate()` wiring tests, matching the task's (a)-(d):
+  (a) a confident disambiguation pick is returned as the resolved id;
+  (b) `"unknown"` falls back to `pick_best()` — proved by asserting the
+  SAME `ResolvedMovie` (dataclass equality) comes back whether
+  disambiguation is skipped entirely or explicitly returns `"unknown"`;
+  (c) no `context`/`chat_client` at all is byte-for-byte identical to the
+  pre-fix call (same two-exact-match setup, `pick_best()`'s rank tiebreak
+  wins); (d) only 1 exact match -> `chat_client.call_count == 0`,
+  disambiguation never attempted. Two extra tests cover the "only one of
+  the two optional args given" half-wired cases (both must be present).
+
+`tests/unit/pipeline/test_waterfall.py` — 2 new tests, plus a new
+`FakeChatClient` fake: one confirms `result.caption` reaches the real
+disambiguation chat client's prompt during an actual `run_pipeline()` run
+(via a `PipelineDeps` with tied exact-match TMDB results and a wired
+`disambiguation_chat_client`); the other confirms a `PipelineDeps` with no
+`disambiguation_chat_client` (every pre-existing test's shape) still
+resolves tied exact matches via the unchanged `pick_best()` rank tiebreak.
+
+`python3 -m pytest tests/unit -q`:
+
+```
+228 passed in 3.31s
+```
+
+(209 before this change, +19 new test functions: 5 in `test_scoring.py`,
+11 in `test_resolver.py` + 1 fake class, 2 in `test_waterfall.py` + 1 fake
+class.)
+
+### Live-API verification of the actual real-world "Don't Be Shy" case
+
+Reconstructed the real scenario end to end: the real caption text (as
+given in the task brief, verbatim), `Candidate(raw_text="Don't Be Shy",
+source=SourceTag.CAPTION, confidence=0.9)` (straight apostrophe, confirmed
+in Step 1 to be what the real extractor actually produces), a real
+`TMDBHttpClient` (`config.get_tmdb_token()`), and a real
+`ClaudeCodeTextChatClient` (real `claude` CLI subprocess). Script written
+only to the session scratchpad, never committed.
+
+**Exact matches found (5, after the apostrophe fix — up from the 3 that a
+straight-only comparison would have found):**
+
+```
+id=1586276 year=2025 movie  "On the verge of a threesome, a wild surprise
+                             turns Noah's evening from seductive fantasy
+                             to real life nightmare."       <- the bad one
+id=420599  year=2015 movie  (no overview on file)
+id=198009  year=2022 tv     "A watch that is ticking in reverse and a
+                             30-day cohabitation contract puts the
+                             domineering female CEO together with a pet
+                             mortician..."
+id=1563521 year=None movie  "On the night he loses his mom, a shy young
+                             man is pulled into an unexpected adventure
+                             by a spontaneous stranger who helps him feel
+                             alive again."
+id=1270005 year=2024 movie  "In this experimental micro-short, the
+                             filmmaker uses a digital collage technique
+                             to walk around and explore different parts
+                             of her body."
+```
+
+**Honest finding: TMDB does not actually have the real Alia Bhatt / Amazon
+Prime "Don't Be Shy" rom-com in its database.** None of the 5 exact-titled
+entries' overviews describe anything resembling a college rom-com — this
+is exactly the "TMDB may not have the real film at all" possibility the
+task anticipated.
+
+**Ran `resolve_candidate(candidate, real_client, context=<real caption>,
+chat_client=real_chat_client)` end to end, repeated several times (the
+`claude` CLI's reply is not deterministic across calls):**
+
+- Across 8 total live model invocations (some via `resolve_candidate()`
+  directly, some via a direct `disambiguate_with_context()` loop over the
+  same 5 candidates): the model picked id `1563521` three times, id
+  `1270005` three times, id `1586276` (the threesome one) **once**, and
+  never once replied `"unknown"`.
+- **The core bug case mostly succeeds**: in the large majority of trials,
+  the fix does what it was built for — it stops the pipeline from
+  confidently resolving to the threesome-themed entry, instead landing on
+  a different (still wrong, since the real film isn't in TMDB at all)
+  exact-titled entry.
+- **But it is not fully reliable**: in 1 of 8 trials, the model itself
+  picked id `1586276` (the threesome movie) — i.e. disambiguation can, on
+  an unlucky model sample, still actively choose the exact bad outcome
+  this feature exists to prevent, rather than falling back safely. This
+  is a real limitation of relying on a single non-deterministic LLM call
+  for disambiguation, not a bug in the wiring: `disambiguate_with_context`
+  faithfully returns whatever id the model names, and the model named the
+  wrong one once.
+- **The model also never said `"unknown"`** in any of the 8 trials, even
+  though arguably it should have (no candidate overview plausibly matches
+  the caption's description) — it always guessed one of the 5 ids
+  instead. This means the "honest fallback via inconclusive disambiguation"
+  path, while fully implemented and unit-tested (see `test_resolver.py`'s
+  `"unknown"` tests), was never actually exercised by the real model
+  against this specific real-world input; the model's behavior here is a
+  genuine, observed limitation of the prompt/model combination, not of
+  this feature's fallback logic (which is proven correct via fakes).
+
+One representative end-to-end `resolved` value (the most common outcome,
+3 of 8 trials):
+
+```
+ResolvedMovie(id=1563521, title='Don’t Be Shy', year=None,
+poster_path='/3N8hBvgPi4YyB4yNkwDFpe0nQVD.jpg', overview='On the night he
+loses his mom, a shy young man is pulled into an unexpected adventure by a
+spontaneous stranger who helps him feel alive again.',
+match_score=0.6458333333333333, media_type='movie')
+```
+
+**Bottom line, reported honestly per the task's own framing:** the fix
+correctly avoids the specific known-bad outcome (the threesome-themed
+entry) in 7 of 8 live trials, and the apostrophe-normalization fix is
+confirmed necessary and working (2 of the 5 exact matches would otherwise
+have been invisible to the exact-match tier at all). It is not a clean,
+fully reliable win: the underlying real film isn't in TMDB's database, the
+model never recognized that and said `"unknown"`, and on one trial out of
+eight it still picked the harmful entry. The disambiguation feature is a
+probabilistic improvement over the old pure-rank tiebreak (which would
+have picked id `1586276`, rank 0, the threesome movie, on 100% of runs),
+not a deterministic guarantee.
+
+### Verification scripts
+
+All four scripts (the Step 1 apostrophe/regex/claude-CLI probe, the
+end-to-end real-caption resolution script, the 5x `disambiguate_with_context`
+repeat loop, and their reruns) were throwaway scripts written only to the
+session scratchpad, never committed to the repo.
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (medium, forked) on the current diff,
+`/ponytail:ponytail-review` on the same diff, a from-scratch
+`python3 -m pytest tests/unit -q` run, and independent live-API
+re-verification scripts (own scripts, own `Candidate`/`pick_best`/
+`resolve_candidate` calls against the real TMDB + real `claude` CLI, not
+the build report's pasted output) — plus direct reads of
+`build_default_pipeline_deps()`, `_resolve_all()`, and
+`disambiguate_with_context()`.
+
+**Non-blocking — `/code-review` (medium, forked), two findings, both
+accepted as real but non-blocking:**
+1. Each candidate with 2+ tied exact TMDB matches now pays a synchronous
+   `claude` CLI subprocess call inside `_resolve_all()`'s per-candidate
+   loop (`reel2movie/pipeline/waterfall.py`), serializing rather than
+   parallelizing disambiguation calls across multiple ambiguous
+   candidates in the same run. True, but out of scope for this follow-up
+   (which is about correctness of disambiguation, not pipeline
+   concurrency) and consistent with the rest of `_resolve_all()`'s
+   existing sequential-loop design (it doesn't parallelize ordinary TMDB
+   lookups either).
+2. `result.caption` is threaded in as `context` even when it's `""` (the
+   documented empty-string fallback in
+   `reel2movie/ingest/instagram.py:75`'s `info.get("description") or
+   ""`), and `resolve_candidate()`'s `context is not None` check passes
+   for `""`, so a reel with no caption and 2+ tied exact matches still
+   pays a wasted `claude` CLI call that will almost always come back
+   `"unknown"`. Confirmed by reading `resolve_candidate()` directly —
+   real, minor inefficiency, not a correctness bug (the fallback to
+   `pick_best()` still fires correctly on `"unknown"`).
+
+**Non-blocking — `/ponytail:ponytail-review`:** diff is lean overall
+(reuses `find_exact_matches`, reuses the existing `TextChatClient`
+Protocol instead of redefining it, shares one `ClaudeCodeTextChatClient`
+instance instead of constructing a second). One minor duplication: the
+same 14-line tied `TMDBSearchResult` list literal (ids 111/222, "Don't Be
+Shy") is repeated verbatim across
+`test_captions_context_is_threaded_into_disambiguation_chat_client` and
+`test_no_disambiguation_chat_client_falls_back_to_pick_best_in_real_pipeline`
+in `tests/unit/pipeline/test_waterfall.py`. `tests/unit/tmdb/test_resolver.py`
+already shows the fix (a `_tied_rom_com_and_threesome_results()` helper);
+`test_waterfall.py`'s two new tests could share a similar helper.
+`net: -14 lines possible.`
+
+**Own verification — backward compatibility of `resolve_candidate()`
+traced directly, both new params default to `None`:** read
+`reel2movie/tmdb/resolver.py`'s `resolve_candidate()` signature and body
+— `context: str | None = None`, `chat_client: TextChatClient | None =
+None`; the only new branch is `if len(exact_matches) >= 2 and context is
+not None and chat_client is not None:`, which is false whenever either
+arg is omitted, so `best` stays `None` from that branch and falls straight
+into the pre-existing `if best is None: best = pick_best(...)` line,
+unchanged. Every other line (year-hint extraction, `client.search(...)`,
+the `ResolvedMovie` construction) is byte-for-byte identical to before
+this diff.
+
+**Own verification — Triangle case, live TMDB, re-run directly (not
+trusted from the report):** `pick_best("Triangle", None,
+client.search("Triangle"))` → now returns `id=2367` ("Triangle", a 1981
+BBC TV soap opera), **not** the `id=26466` (2009 movie) the original
+"prioritize exact title match" follow-up's write-up recorded. Investigated
+directly with `git stash` / `git stash pop`: ran the identical script
+against the pre-diff code and got the **identical** `id=2367` result.
+Conclusion: this is **live TMDB data drift** (a TV show now also
+exactly-matches "Triangle", interacting with the already-committed, prior
+"widen TMDB resolution scope to include TV shows" follow-up) — it
+predates and is wholly unrelated to the current diff under review, and
+`pick_best()`'s behavior for this query is confirmed byte-for-byte
+unchanged by this diff specifically. Recorded here for honesty/paper
+trail, not as a finding against this follow-up.
+
+**Own verification — Dhobi Ghat case, live TMDB, re-run directly via the
+OLD 2-arg `resolve_candidate(candidate, client)` call (no `context`/
+`chat_client` at all):** `resolve_candidate(Candidate(raw_text="Dhobi
+Ghat (2010)", source=SourceTag.CAPTION, confidence=0.9), client)` →
+`ResolvedMovie(id=54890, title='Dhobi Ghat', year=2010, ...,
+match_score=1.0)` — matches the originally-recorded result exactly.
+Confirms the simple/common path (no tied exact matches, disambiguation
+args omitted) is unaffected.
+
+**Own verification — UP/Up case-sensitivity case, live TMDB, re-run
+directly:** `pick_best("Up", None, client.search("Up"))` → returns the
+real Pixar "Up" (`id=14160`, title exactly `"Up"`), confirming the
+case-insensitive exact-match tier still isn't penalized by case
+differences after the `find_exact_matches()` extraction.
+
+**Own verification — `_normalize_apostrophes()` scope confirmed narrow:**
+read `reel2movie/tmdb/scoring.py` directly — it's a 2-entry
+`str.maketrans()` table (`’`→`'`, `‘`→`'`), applied only inside
+`_is_exact_title_match()` to `query` and `title` immediately before the
+existing `.strip().casefold()` comparison. Not a general Unicode-folding
+operation (e.g. no NFKD normalization, no broad punctuation stripping) —
+confirmed it cannot cause a new false-positive exact match between
+genuinely different titles, since it only maps two specific lookalike
+code points to U+0027 and touches nothing else.
+
+**Own verification — `find_exact_matches()` extraction is genuinely
+behavior-preserving, confirmed by direct read plus the Triangle/UP live
+reruns above:** `pick_best()`'s only change is
+`exact_matches = find_exact_matches(query, results)` replacing the
+previous inline list comprehension — `find_exact_matches()`'s body is
+that exact same comprehension, now calling `_is_exact_title_match()`
+(itself only changed by the additive apostrophe normalization). Both live
+reruns above (Triangle, UP/Up) return results consistent with the
+pre-existing scoring tests, confirming no behavioral drift from the
+refactor itself.
+
+**Own verification — fallback-to-`pick_best()` path traced for both the
+"inconclusive" and "no-args" cases:** in `resolve_candidate()`, both
+paths — (a) `context`/`chat_client` omitted entirely, and (b)
+`disambiguate_with_context()` returns `None` (its own `"unknown"`/
+garbage/raise/id-not-found branches, all confirmed to return `None`, never
+raise, by direct read) — converge on the exact same line,
+`best = pick_best(query_title, year_hint, results)`, with no other state
+differing between the two paths (`results`, `query_title`, `year_hint`
+are computed once, before either branch). Confirmed identical, not just
+similar.
+
+**Own verification — every `resolve_candidate()` call site in the
+pipeline receives both new args:** `grep -rn "resolve_candidate(" --include="*.py" reel2movie/`
+finds exactly one production call site,
+`reel2movie/pipeline/waterfall.py`'s `_resolve_all()` loop, which passes
+`context=result.caption, chat_client=deps.disambiguation_chat_client` on
+every iteration (not conditionally) — there is no second call site that
+could have been missed.
+
+**Own verification — `build_default_pipeline_deps()` shares ONE
+`ClaudeCodeTextChatClient` instance, confirmed by direct read:** in
+`reel2movie/pipeline/deps.py`, `claude_text_chat_client =
+ClaudeCodeTextChatClient()` is constructed exactly once, then passed both
+into `ClaudeCodeCandidateExtractor(claude_text_chat_client)` (the
+text-extraction fallback) and directly as
+`disambiguation_chat_client=claude_text_chat_client` on the returned
+`PipelineDeps` — not two separate constructions.
+
+**Own verification — `disambiguate_with_context()` prompt-construction
+and response-parsing, read directly, confirmed matches the build report's
+claims exactly:** bare-integer-id parsing via `int(reply.strip())` inside
+a `try/except ValueError`; `"unknown"` (checked case-insensitively via
+`.lower()`) → `None`; a chat-client exception caught by a blanket
+`except Exception` → `None` (logged via `logger.exception`, never
+re-raised); an id not among `candidates` → `None` (logged via
+`logger.warning`); garbage/non-numeric reply → `None` via the same
+`ValueError` branch. Every path returns `None`, none raises.
+
+**Own verification — `python3 -m pytest tests/unit -q`, run independently,
+not trusted from the reported 228:**
+
+```
+228 passed in 3.74s
+```
+
+Matches the build report exactly.
+
+**Own verification — one live sanity run of the full wiring on the real
+"Don't Be Shy" tied case (not the full 8-trial experiment, per the task's
+own instruction that re-running that is unnecessary):** real `TMDBClient`
++ real `ClaudeCodeTextChatClient`, `find_exact_matches()` found the same 5
+tied exact matches as the build report's own verification. The one-shot
+`resolve_candidate(..., context=<realistic caption>, chat_client=...)`
+call returned `ResolvedMovie(id=1586276, ...)` — i.e. on this particular
+run the model picked the known-bad threesome-themed entry, consistent
+with the build report's own honestly-disclosed 1-in-8 failure rate (a
+probabilistic, not deterministic, limitation of the underlying model
+call, already documented above). The wiring itself behaved exactly as
+designed: it didn't crash, didn't raise, and returned a valid
+`ResolvedMovie` either way — confirming the plumbing is sound even though
+the model's pick on this particular run was the unlucky one.
+
+VERDICT: ACCEPTABLE
