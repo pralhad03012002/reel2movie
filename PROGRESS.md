@@ -5391,3 +5391,569 @@ release year — a distinct, pre-existing ambiguity in `_extract_year_hint`
 parenthetical isn't the release year, not a regression from or scope of
 this fix cycle's assigned BLOCKING finding. Left unfixed as out of
 scope; flagged here for visibility rather than silently worked around.
+
+## Follow-up — prioritize exact title match over popularity in scoring — status: DONE
+
+Confirmed real bug found via live testing: a caption recommending a
+"mind-bending movies" list (Primer, Coherence, Predestination, Memento,
+Donnie Darko, Triangle, Resolution) had "Triangle" resolved to "Triangle
+of Sadness" (2022, an unrelated satire) instead of the actual 2009
+time-loop thriller "Triangle" that fits the list's theme.
+
+### Root cause
+
+`reel2movie/tmdb/scoring.py`'s `pick_best()` scored every result with
+`score_result()` (`0.65 * title_similarity + 0.25 * rank_bonus + 0.10 *
+year_bonus`) and took the single argmax across the whole result set.
+`title_similarity` is `rapidfuzz.fuzz.WRatio(query, result.title) / 100`,
+which uses partial-ratio logic: a short query that is a full substring of
+a longer title (e.g. `"Triangle"` inside `"Triangle of Sadness"`) scores
+very close to 1.0, nearly indistinguishable from a true exact match. Once
+combined with `rank_bonus` (`1 / (1 + original_rank)`), a popular partial
+match that TMDB ranks first can out-score a true exact match TMDB ranks
+lower — reweighting the formula's coefficients would only ever produce a
+*harder-to-reach* threshold, not a categorical guarantee, since any fixed
+weights can in principle be beaten by a large enough rank/popularity gap.
+
+### Design: tiered selection, not a reweighted formula
+
+Restructured `pick_best(query, year_hint, results)` into two tiers so
+"name matching beats popularity" holds categorically:
+
+1. Partition `results` into exact-title matches (via a new
+   `_is_exact_title_match(query, title)` helper — strict, normalized
+   (`.strip().casefold()`) equality, deliberately NOT fuzzy/partial) vs.
+   everything else.
+2. If the exact-match group is non-empty, select the best *only* from
+   that group, using the existing `score_result()` purely as a
+   tiebreaker (so `year_hint` and TMDB's own rank still correctly
+   disambiguate between, say, two different movies both literally titled
+   "Triangle" in different years). A fuzzy/partial match in the other
+   group can never win once a real exact match exists, regardless of its
+   popularity or TMDB rank.
+3. If there are no exact matches at all, fall back unchanged to the
+   original behavior: score every result and take the argmax.
+
+`MIN_MATCH_SCORE` is still applied as the floor in both branches.
+`score_result()` itself was left untouched, exactly as scoped — it's
+still used for tie-breaking within the exact-match tier and for the
+no-exact-match fallback.
+
+### Tests
+
+`tests/unit/tmdb/test_scoring.py` — added 5 tests:
+- `test_pick_best_prefers_exact_match_over_popular_partial_match` — the
+  real-world regression: `"Triangle of Sadness"` (`original_rank=0`,
+  `popularity=120.0`) vs `"Triangle"` (`original_rank=1`,
+  `popularity=15.0`), `pick_best("Triangle", None, ...)` must pick
+  `"Triangle"`.
+- `test_pick_best_falls_back_to_fuzzy_scoring_when_no_exact_match_exists`
+  — proves the no-exact-match fallback path is unchanged: best fuzzy
+  score still wins when nothing is an exact match.
+- `test_pick_best_among_exact_matches_uses_year_hint_as_tiebreaker` — two
+  different movies both exactly titled "Triangle" (2009 vs 1994), tied on
+  TMDB rank so only `year_hint` distinguishes them; confirms `year_hint`
+  still picks the right one among exact matches.
+- `test_pick_best_exact_match_wins_despite_huge_popularity_gap` — the
+  direct "name matching beats popularity" proof: a non-exact,
+  `original_rank=0`/`popularity=500.0` result still loses to an exact
+  match at `original_rank=9`/`popularity=1.0`.
+- `test_pick_best_exact_match_is_case_and_whitespace_insensitive` —
+  `"the matrix"` vs `"The Matrix"` and `" Inception "` vs `"Inception"`
+  both still count as exact.
+
+`python3 -m pytest tests/unit -q` → **203 passed** (198 before this
+follow-up + 5 new scoring tests).
+
+### Live-API verification
+
+Loaded the real `.env` `TMDB_API_KEY` via `config.get_tmdb_token()` +
+`load_dotenv()`, built a real `TMDBHttpClient`, called
+`search_movie("Triangle")` against the live TMDB API, and ran the full
+result list through the fixed `pick_best("Triangle", None, results)`
+(script written to a scratchpad outside the repo, not committed). Live
+TMDB returned 20 results for the query `"Triangle"`, including
+`"Triangle of Sadness"` (2022, `original_rank=0`, `popularity=34.666`)
+ranked ahead of several genuinely-titled `"Triangle"` entries at
+different years (2009, 2020, 2024, 2007, 2022, 1994, 2014, 2025, plus an
+all-caps `"TRIANGLE"` (2012)). Output:
+
+```
+=== pick_best('Triangle', None, results) ===
+TMDBSearchResult(id=26466, title='Triangle', year=2009, poster_path='/cRlMrbc4Iof7vN0ZqHwJnMBYBLi.jpg', overview='When Jess sets sail on a yacht with a group of friends, she cannot shake the feeling that there is something wrong.', popularity=9.7426, original_rank=1)
+
+score_result for best: 0.775
+```
+
+Confirmed: `id=26466` is the real 2009 time-loop thriller "Triangle" —
+exactly the diagnostic-output id named in this follow-up's task, now
+independently reconfirmed against the live API rather than assumed. The
+fix correctly rejects the more popular, top-ranked "Triangle of Sadness"
+(`original_rank=0`) in favor of the true exact title match, and also
+correctly disambiguates among the *several* other exact-titled
+`"Triangle"` results in the live result set by falling back to
+`score_result`'s `rank_bonus` tiebreaker (no `year_hint` was supplied in
+this call) to pick the one TMDB itself ranks highest among the
+genuinely-tied exact matches.
+
+### Files changed
+
+- `reel2movie/tmdb/scoring.py` — tiered `pick_best()` + new
+  `_is_exact_title_match()` helper; `score_result()` unchanged.
+- `tests/unit/tmdb/test_scoring.py` — 5 new tests (above).
+
+### Review findings (latest pass)
+
+This section holds two review passes, kept distinct rather than letting the
+newer one overwrite the older (per handoff-logging convention: never destroy
+history). **Cycle 0** (below) is the original pre-fix review; its outcome is
+narrated in `### Fixes applied` below and is kept here verbatim for the
+record. **Cycle 2** (further down) is a fresh, from-scratch re-review of the
+current working tree (fix cycle 1 already applied) — run independently of
+cycle 0/1, not a continuation of them.
+
+#### cycle 0 review (historical — pre-fix; see "Fixes applied" below for what changed in response)
+
+Reviewed via `/code-review` (high, forked) on the current diff
+(`reel2movie/tmdb/scoring.py`, `tests/unit/tmdb/test_scoring.py`,
+`PROGRESS.md`), `/ponytail:ponytail-review` on the same diff, a
+from-scratch `python3 -m pytest tests/unit -q` run, and an independent
+live-TMDB-API re-verification (own script, own API call, not the build
+report's pasted output).
+
+**BLOCKING — confirmed by direct repro, not just read:** `_is_exact_title_match()`
+normalizes case (`.casefold()`), but once a candidate is placed in the
+exact-match tier, its *own* tiebreak/floor score still comes from
+`score_result()`, whose `title_similarity` term is `fuzz.WRatio(query,
+result.title) / 100` — which is case-sensitive for this kind of
+short, all-caps-vs-title-case pair. The two functions disagree on what
+"the same title" means, so a genuinely exact (case-insensitive) match
+can be placed in the exact-only tier and then scored so low by the
+case-sensitive formula that it fails `MIN_MATCH_SCORE` — at which point
+`pick_best` returns `None`, discarding the real exact match entirely
+rather than falling back to anything else (the exact tier is exclusive
+by design, so there's no fallback once it's non-empty). Verified directly:
+```python
+up = TMDBSearchResult(id=1, title="Up", year=2009, ..., popularity=50.0, original_rank=3)
+up_all_night = TMDBSearchResult(id=2, title="Up All Night", year=2011, ..., popularity=90.0, original_rank=0)
+pick_best("UP", None, [up_all_night, up])  # -> None
+# score_result("UP", None, up) == 0.3875  (< MIN_MATCH_SCORE == 0.5)
+# score_result("UP", None, up_all_night) == 0.64  (would have cleared the floor)
+```
+Confirmed with `fuzz.WRatio("UP", "Up") == 50.0` directly (not case-insensitive
+here), vs. `fuzz.WRatio("UP", "UP") == 100.0`. Before this diff, the plain
+global-argmax fallback would have returned *something* (`"Up All Night"`,
+wrong movie but non-`None`); after this diff, having a real exact match
+present actively makes the outcome `None` instead. This is the exact
+"pathological case where the best exact match scores below the floor"
+the task asked to construct — it is real, reachable (all-caps or
+otherwise differently-cased short captions are a plausible real-world
+input for this pipeline's OCR/caption-extracted queries), and it
+silently defeats the entire point of the exact-match tier for the one
+case class (low TMDB rank + case-differing query) it should have helped
+most. The floor-check *mechanism* itself isn't broken (it still
+correctly returns `None` below `MIN_MATCH_SCORE`), but the input to that
+mechanism is inconsistent with how "exact" was defined one line earlier.
+Fix direction: within the exact-match tier, don't re-score title
+similarity via `fuzz.WRatio` at all (it's already known to be 1.0 in the
+intended sense) — tiebreak only on `rank_bonus`/`year_bonus`, or at minimum
+make `score_result`'s title-similarity term case/whitespace-normalized
+the same way `_is_exact_title_match` is, so the two checks can't disagree.
+
+**Non-blocking:** `_is_exact_title_match()` only strips leading/trailing
+whitespace (`.strip().casefold()`), so it misses exact matches that
+differ by internal whitespace runs (e.g. OCR/caption noise producing
+`"The  Matrix"` with a double space) or Unicode normalization form.
+Confirmed: `_is_exact_title_match("The  Matrix", "The Matrix")` is
+`False`. Not a regression from this diff — these cases simply fall
+through to the unchanged fuzzy fallback, the same as before this fix
+existed — just a missed robustness improvement, not a new bug.
+
+**Judgment on "could exact-match-always-wins ever pick something worse
+than the old fuzzy-only approach?":** Yes, in principle, but only in a
+narrow class of inputs: it requires the *correct* intended movie's real
+TMDB title to NOT be a literal (case/whitespace-insensitive) match for
+the query (e.g. the query is missing an article, has different
+punctuation, or the query itself is slightly off from the caption),
+while some *other*, unrelated/obscure movie's title happens to be a
+literal exact match for that same query string. In that specific
+situation, the obscure one wins categorically even if the real target
+would have scored dramatically higher under the old fuzzy formula. For
+genuinely famous titles like the task's "The Dark Knight" example, this
+is close to non-reachable in practice: TMDB's title field for a famous
+film is reliably its exact common name, so the real film would also
+land in the exact tier (and `rank_bonus`/`year_bonus` tiebreaking inside
+that tier would almost always still favor it over an obscure decoy,
+since TMDB's own relevance ranking already biases toward the better-known
+title). This class of risk is also the explicit, deliberate tradeoff
+this fix accepts per `brainstorm.md`'s "name matching categorically
+outranks popularity" decision — it is narrower and far less frequently
+triggered than the bug being fixed (the "Triangle" / "Triangle of
+Sadness" substring-match class is systematic and common; this
+"exact-but-wrong-movie" class requires a specific title collision plus
+the real movie's title diverging from the query, which is comparatively
+rare). Net judgment: an acceptable, documented tradeoff, not a
+newly-introduced regression — but worth keeping in mind if a future bug
+report surfaces a short/generic query colliding with an obscure
+exact-titled movie.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity):**
+- `L61-62` **shrink**: the two-line "exact matches, else all results"
+  fallback (`exact_matches = [...]; candidates = exact_matches if
+  exact_matches else results`) can be one line, relying on a non-empty
+  list being truthy: `candidates = [r for r in results if
+  _is_exact_title_match(query, r.title)] or results`.
+- net: -1 line possible. Everything else is lean — `_is_exact_title_match`
+  is a single strict comparison with no stray flexibility, and the
+  tiered `pick_best` has no speculative branches.
+
+**Independent test run (run directly in this review pass, not trusted
+from the build report):**
+- `python3 -m pytest tests/unit -q` → **203 passed**, matching the build
+  report's count exactly.
+
+**Independent live-API re-verification (own script, own call, not the
+build report's pasted output):** loaded the real `.env` `TMDB_API_KEY`
+via `config.get_tmdb_token()` + `load_dotenv()`, built a real
+`TMDBHttpClient`, called `search_movie("Triangle")` against the live
+TMDB API, and ran the full result list through `pick_best("Triangle",
+None, results)`. Live TMDB returned 20 results, including `"Triangle of
+Sadness"` (2022, `original_rank=0`, popularity 34.67) ranked ahead of
+the real `"Triangle"` (2009, `original_rank=1`) and several other
+exactly-titled `"Triangle"` entries at other years/ranks. Result:
+```
+pick_best('Triangle', None, results) ->
+TMDBSearchResult(id=26466, title='Triangle', year=2009, poster_path='/cRlMrbc4Iof7vN0ZqHwJnMBYBLi.jpg', ..., popularity=9.7426, original_rank=1)
+```
+Matches `id=26466`, `title="Triangle"`, `year=2009` exactly — the
+original fix's core claim independently confirmed against a fresh live
+API call (note: TMDB's live dataset had shifted slightly since the prior
+verification — e.g. `"Triangle of Sadness"`'s id and popularity differ
+from the earlier pasted output, and the result set now includes a few
+additional `"Triangle"`-titled entries — but the fix's behavior holds
+regardless).
+
+One blocking finding: the exact-match tier's own tiebreak/floor check
+reuses `score_result()`'s case-sensitive `fuzz.WRatio` title-similarity
+term, which disagrees with `_is_exact_title_match()`'s case-insensitive
+definition of "exact" — a real exact match at low TMDB rank with
+different casing than the query can be scored below `MIN_MATCH_SCORE`
+and discarded as `None` even though a genuine exact match was present
+in the results, which is strictly worse than the pre-fix global-argmax
+behavior for that case class. All other findings (the internal-whitespace/
+Unicode gap in `_is_exact_title_match`, and the ponytail one-line shrink)
+are non-blocking. Tests (203 passed) and the live-API Triangle case were
+independently re-run and matched; the "exact match could beat a clearly
+better fuzzy match" risk is real but narrow, judged an acceptable,
+documented tradeoff rather than a regression.
+
+VERDICT: NEEDS FIXES
+
+### Fixes applied
+
+Fixed the BLOCKING finding in `reel2movie/tmdb/scoring.py` (review→fix
+cycle 1 of 3).
+
+**Direction chosen: (a)** — exact matches no longer go through
+`score_result()` at all. Added a new `_exact_tier_rank(result,
+year_hint)` helper used only inside `pick_best()`'s exact-match branch:
+
+```python
+def _exact_tier_rank(result: TMDBSearchResult, year_hint: int | None) -> float:
+    rank_bonus = 1 / (1 + result.original_rank)
+    year_bonus = 1.0 if year_hint and result.year == year_hint else 0.0
+    return 0.25 * rank_bonus + 0.10 * year_bonus
+```
+
+`pick_best()`'s exact-match branch now does
+`max(exact_matches, key=lambda r: _exact_tier_rank(r, year_hint))` and
+returns immediately — it no longer calls `score_result()` or checks
+`MIN_MATCH_SCORE` for that tier at all. The no-exact-match fallback
+branch is untouched: it still calls `score_result()` and still enforces
+`MIN_MATCH_SCORE` exactly as before.
+
+**Why (a) over (b):** both directions fix the bug, but (a) avoids adding
+a conditional/special-case ("is this an exact match? then fix
+title_similarity to 1.0...") inside `score_result()`, which is also used
+standalone (and tested standalone, e.g. `test_exact_title_match_scores_
+highest`) outside of `pick_best()`'s tiering — threading exact-match
+awareness into it would have coupled a general-purpose scorer to
+`pick_best()`'s tiering concept. Keeping the exact tier's ranking as its
+own small, honestly-named function (`_exact_tier_rank`) keeps
+`score_result()` simple and unchanged, and makes the exact tier's logic
+self-contained and easy to audit: it only ever looks at `rank_bonus`/
+`year_bonus`, never at title text, so there is no case-sensitivity (or
+any other title-matching) path left for it to disagree with
+`_is_exact_title_match()` on. The `0.25`/`0.10` weights were kept
+identical to `score_result()`'s so the relative tiebreak behavior among
+exact matches (rank vs. year_hint) is unchanged from before — this is
+mathematically equivalent to what `score_result()` would have computed
+*if* `title_similarity` had correctly been a constant `1.0` for every
+member of the tier, which is precisely the bug being fixed.
+
+**Ponytail suggestions:**
+- *(1) collapse the two-line fallback into one line* — not applied as
+  literally suggested. The suggested one-liner
+  (`candidates = [...] or results`) assumed both tiers still flow
+  through a single `score_result`-based `max(...)` call, which is no
+  longer true under direction (a): the exact tier now has its own
+  ranking function and skips `MIN_MATCH_SCORE` entirely, so there's no
+  longer a shared `candidates` list to unify the two branches around.
+  The new code is arguably still just as lean — `if exact_matches:
+  return max(exact_matches, key=...)` is one line more than a `candidates
+  = ... or ...` assignment would have been, but avoids re-merging two
+  branches that now have genuinely different semantics (one skips the
+  floor check, one doesn't).
+- *(2) whitespace-normalization nit* — left alone, as instructed (the
+  reviewer explicitly flagged it as a non-regression, not required).
+
+**Tests:** added
+`test_pick_best_exact_match_not_penalized_by_case_sensitive_wratio` to
+`tests/unit/tmdb/test_scoring.py` — the reviewer's exact repro case:
+`TMDBSearchResult(title="Up", year=2009, popularity=50.0,
+original_rank=3)` vs `TMDBSearchResult(title="Up All Night", year=2011,
+popularity=90.0, original_rank=0)`, asserts
+`pick_best("UP", None, [up_all_night, up])` returns the `"Up"` result
+(not `None`, not "Up All Night").
+
+`python3 -m pytest tests/unit -q` → **204 passed** (203 before this fix
++ 1 new regression test).
+
+**Manual verification (outside pytest), reviewer's exact case:**
+```
+fuzz.WRatio("UP", "Up") = 50.0
+score_result("UP", None, up) [old-style, case-sensitive] = 0.3875
+MIN_MATCH_SCORE = 0.5
+pick_best("UP", None, [up_all_night, up]) -> TMDBSearchResult(id=1, title='Up', year=2009, poster_path=None, overview='', popularity=50.0, original_rank=3)
+PASS: exact match "Up" correctly returned, not None, not Up All Night
+```
+Confirms the invariant the reviewer required: `score_result()` alone
+still scores `"Up"` at 0.3875 (below `MIN_MATCH_SCORE`) because
+`fuzz.WRatio` is still case-sensitive — but `pick_best()` no longer
+routes exact-tier candidates through `score_result()`/`MIN_MATCH_SCORE`
+at all, so the case-sensitivity of `fuzz.WRatio` can no longer affect
+the outcome for a result `_is_exact_title_match()` has already
+classified as exact.
+
+#### cycle 2 review (current — fresh re-review of the post-fix-cycle-1 working tree)
+
+Scope: the full current diff — `reel2movie/tmdb/scoring.py` (both
+`_is_exact_title_match()` from cycle 0 and `_exact_tier_rank()` from fix
+cycle 1), `tests/unit/tmdb/test_scoring.py` (all 6 added tests), and
+`PROGRESS.md`. Run as a clean re-review, not a continuation of the
+cycle 0/1 session: fresh `/code-review` (high, forked) and
+`/ponytail:ponytail-review` invocations against the current diff, a direct
+read of `_exact_tier_rank()`'s source, two own repro scripts (the
+reviewer's original case + a fresh adversarial tie case), an independent
+`python3 -m pytest tests/unit -q` run, and an independent live-TMDB-API
+re-verification (own script, own call).
+
+**Primary question — is the cycle 0 BLOCKING case-sensitivity bug actually
+fixed? Yes, confirmed by direct reproduction, not just by reading the fix:**
+```
+fuzz.WRatio('UP','Up') = 50.0
+score_result('UP', None, up) [would-be, bypassed now] = 0.3875
+MIN_MATCH_SCORE = 0.5
+pick_best('UP', None, [up_all_night, up]) -> TMDBSearchResult(id=1, title='Up', year=2009, ...)
+PASS: exact match 'Up' returned despite case-sensitive WRatio scoring below floor
+```
+Same outcome the fix-cycle-1 report claimed, independently re-run.
+
+**(a) Does `_exact_tier_rank()` genuinely never touch title text/fuzz
+matching? Confirmed by direct read of the source, not inference:**
+```python
+def _exact_tier_rank(result: TMDBSearchResult, year_hint: int | None) -> float:
+    rank_bonus = 1 / (1 + result.original_rank)
+    year_bonus = 1.0 if year_hint and result.year == year_hint else 0.0
+    return 0.25 * rank_bonus + 0.10 * year_bonus
+```
+The only attributes read are `result.original_rank` and `result.year`;
+`result.title` never appears, `fuzz`/`score_result`/`MIN_MATCH_SCORE` are
+never imported or called from it, and `pick_best()`'s exact branch
+(`return max(exact_matches, key=lambda r: _exact_tier_rank(r, year_hint))`)
+calls nothing else before returning. There is no path left by which a
+case-sensitivity (or any other title-matching) disagreement between this
+function and `_is_exact_title_match()` can resurface. Cycle 0's BLOCKING
+finding is genuinely fixed, not just re-described as fixed.
+
+**(b) Judgment — is skipping `MIN_MATCH_SCORE` entirely for ALL exact
+matches safe?** Yes — safe, and actually the only sensible choice given
+how the floor is calibrated, not merely a defensible shortcut:
+
+- `MIN_MATCH_SCORE` (0.5) was calibrated against `score_result()`'s full
+  formula, where `title_similarity` contributes up to `0.65` of the total
+  — i.e. the floor is fundamentally a title-similarity gate, with
+  `rank_bonus`/`year_bonus` only ever nudging a result that already has
+  decent title similarity. `_exact_tier_rank()`'s own range is `[0, 0.35]`
+  (`0.25` max rank_bonus + `0.10` max year_bonus) — strictly *below* `0.5`
+  for every possible input. Applying the unmodified floor to this tier's
+  scale wouldn't just risk edge cases, it would reject every exact match,
+  always, unconditionally — proof that the floor was never meant to apply
+  to this tier's scale in the first place, not just safe to omit from it.
+- Conceptually: `MIN_MATCH_SCORE` exists to answer "is the title similar
+  enough to trust?". Within the exact tier, that question is already
+  answered categorically and maximally by `_is_exact_title_match()`
+  (post-casefold string equality) — there is no continuous "how similar"
+  left for a floor to gate. The only genuinely open question inside the
+  tier is disambiguation among multiple same-titled movies, and that is
+  what `rank_bonus`/`year_bonus` tiebreaking already does — a popularity
+  floor was never doing that disambiguation job either.
+- Adversarial case considered: could a title be an exact (post-casefold)
+  match to the query yet obviously be the wrong movie, in a way
+  `MIN_MATCH_SCORE` was protecting against? The only such class is the one
+  cycle 0's own judgment paragraph already identified and accepted as a
+  documented tradeoff — an obscure movie's title collides exactly with the
+  query while the *real* target's title diverges from the query (e.g. a
+  missing article or punctuation). Re-examined here specifically for
+  `MIN_MATCH_SCORE`'s role: the floor would not have blocked this class
+  either, before or after this fix — the old formula scores a
+  title-identical string at `title_similarity ≈ 1.0` via `fuzz.WRatio`
+  regardless of which movie it belongs to, so an obscure exact-string
+  collision would have cleared `MIN_MATCH_SCORE` comfortably under the old
+  code too. `MIN_MATCH_SCORE` was never the mechanism guarding against
+  "right string, wrong movie" — only against "string doesn't really
+  match" — so removing it from a tier where the string is already
+  confirmed to match changes nothing about that risk. Net judgment:
+  "exact title match" is inherently strong enough that a popularity/
+  `MIN_MATCH_SCORE` floor was never meaningfully protecting anything in
+  this tier — skipping it is correct, not just low-risk.
+
+**(c) Repro of the reviewer's original case:** see "Primary question"
+above — reproduced directly, passes.
+
+**(c) Fresh adversarial case — two exact matches, no year hint, IDENTICAL
+`original_rank` (a tie within a tie):**
+```python
+triangle_a = _result(id=100, title="Triangle", year=2009, original_rank=4)
+triangle_b = _result(id=200, title="Triangle", year=1994, original_rank=4)
+_exact_tier_rank(triangle_a, None) == _exact_tier_rank(triangle_b, None) == 0.05
+pick_best("Triangle", None, [triangle_a, triangle_b]) -> id=100 (triangle_a)
+pick_best("Triangle", None, [triangle_b, triangle_a]) -> id=200 (triangle_b)
+# stable across 5 repeated trials each ordering
+```
+`max()` behaves exactly per Python's documented tie-break rule: it returns
+the *first* maximal element encountered in iteration order. No crash, no
+`None`, no non-determinism across repeated runs — the outcome is a pure,
+stable function of input list order when every other signal is tied.
+**Caveat, checked directly:** this exact scenario is not reachable via the
+one production call site. `reel2movie/tmdb/resolver.py:90` passes
+`client.search_movie(...)`'s return value straight into `pick_best()`
+unmodified, and `TMDBHttpClient.search_movie()`
+(`reel2movie/tmdb/client.py:107`) assigns `original_rank=rank` via
+`enumerate(payload["results"])` — guaranteeing every result in one
+`search_movie()` call has a unique `original_rank`. So a same-call tie on
+`original_rank` can't actually occur today; this was a synthetic
+unit-level stress case, not a reachable regression. Still worth having
+confirmed: `pick_best()` takes a plain `list[TMDBSearchResult]` with no
+caller-independent uniqueness guarantee enforced at the type level, so if
+a future caller ever merges results from more than one search call before
+calling `pick_best()`, the tie-break would silently degenerate to list
+order rather than crash — good defensive behavior to have confirmed now
+rather than assumed.
+
+**From `/ponytail:ponytail-review` (over-engineering/complexity) —
+re-run fresh on the full current diff:** nothing to cut. `_exact_tier_rank()`
+duplicates `score_result()`'s two-line `rank_bonus`/`year_bonus`
+computation, but extracting a shared helper is a wash (a 4-line helper
+replacing two 2-line duplicates nets ~0 lines) and the duplication is a
+maintainability/drift concern (see code-review finding below), not a
+complexity/line-count one — out of ponytail's "fewer lines" scope. No
+speculative flexibility, no unused config, no reinvented stdlib in the new
+code. **Lean already. Ship.**
+
+**From `/code-review` (high, forked) — two findings, both non-blocking:**
+
+1. **Non-blocking (latent, currently unreachable in output):**
+   `reel2movie/tmdb/resolver.py:100`'s `resolve_candidate()` sets
+   `ResolvedMovie.match_score` via `score_result(query_title, year_hint,
+   best)` unconditionally — including when `best` came from `pick_best()`'s
+   exact-match tier, which by design never calls `score_result()` to pick
+   it. Confirmed directly: for the "UP"/"Up" case, `pick_best()` correctly
+   returns `up` via the exact tier, but `resolve_candidate()` would then
+   store `match_score = score_result("UP", None, up) == 0.3875` — a value
+   *below* `MIN_MATCH_SCORE`, on a result the pipeline just trusted as a
+   categorical exact match. Checked whether this is reachable in current
+   output: `reel2movie/cli.py`'s `_tmdb_to_dict()` deliberately excludes
+   `match_score` from the emitted CLI output today (its docstring says so
+   explicitly), and nothing else in the codebase reads
+   `ResolvedMovie.match_score`, so this doesn't produce an incorrect
+   *visible* result right now — hence non-blocking rather than blocking.
+   However, `flow.md` ("Sort by confidence") and `brainstorm.md` (a
+   `confidence` field in the documented output draft) both describe a
+   planned confidence-based sorting/thresholding feature that this field
+   is clearly meant to feed — and for that feature, a misleadingly low
+   `match_score` on exactly the results this fix was designed to treat as
+   highest-confidence would be actively wrong. Recommended near-term
+   follow-up (not required for this diff): give exact-tier picks a
+   `match_score` consistent with their tier (e.g. a constant `1.0`, or
+   reuse `_exact_tier_rank`'s value on a comparable scale) instead of
+   silently re-running them through the case-sensitive formula the tier
+   was built to bypass.
+2. **Non-blocking (maintainability nit):** `_exact_tier_rank()` duplicates
+   `score_result()`'s `rank_bonus`/`year_bonus` formula and literal weights
+   (`0.25`, `0.10`) as a separate, independently-maintained copy rather
+   than a shared helper. If either formula is retuned later (e.g. the
+   weights, or the year-bonus condition), the two tiers' tiebreak logic
+   can silently drift apart with nothing (no test, no type error) to
+   surface the inconsistency. Same observation ponytail's duplication note
+   above makes from the lines angle; flagged here from the drift-risk
+   angle. Low cost to defer: the weights are currently identical by
+   construction and the comment in `_exact_tier_rank()`'s docstring
+   already documents the intent to keep them in sync.
+
+**Independent test run (run directly in this pass, not trusted from the
+build/fix-cycle-1 report):**
+```
+python3 -m pytest tests/unit -q
+204 passed in 3.75s
+```
+Matches the fix-cycle-1 report's count exactly.
+
+**Independent live-API re-verification (own script, own call, not the
+fix-cycle-1 report's pasted output) — confirms both cycles' fixes hold
+together end-to-end against live data:** loaded the real `.env`
+`TMDB_API_KEY` via `config.get_tmdb_token()` + `load_dotenv()` (passed an
+explicit path — `load_dotenv()`'s default search walks up from the
+*calling script's* own directory, not the cwd, so a script run from
+outside the repo needs the path spelled out explicitly; not a product
+bug, a test-harness detail), built a real `TMDBHttpClient`, called
+`search_movie("Triangle")` against the live TMDB API, and ran the full
+result list through `pick_best("Triangle", None, results)`. Live TMDB
+returned 20 results, including `"Triangle of Sadness"` (2022,
+`original_rank=0`, popularity 34.67, still ranked first by TMDB itself),
+several genuinely-titled `"Triangle"` entries at other years (2009, 2020,
+2024, 2007, 2022, 1994, 2014, 2025), and an all-caps `"TRIANGLE"` (2012,
+`original_rank=16`) that only matters because of cycle 0's fix (it's an
+exact match only once case is normalized). Result:
+```
+pick_best('Triangle', None, results) ->
+TMDBSearchResult(id=26466, title='Triangle', year=2009, ..., popularity=9.7426, original_rank=1)
+```
+Matches `id=26466`, `title="Triangle"`, `year=2009` — the correct 2009
+time-loop thriller, beating both the more popular `"Triangle of Sadness"`
+(`original_rank=0`) and the other exact-titled `"Triangle"` entries via
+`_exact_tier_rank`'s rank-bonus tiebreak (no `year_hint` supplied). The
+combined fix from both cycles resolves correctly end-to-end against a
+fresh live API call.
+
+**Summary:** no BLOCKING findings in this pass. The cycle 0 BLOCKING bug is
+confirmed genuinely fixed by direct reproduction and by reading
+`_exact_tier_rank()`'s source (it provably never touches title text or
+`fuzz`). Skipping `MIN_MATCH_SCORE` for the entire exact tier is judged
+correct, not just acceptable — the floor's own scale (`title_similarity`-
+dominated, max possible exact-tier score of `0.35` vs. a `0.5` floor)
+proves it was never calibrated to apply to this tier, and the risk class
+it might otherwise have guarded against ("right string, wrong movie") was
+never something `MIN_MATCH_SCORE` actually caught, before or after this
+fix. The tie-within-a-tie case confirmed `max()`'s deterministic
+first-wins behavior with no crash, though the scenario itself is not
+reachable via the current single production call site. Two non-blocking
+findings carry forward as recommended follow-ups: `resolve_candidate()`'s
+`match_score` can be misleadingly low for exact-tier picks (latent,
+currently unreachable in any emitted output, but worth fixing before the
+planned confidence-sorting feature lands), and `_exact_tier_rank()`
+duplicates `score_result()`'s rank/year formula (drift risk, no test
+coverage for staying in sync). Tests (204 passed) and the live-API
+Triangle case were independently re-run from scratch and matched.
+
+VERDICT: ACCEPTABLE
