@@ -9,3 +9,4 @@ venv/
 dist/
 build/
 tests/fixtures/*.mp4
+*.mp4
