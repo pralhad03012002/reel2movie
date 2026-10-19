@@ -369,7 +369,7 @@ class TestClaudeCodeVisionChatClient:
         )
 
         with patch(
-            "reel2movie.visual.vision_llm_detector.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
@@ -403,7 +403,7 @@ class TestClaudeCodeVisionChatClient:
         )
 
         with patch(
-            "reel2movie.visual.vision_llm_detector.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
@@ -430,7 +430,7 @@ class TestClaudeCodeVisionChatClient:
         )
 
         with patch(
-            "reel2movie.visual.vision_llm_detector.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
@@ -445,7 +445,7 @@ class TestClaudeCodeVisionChatClient:
         image_path.write_bytes(b"fake-jpeg-bytes")
 
         with patch(
-            "reel2movie.visual.vision_llm_detector.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"],
@@ -463,7 +463,7 @@ class TestClaudeCodeVisionChatClient:
         image_path.write_bytes(b"fake-jpeg-bytes")
 
         with patch(
-            "reel2movie.visual.vision_llm_detector.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"],
@@ -483,7 +483,7 @@ class TestClaudeCodeVisionChatClient:
         image_path.write_bytes(b"fake-jpeg-bytes")
 
         with patch(
-            "reel2movie.visual.vision_llm_detector.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.side_effect = subprocess.TimeoutExpired(
                 cmd=["claude"], timeout=60.0
@@ -500,7 +500,7 @@ class TestClaudeCodeVisionChatClient:
         image_path.write_bytes(b"fake-jpeg-bytes")
 
         with patch(
-            "reel2movie.visual.vision_llm_detector.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.side_effect = FileNotFoundError(
                 "[Errno 2] No such file or directory: 'claude'"
@@ -516,7 +516,7 @@ class TestClaudeCodeVisionChatClient:
         canned_stdout = _canned_cli_json(result_text="ok")
 
         with patch(
-            "reel2movie.visual.vision_llm_detector.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["my-claude"], returncode=0, stdout=canned_stdout, stderr=""

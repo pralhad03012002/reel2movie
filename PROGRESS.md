@@ -6851,3 +6851,309 @@ designed: it didn't crash, didn't raise, and returned a valid
 the model's pick on this particular run was the unlucky one.
 
 VERDICT: ACCEPTABLE
+
+## Follow-up — unify duplicated claude-CLI subprocess/parsing logic — status: DONE
+
+**Motivation (from the repo-wide ponytail-audit):** `ClaudeCodeVisionChatClient.chat()`
+(`visual/vision_llm_detector.py`) and `ClaudeCodeTextChatClient.chat()`
+(`text_extraction/claude_code_extractor.py`) duplicated ~90% of their
+`subprocess.run()` → timeout/`OSError` → non-zero-exit →
+`json.JSONDecodeError` → `is_error` → `permission_denials` → return
+`parsed["result"]` pipeline almost line-for-line, differing only in CLI
+flags (`--tools Read` + an image-read prompt prefix vs. `--tools ""`) and
+in which exception class each raised. Likewise `VisionLLMPosterDetector.detect()`
+and `ClaudeCodeCandidateExtractor.extract()` duplicated the same
+"parse a JSON array of `{title, year, confidence}` items into `Candidate`s,
+skipping malformed items, mapping confidence labels via a caller-supplied
+map" loop nearly verbatim.
+
+**New module layout — two small internal (`_`-prefixed, not part of the
+public package surface) modules, both under `reel2movie/`:**
+
+- `reel2movie/_claude_cli.py` (92 lines): `ClaudeCliError` (the one real
+  error class now) and `run_claude_cli(args, *, claude_binary,
+  timeout_seconds, context) -> str` — the shared subprocess-run → parse
+  `--output-format json` → `result` pipeline. `context` is a plain string
+  each caller supplies purely to make error messages identify what was
+  being processed (an image path for vision, a fixed string for text); it
+  has no effect on control flow.
+- `reel2movie/_candidate_parsing.py` (87 lines):
+  `parse_movie_candidates(raw_response, *, confidence_map,
+  default_confidence, source, log_context) -> list[Candidate]` — the
+  shared JSON-array-of-movie-mentions parser. Each caller supplies its own
+  confidence-label map (vision's dampened 0.8/0.5/0.3 vs. text's
+  `HIGH_CONFIDENCE`/`MEDIUM_CONFIDENCE` imported from `regex_extractor.py`,
+  unchanged) and default.
+
+**How the two original files changed:**
+
+- `reel2movie/visual/vision_llm_detector.py` (364 → 256 lines):
+  `ClaudeCodeVisionError` is now `ClaudeCodeVisionError = ClaudeCliError`
+  — a bare alias (not a subclass), per the task's explicit allowance for
+  either — so every existing `pytest.raises(ClaudeCodeVisionError, ...)`
+  still catches exactly what gets raised, since it's the same class
+  object. `ClaudeCodeVisionChatClient.chat()` now only builds its
+  `combined_prompt` (the "Read the image file at {image_path} using your
+  Read tool. {prompt}" prefix, unchanged) and its own `args` list (same
+  flags, same order: `-p`, `--output-format json`, `--tools Read`,
+  `--permission-mode bypassPermissions`, `--no-session-persistence`), then
+  returns `run_claude_cli(args, claude_binary=..., timeout_seconds=...,
+  context=f"analyzing {image_path}")`. `VisionLLMPosterDetector.detect()`
+  now just calls `self._chat_client.chat(...)` then returns
+  `parse_movie_candidates(raw_response, confidence_map=CONFIDENCE_MAP,
+  default_confidence=_DEFAULT_CONFIDENCE, source=SourceTag.FRAME_VISUAL,
+  log_context=...)` — `CONFIDENCE_MAP` (0.8/0.5/0.3) and
+  `_DEFAULT_CONFIDENCE` stayed exactly where they were, unchanged. Removed
+  the now-unused `import json`, `import subprocess`, `import logging` (and
+  module-level `logger`), since all three responsibilities moved to the
+  shared helpers.
+- `reel2movie/text_extraction/claude_code_extractor.py` (285 → 189 lines):
+  same treatment. `ClaudeCodeTextError = ClaudeCliError` (alias).
+  `ClaudeCodeTextChatClient.chat()` shrinks to building its own `args`
+  (`--tools ""` instead of `--tools Read`, no image-read prompt prefix,
+  prompt passed as-is) and calling `run_claude_cli(..., context="extracting
+  movie titles from text")`. `ClaudeCodeCandidateExtractor.extract()` keeps
+  its empty/whitespace-only-text short-circuit (unchanged, still returns
+  `[]` before ever touching the chat client) and otherwise delegates to
+  `parse_movie_candidates(..., confidence_map=_CONFIDENCE_MAP,
+  default_confidence=_DEFAULT_CONFIDENCE, source=source, ...)` where
+  `_CONFIDENCE_MAP` is still built from `HIGH_CONFIDENCE`/`MEDIUM_CONFIDENCE`
+  imported from `regex_extractor.py` exactly as before. Removed the
+  now-unused `import json`/`import logging`/module-level `logger`.
+
+**Confirmed zero behavior change — grepped the whole repo first for every
+externally-visible name before touching anything:**
+`ClaudeCodeVisionError`, `ClaudeCodeTextError`, `ClaudeCodeVisionChatClient`,
+`ClaudeCodeTextChatClient`, `VisionChatClient`, `TextChatClient` are each
+still defined under their original name, in their original module, with
+their original public constructor signature (`claude_binary: str =
+"claude", timeout_seconds: float = 60.0` for both chat-client classes) and
+`chat()` signature. Confirmed every production call site unaffected by
+direct read: `reel2movie/pipeline/deps.py` imports `ClaudeCodeTextChatClient`/
+`TextChatClient` from `text_extraction.claude_code_extractor` and
+`ClaudeCodeVisionChatClient`/`AnthropicVisionChatClient` from
+`visual.vision_llm_detector` — both unmoved; `reel2movie/tmdb/resolver.py`
+imports `TextChatClient` from `claude_code_extractor` — unmoved, Protocol
+definition untouched. Not changed anywhere: the exact CLI flags per
+caller, the prompt text/construction for either caller, `raw_text`
+formatting (`f"{title} ({year})"`), the `permission_denials`/`is_error`
+check semantics (same two checks, same order, same "raise before trusting
+`result`" behavior), or either caller's confidence mapping/default.
+(Error-message *prose* did change in a few spots — e.g. non-JSON/`is_error`
+messages for the text caller now include the `context` string where they
+previously didn't, and vision's permission_denials message lost its
+`image never actually seen` phrase in favor of a shared "reply cannot be
+trusted" phrase — this is cosmetic log/exception text, not checked by any
+existing test beyond generic substrings like `"is_error"`/
+`"permission_denials"`/`"non-JSON"`/`"timed out"`/`"not logged in"`/`"claude"`,
+all of which still match.)
+
+**Tests:**
+
+- `tests/unit/visual/test_vision_llm_detector.py` and
+  `tests/unit/text_extraction/test_claude_code_extractor.py`: every test
+  kept, unchanged in substance. The only edit was the `subprocess.run`
+  mock-patch target, since that's genuinely where the call moved to:
+  `reel2movie.visual.vision_llm_detector.subprocess.run` →
+  `reel2movie._claude_cli.subprocess.run`, and
+  `reel2movie.text_extraction.claude_code_extractor.subprocess.run` →
+  `reel2movie._claude_cli.subprocess.run` (same new target for both, since
+  both now share the one module that actually calls `subprocess.run`).
+  All 44 of their tests still pass.
+- New `tests/unit/test_claude_cli.py` (8 tests): the same error-case
+  coverage proven per-caller before (success/`result`-returned, timeout,
+  missing binary, non-zero exit, non-JSON stdout, `is_error`,
+  `permission_denials`-despite-plausible-`result`, plus a check that
+  `context` actually shows up in a raised message), now proven once
+  directly against `run_claude_cli()`.
+- New `tests/unit/test_candidate_parsing.py` (8 tests): standalone
+  coverage of `parse_movie_candidates()` — title+year, title without year,
+  empty array, non-JSON, JSON-object-not-array, missing-title item
+  skipped, unrecognized confidence label falls back to default, and (the
+  point of taking `confidence_map` as a parameter) two different callers
+  getting different numeric confidence for the same label.
+
+**`python3 -m pytest tests/unit -q`, run after the refactor:**
+
+```
+244 passed in 3.50s
+```
+
+228 (pre-refactor baseline) + 8 (`test_claude_cli.py`) + 8
+(`test_candidate_parsing.py`) = 244. Count only grew, never dropped —
+every pre-existing test still proves the same thing it did before.
+
+**Live-API spot check (`load_dotenv()` + the real `claude` CLI, no mocks),
+run directly against both refactored clients:**
+
+```
+=== ClaudeCodeTextChatClient live call ===
+result: '4'
+
+=== ClaudeCodeVisionChatClient live call ===
+result: 'White'
+```
+
+`ClaudeCodeTextChatClient().chat("What is 2+2? Respond with just the
+number.")` → `'4'`. For vision, generated a fresh scratchpad test image (a
+400×300 JPEG with a white rectangle border drawn via PIL — the repo's own
+prior scratchpad frames were from an earlier subtask, so a new one was
+made rather than reused) and ran `ClaudeCodeVisionChatClient().chat(image_path,
+"What color is the border rectangle drawn in this image? Answer in one
+word.")` → `'White'`, correctly matching the actual drawn color. Confirms
+the real `claude` CLI integration genuinely still works post-refactor
+through both shrunk `chat()` methods, not just against the mocked
+`subprocess.run` the unit tests use.
+
+**Net lines-saved count:** production source (excluding tests) went from
+`364 + 285 = 649` lines (`vision_llm_detector.py` +
+`claude_code_extractor.py`, pre-refactor) to `256 + 189 + 92 + 87 = 624`
+lines (those same two files, now shrunk, plus the two new shared modules
+that replace their duplicated logic) — a net reduction of 25 production
+lines, with the actual duplicated subprocess/JSON-parsing and
+candidate-parsing logic now written exactly once instead of twice. Test
+line count grew by design (table above): +352 lines across the two new
+dedicated shared-helper test files, with the two existing per-caller test
+files unchanged in line count (only their mock-patch target strings
+edited).
+
+VERDICT: DONE — pure refactor, zero behavior change, pytest count only
+grew (228 → 244), live CLI spot check passes for both clients.
+
+### Review findings (latest pass)
+
+Reviewed via `/code-review` (high, forked) on the current diff,
+`/ponytail:ponytail-review` on the two new shared modules, a from-scratch
+`python3 -m pytest tests/unit -q` run, direct reads of both diffs against
+`git show HEAD:...`, a repo-wide grep for every externally-importable
+name and for `isinstance`/`except` usage against the error classes, and
+independent live-`claude`-CLI spot checks + one higher-level integration
+rerun (own scripts, real CLI, no mocks — not the build report's pasted
+output).
+
+**Non-blocking — `/code-review` (high, forked), two findings, both
+accepted as real but non-blocking:**
+1. `parse_movie_candidates()` (`reel2movie/_candidate_parsing.py:20`) logs
+   its warnings under the single shared logger name
+   `"reel2movie._candidate_parsing"`, whereas before the refactor the
+   vision and text callers each logged under their own module's logger
+   (`"reel2movie.visual.vision_llm_detector"` /
+   `"reel2movie.text_extraction.claude_code_extractor"`). Confirmed by
+   direct diff read: both callers' `logger = logging.getLogger(__name__)`
+   lines were removed. This silently merges what were two independently
+   configurable/filterable log streams into one. Real, but not disclosed
+   in the original write-up above (which only disclosed *message text*
+   drift, not logger identity), and no existing test uses `caplog` to
+   depend on logger name — non-blocking.
+2. `run_claude_cli()`'s shared error messages unconditionally splice
+   `context` into every raised message, changing exact text for the text
+   caller's `is_error`/non-JSON/`permission_denials` cases (previously
+   context-free) and replacing vision's specific "the model never
+   actually saw the image" permission-denial caveat with a generic "the
+   model's reply cannot be trusted" phrase. This matches what the
+   original write-up above already self-disclosed ("Error-message
+   *prose* did change in a few spots...") — confirmed accurate by direct
+   diff read, not a new finding, and no test/code inspects the exact
+   phrasing (all `pytest.raises` use `match=` on substrings still
+   present) — non-blocking.
+
+**Non-blocking — `/ponytail:ponytail-review`:** both new modules are lean
+— every parameter (`context`, `confidence_map`, `default_confidence`,
+`source`, `log_context`) is genuinely consumed differently by the two
+real callers, no speculative hooks/config, no unused imports. One minor
+duplication: `run_claude_cli(args, *, claude_binary, ...)` takes
+`claude_binary` as its own keyword even though it's always `args[0]` too
+(both callers pass it both ways). Could derive it inside the function as
+`args[0]` and drop the separate parameter, saving one line at each of the
+two call sites. `net: -2 lines possible.`
+
+**Own verification — CLI args/flags byte-for-byte unchanged, confirmed by
+direct diff read (not trusted from the write-up):** `git diff HEAD --
+reel2movie/visual/vision_llm_detector.py reel2movie/text_extraction/claude_code_extractor.py`
+shows the only change inside each `chat()` method is replacing the
+inline `subprocess.run()`/parse block with a call to `run_claude_cli()`
+passing the *exact same* `args` list literal (same flags, same order,
+same values: `-p`, `--output-format json`, `--tools Read` for vision vs.
+`--tools ""` for text, `--permission-mode bypassPermissions`,
+`--no-session-persistence`, and vision's unchanged `combined_prompt` =
+`f"Read the image file at {image_path} using your Read tool. {prompt}"`).
+The `is_error` check precedes the `permission_denials` check in both the
+old inline code and the new `run_claude_cli()`, same as before. `raw_text`
+formatting (`f"{title} ({year})" if year is not None else title`) and both
+callers' confidence maps/defaults (vision's `CONFIDENCE_MAP` 0.8/0.5/0.3 +
+`_DEFAULT_CONFIDENCE`; text's `_CONFIDENCE_MAP` built from
+`HIGH_CONFIDENCE`/`MEDIUM_CONFIDENCE` imported from `regex_extractor.py`)
+are untouched by the diff — confirmed these constants/lines don't even
+appear in the diff hunks.
+
+**Own verification — `ClaudeCodeVisionError`/`ClaudeCodeTextError` alias
+safety, confirmed by repo-wide grep:** both are `= ClaudeCliError`
+(literally the same class object under two names, not a subclass).
+Grepped the whole repo for `isinstance.*ClaudeCode`, `except
+ClaudeCode`, and `ClaudeCliError` — the only `isinstance()` in the repo
+near these names is `tests/unit/pipeline/test_deps.py`'s unrelated
+`isinstance(deps.text_extractor._fallback, ClaudeCodeCandidateExtractor)`
+(a class check, not an error check). Every `pytest.raises(ClaudeCodeVisionError, ...)`
+/ `pytest.raises(ClaudeCodeTextError, ...)` in the test suite catches
+exactly what `run_claude_cli()` raises, since it's the same object —
+confirmed this works by the full suite passing (see below), not just by
+assumption.
+
+**Own verification — every externally-importable name re-grepped
+repo-wide, not just the files the build report listed:** `grep -rn` for
+`ClaudeCodeVisionChatClient`, `ClaudeCodeTextChatClient`,
+`VisionChatClient`, `TextChatClient`, `ClaudeCodeVisionError`,
+`ClaudeCodeTextError` across the whole repo. Confirmed `reel2movie/pipeline/deps.py`
+still imports `ClaudeCodeTextChatClient`/`TextChatClient` from
+`text_extraction.claude_code_extractor` and `ClaudeCodeVisionChatClient`/
+`AnthropicVisionChatClient` from `visual.vision_llm_detector`, and
+`reel2movie/tmdb/resolver.py` still imports `TextChatClient` from
+`claude_code_extractor` — both unmoved, no call site outside the two
+refactored files and their own tests references anything that changed
+location or signature.
+
+**Own verification — `python3 -m pytest tests/unit -q`, run
+independently, not trusted from the reported 244:**
+
+```
+244 passed in 3.61s
+```
+
+Matches the build report exactly.
+
+**Own live-API spot check, both clients, real `claude` CLI, no mocks
+(own scripts, not the build report's pasted output):**
+
+```
+TEXT RESULT: '12'
+VISION RESULT: 'Red'
+```
+
+`ClaudeCodeTextChatClient().chat("What is 7+5? Respond with just the
+number.")` → `'12'`. For vision, generated a fresh scratchpad 400×300 JPEG
+with a red rectangle border (PIL) and ran
+`ClaudeCodeVisionChatClient().chat(image_path, "What color is the
+rectangle border drawn in this image? Answer in one word.")` → `'Red'`,
+correctly matching the actual drawn color — independently confirms the
+real CLI integration works post-refactor for both clients, using
+different example inputs than the build report's own spot check (2+2/
+white border) so this isn't just re-running the same cached-looking
+result.
+
+**Own verification — higher-level integration rerun through the real
+`ClaudeCodeCandidateExtractor` (exercises the new `parse_movie_candidates`
+shared module end-to-end via the real CLI, not just the raw `chat()`
+call):** fed the same "Dhobi Ghat" prose caption from the original
+Claude CLI text-extraction-fallback follow-up through
+`ClaudeCodeCandidateExtractor(ClaudeCodeTextChatClient()).extract(caption, SourceTag.CAPTION)`
+→ `Candidate(raw_text='Dhobi Ghat (2010)', source=SourceTag.CAPTION,
+confidence=0.9)` — correct title, correct year, confidence exactly
+`HIGH_CONFIDENCE` (0.9, confirmed against `regex_extractor.py`). Also ran
+`VisionLLMPosterDetector(ClaudeCodeVisionChatClient()).detect(frame)` on
+the same plain red-rectangle scratchpad frame (no poster/title visible)
+→ `[]`, correctly empty. Both prove the full `detect()`/`extract()` →
+`chat()` → `run_claude_cli()` → `parse_movie_candidates()` chain works
+end-to-end against the real CLI post-refactor, at a level unit tests
+(mocked `subprocess.run`) can't catch.
+
+VERDICT: ACCEPTABLE

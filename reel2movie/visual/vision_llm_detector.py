@@ -24,17 +24,14 @@ always a constructor parameter, supplied by the caller (a later
 from __future__ import annotations
 
 import base64
-import json
-import logging
-import subprocess
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import anthropic
 
+from reel2movie._candidate_parsing import parse_movie_candidates
+from reel2movie._claude_cli import ClaudeCliError, run_claude_cli
 from reel2movie.core.models import Candidate, FrameSample, SourceTag
-
-logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -119,18 +116,11 @@ class AnthropicVisionChatClient:
         )
 
 
-class ClaudeCodeVisionError(RuntimeError):
-    """Raised when the `claude` CLI subprocess fails to produce a usable reply.
-
-    Covers: the subprocess timing out, the `claude` binary being missing,
-    not on `PATH`, or otherwise not runnable (any `OSError` raised by
-    `subprocess.run` itself, e.g. `FileNotFoundError`/`PermissionError`),
-    a non-zero exit code, stdout that isn't valid JSON, a parsed reply
-    with `is_error: true`, and a parsed reply with a non-empty
-    `permission_denials` list (the Read tool call on the image was
-    blocked, so the model never actually saw the image -- this must
-    never be mistaken for a legitimate empty/negative answer).
-    """
+# Alias (not a subclass) of the shared `ClaudeCliError` raised by
+# `run_claude_cli()` -- see `reel2movie._claude_cli` for the actual
+# error-raising logic this used to duplicate. Kept under this name since
+# external code/tests still import/reference it as `ClaudeCodeVisionError`.
+ClaudeCodeVisionError = ClaudeCliError
 
 
 class ClaudeCodeVisionChatClient:
@@ -177,65 +167,23 @@ class ClaudeCodeVisionChatClient:
             f"Read the image file at {image_path} using your Read tool. {prompt}"
         )
 
-        try:
-            result = subprocess.run(
-                [
-                    self._claude_binary,
-                    "-p",
-                    "--output-format",
-                    "json",
-                    "--tools",
-                    "Read",
-                    "--permission-mode",
-                    "bypassPermissions",
-                    "--no-session-persistence",
-                    combined_prompt,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ClaudeCodeVisionError(
-                f"`{self._claude_binary}` CLI timed out after "
-                f"{self._timeout_seconds}s analyzing {image_path}"
-            ) from exc
-        except OSError as exc:
-            raise ClaudeCodeVisionError(
-                f"could not run the 'claude' CLI (binary: "
-                f"{self._claude_binary!r}) -- is it installed and on PATH? "
-                f"({exc})"
-            ) from exc
-
-        if result.returncode != 0:
-            raise ClaudeCodeVisionError(
-                f"`{self._claude_binary}` CLI exited {result.returncode} "
-                f"analyzing {image_path}: {result.stderr.strip()}"
-            )
-
-        try:
-            parsed = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise ClaudeCodeVisionError(
-                f"`{self._claude_binary}` CLI returned non-JSON stdout for "
-                f"{image_path}: {result.stdout!r}"
-            ) from exc
-
-        if parsed.get("is_error"):
-            raise ClaudeCodeVisionError(
-                f"`{self._claude_binary}` CLI reported is_error=true for "
-                f"{image_path}: {parsed.get('result')!r}"
-            )
-
-        if parsed.get("permission_denials"):
-            raise ClaudeCodeVisionError(
-                f"`{self._claude_binary}` CLI's Read tool call was denied "
-                f"for {image_path} (permission_denials="
-                f"{parsed['permission_denials']!r}); the model never "
-                f"actually saw the image"
-            )
-
-        return parsed["result"]
+        return run_claude_cli(
+            [
+                self._claude_binary,
+                "-p",
+                "--output-format",
+                "json",
+                "--tools",
+                "Read",
+                "--permission-mode",
+                "bypassPermissions",
+                "--no-session-persistence",
+                combined_prompt,
+            ],
+            claude_binary=self._claude_binary,
+            timeout_seconds=self._timeout_seconds,
+            context=f"analyzing {image_path}",
+        )
 
 
 # Confidence labels the prompt asks the model to use, mapped to this
@@ -299,66 +247,10 @@ class VisionLLMPosterDetector:
         """
         raw_response = self._chat_client.chat(frame.path, _PROMPT)
 
-        try:
-            parsed = json.loads(raw_response.strip())
-        except (json.JSONDecodeError, AttributeError):
-            logger.warning(
-                "vision LLM returned non-JSON response for frame %s: %r",
-                frame.path,
-                raw_response,
-            )
-            return []
-
-        if not isinstance(parsed, list):
-            logger.warning(
-                "vision LLM JSON response for frame %s was not a list: %r",
-                frame.path,
-                parsed,
-            )
-            return []
-
-        candidates: list[Candidate] = []
-        for item in parsed:
-            if not isinstance(item, dict):
-                logger.warning(
-                    "vision LLM response for frame %s had a non-object list "
-                    "item, skipping: %r",
-                    frame.path,
-                    item,
-                )
-                continue
-
-            title = item.get("title")
-            if not isinstance(title, str) or not title.strip():
-                logger.warning(
-                    "vision LLM response for frame %s had an item with no "
-                    "usable title, skipping: %r",
-                    frame.path,
-                    item,
-                )
-                continue
-            title = title.strip()
-
-            year = item.get("year")
-            if isinstance(year, bool):
-                year = None  # bool is a subclass of int; not a real year
-            elif isinstance(year, str) and year.strip().isdigit():
-                year = int(year.strip())
-            elif not isinstance(year, int):
-                year = None
-            raw_text = f"{title} ({year})" if year is not None else title
-
-            confidence_label = item.get("confidence")
-            if isinstance(confidence_label, str):
-                confidence_label = confidence_label.strip().lower()
-            confidence = CONFIDENCE_MAP.get(confidence_label, _DEFAULT_CONFIDENCE)
-
-            candidates.append(
-                Candidate(
-                    raw_text=raw_text,
-                    source=SourceTag.FRAME_VISUAL,
-                    confidence=confidence,
-                )
-            )
-
-        return candidates
+        return parse_movie_candidates(
+            raw_response,
+            confidence_map=CONFIDENCE_MAP,
+            default_confidence=_DEFAULT_CONFIDENCE,
+            source=SourceTag.FRAME_VISUAL,
+            log_context=f"vision LLM response for frame {frame.path}",
+        )

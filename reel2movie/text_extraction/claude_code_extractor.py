@@ -32,18 +32,15 @@ shared constants by import, not duplicating magic numbers (see
 
 from __future__ import annotations
 
-import json
-import logging
-import subprocess
 from typing import Protocol, runtime_checkable
 
+from reel2movie._candidate_parsing import parse_movie_candidates
+from reel2movie._claude_cli import ClaudeCliError, run_claude_cli
 from reel2movie.core.models import Candidate, SourceTag
 from reel2movie.text_extraction.regex_extractor import (
     HIGH_CONFIDENCE,
     MEDIUM_CONFIDENCE,
 )
-
-logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -58,17 +55,13 @@ class TextChatClient(Protocol):
     def chat(self, prompt: str) -> str: ...
 
 
-class ClaudeCodeTextError(RuntimeError):
-    """Raised when the `claude` CLI subprocess fails to produce a usable reply.
-
-    Covers: the subprocess timing out, the `claude` binary being missing,
-    not on `PATH`, or otherwise not runnable (any `OSError` raised by
-    `subprocess.run` itself, e.g. `FileNotFoundError`/`PermissionError`),
-    a non-zero exit code, stdout that isn't valid JSON, a parsed reply
-    with `is_error: true`, and a parsed reply with a non-empty
-    `permission_denials` list. Text-only mirror of
-    `visual.vision_llm_detector.ClaudeCodeVisionError`.
-    """
+# Alias (not a subclass) of the shared `ClaudeCliError` raised by
+# `run_claude_cli()` -- see `reel2movie._claude_cli` for the actual
+# error-raising logic this used to duplicate (same pattern as
+# `visual.vision_llm_detector.ClaudeCodeVisionError`). Kept under this name
+# since external code/tests still import/reference it as
+# `ClaudeCodeTextError`.
+ClaudeCodeTextError = ClaudeCliError
 
 
 class ClaudeCodeTextChatClient:
@@ -93,64 +86,23 @@ class ClaudeCodeTextChatClient:
                 non-JSON stdout, `is_error: true`, or a non-empty
                 `permission_denials` list in the parsed reply.
         """
-        try:
-            result = subprocess.run(
-                [
-                    self._claude_binary,
-                    "-p",
-                    "--output-format",
-                    "json",
-                    "--tools",
-                    "",
-                    "--permission-mode",
-                    "bypassPermissions",
-                    "--no-session-persistence",
-                    prompt,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ClaudeCodeTextError(
-                f"`{self._claude_binary}` CLI timed out after "
-                f"{self._timeout_seconds}s extracting movie titles from text"
-            ) from exc
-        except OSError as exc:
-            raise ClaudeCodeTextError(
-                f"could not run the 'claude' CLI (binary: "
-                f"{self._claude_binary!r}) -- is it installed and on PATH? "
-                f"({exc})"
-            ) from exc
-
-        if result.returncode != 0:
-            raise ClaudeCodeTextError(
-                f"`{self._claude_binary}` CLI exited {result.returncode} "
-                f"extracting movie titles from text: {result.stderr.strip()}"
-            )
-
-        try:
-            parsed = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise ClaudeCodeTextError(
-                f"`{self._claude_binary}` CLI returned non-JSON stdout: "
-                f"{result.stdout!r}"
-            ) from exc
-
-        if parsed.get("is_error"):
-            raise ClaudeCodeTextError(
-                f"`{self._claude_binary}` CLI reported is_error=true: "
-                f"{parsed.get('result')!r}"
-            )
-
-        if parsed.get("permission_denials"):
-            raise ClaudeCodeTextError(
-                f"`{self._claude_binary}` CLI's tool call was denied "
-                f"(permission_denials={parsed['permission_denials']!r}); "
-                f"the model's reply cannot be trusted"
-            )
-
-        return parsed["result"]
+        return run_claude_cli(
+            [
+                self._claude_binary,
+                "-p",
+                "--output-format",
+                "json",
+                "--tools",
+                "",
+                "--permission-mode",
+                "bypassPermissions",
+                "--no-session-persistence",
+                prompt,
+            ],
+            claude_binary=self._claude_binary,
+            timeout_seconds=self._timeout_seconds,
+            context="extracting movie titles from text",
+        )
 
 
 _PROMPT_TEMPLATE = """You are reading a piece of text (e.g. an Instagram reel caption or comment).
@@ -228,58 +180,10 @@ class ClaudeCodeCandidateExtractor:
         prompt = _PROMPT_TEMPLATE.replace("{text}", text)
         raw_response = self._chat_client.chat(prompt)
 
-        try:
-            parsed = json.loads(raw_response.strip())
-        except (json.JSONDecodeError, AttributeError):
-            logger.warning(
-                "claude CLI text extraction returned non-JSON response: %r",
-                raw_response,
-            )
-            return []
-
-        if not isinstance(parsed, list):
-            logger.warning(
-                "claude CLI text extraction JSON response was not a list: %r",
-                parsed,
-            )
-            return []
-
-        candidates: list[Candidate] = []
-        for item in parsed:
-            if not isinstance(item, dict):
-                logger.warning(
-                    "claude CLI text extraction response had a non-object "
-                    "list item, skipping: %r",
-                    item,
-                )
-                continue
-
-            title = item.get("title")
-            if not isinstance(title, str) or not title.strip():
-                logger.warning(
-                    "claude CLI text extraction response had an item with "
-                    "no usable title, skipping: %r",
-                    item,
-                )
-                continue
-            title = title.strip()
-
-            year = item.get("year")
-            if isinstance(year, bool):
-                year = None  # bool is a subclass of int; not a real year
-            elif isinstance(year, str) and year.strip().isdigit():
-                year = int(year.strip())
-            elif not isinstance(year, int):
-                year = None
-            raw_text = f"{title} ({year})" if year is not None else title
-
-            confidence_label = item.get("confidence")
-            if isinstance(confidence_label, str):
-                confidence_label = confidence_label.strip().lower()
-            confidence = _CONFIDENCE_MAP.get(confidence_label, _DEFAULT_CONFIDENCE)
-
-            candidates.append(
-                Candidate(raw_text=raw_text, source=source, confidence=confidence)
-            )
-
-        return candidates
+        return parse_movie_candidates(
+            raw_response,
+            confidence_map=_CONFIDENCE_MAP,
+            default_confidence=_DEFAULT_CONFIDENCE,
+            source=source,
+            log_context="claude CLI text extraction response",
+        )

@@ -84,7 +84,7 @@ class TestClaudeCodeTextChatClient:
         canned_stdout = _canned_cli_json(result_text='[{"title": "Dhobi Ghat"}]')
 
         with patch(
-            "reel2movie.text_extraction.claude_code_extractor.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
@@ -116,7 +116,7 @@ class TestClaudeCodeTextChatClient:
         )
 
         with patch(
-            "reel2movie.text_extraction.claude_code_extractor.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
@@ -136,7 +136,7 @@ class TestClaudeCodeTextChatClient:
         )
 
         with patch(
-            "reel2movie.text_extraction.claude_code_extractor.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
@@ -148,7 +148,7 @@ class TestClaudeCodeTextChatClient:
 
     def test_chat_raises_on_non_json_stdout(self) -> None:
         with patch(
-            "reel2movie.text_extraction.claude_code_extractor.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"],
@@ -163,7 +163,7 @@ class TestClaudeCodeTextChatClient:
 
     def test_chat_raises_on_nonzero_exit_code(self) -> None:
         with patch(
-            "reel2movie.text_extraction.claude_code_extractor.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["claude"],
@@ -178,7 +178,7 @@ class TestClaudeCodeTextChatClient:
 
     def test_chat_raises_clear_error_on_timeout_not_raw_exception(self) -> None:
         with patch(
-            "reel2movie.text_extraction.claude_code_extractor.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.side_effect = subprocess.TimeoutExpired(
                 cmd=["claude"], timeout=60.0
@@ -192,7 +192,7 @@ class TestClaudeCodeTextChatClient:
         self,
     ) -> None:
         with patch(
-            "reel2movie.text_extraction.claude_code_extractor.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.side_effect = FileNotFoundError(
                 "[Errno 2] No such file or directory: 'claude'"
@@ -206,7 +206,7 @@ class TestClaudeCodeTextChatClient:
         canned_stdout = _canned_cli_json(result_text="ok")
 
         with patch(
-            "reel2movie.text_extraction.claude_code_extractor.subprocess.run"
+            "reel2movie._claude_cli.subprocess.run"
         ) as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=["my-claude"], returncode=0, stdout=canned_stdout, stderr=""
