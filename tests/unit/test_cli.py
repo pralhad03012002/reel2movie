@@ -154,38 +154,38 @@ def test_fatal_pipeline_error_prints_clear_error_on_stderr_and_returns_nonzero(
     assert "unreachable" in captured.err
 
 
-def test_frame_count_override_reaches_pipeline_deps(monkeypatch):
+def test_frame_interval_seconds_override_reaches_pipeline_deps(monkeypatch):
     fake_deps = _fake_deps()
     monkeypatch.setattr(cli_module, "build_default_pipeline_deps", lambda: fake_deps)
 
-    seen_frame_counts = []
+    seen_frame_intervals = []
 
     def fake_run_pipeline(reel_url, deps):
-        seen_frame_counts.append(deps.frame_count)
+        seen_frame_intervals.append(deps.frame_interval_seconds)
         return PipelineResult(reel_url=reel_url, recommendations=[])
 
     monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
 
     exit_code = cli_module.main(
-        ["https://www.instagram.com/reel/abc123/", "--frame-count", "3"]
+        ["https://www.instagram.com/reel/abc123/", "--frame-interval-seconds", "3"]
     )
 
     assert exit_code == 0
-    assert seen_frame_counts == [3]
+    assert seen_frame_intervals == [3.0]
     # The override mutates the very deps object build_default_pipeline_deps
     # returned, not a copy.
-    assert fake_deps.frame_count == 3
+    assert fake_deps.frame_interval_seconds == 3.0
 
 
-def test_no_frame_count_override_leaves_default_untouched(monkeypatch):
+def test_no_frame_interval_seconds_override_leaves_default_untouched(monkeypatch):
     fake_deps = _fake_deps()
-    default_frame_count = fake_deps.frame_count
+    default_frame_interval_seconds = fake_deps.frame_interval_seconds
     monkeypatch.setattr(cli_module, "build_default_pipeline_deps", lambda: fake_deps)
 
-    seen_frame_counts = []
+    seen_frame_intervals = []
 
     def fake_run_pipeline(reel_url, deps):
-        seen_frame_counts.append(deps.frame_count)
+        seen_frame_intervals.append(deps.frame_interval_seconds)
         return PipelineResult(reel_url=reel_url, recommendations=[])
 
     monkeypatch.setattr(cli_module, "run_pipeline", fake_run_pipeline)
@@ -193,4 +193,4 @@ def test_no_frame_count_override_leaves_default_untouched(monkeypatch):
     exit_code = cli_module.main(["https://www.instagram.com/reel/abc123/"])
 
     assert exit_code == 0
-    assert seen_frame_counts == [default_frame_count]
+    assert seen_frame_intervals == [default_frame_interval_seconds]

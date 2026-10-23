@@ -1,8 +1,21 @@
 """Vision-LLM based `PosterDetector`: asks Claude whether a sampled video
-frame shows a movie poster, title card, or clearly identifiable scene.
+frame shows a movie poster/title card, OR a creator-burned on-screen text
+overlay naming a movie/show.
 
 This is the visual-fallback path (per `flow.md`, reached only once caption
 and creator-comment extraction both fail to yield a confident candidate).
+
+Widened scope (see this subtask's `PROGRESS.md` entry): the original
+version of this detector only asked about posters/title cards/identifiable
+scenes. That alone misses a common "rate these movies" / "movies like X"
+reel pattern where the creator types the title directly onto the video as
+a caption/lower-third/listicle-style text card -- never a poster at all.
+Rather than add a second model/backend/call, the SAME single Claude call
+per frame (`VisionChatClient.chat`, unchanged Protocol) now asks about BOTH
+things at once via `_PROMPT` below: this is additive to what the model is
+asked to look for, not a new architecture, new billing path, or schema
+change -- the output JSON contract
+(`[{"title", "year", "confidence"}, ...]`) is identical either way.
 
 Design note (see vast-wobbling-owl.md "Visual detection approach"): the
 actual provider call is wrapped behind a tiny local `VisionChatClient`
@@ -203,12 +216,21 @@ _DEFAULT_CONFIDENCE = CONFIDENCE_MAP["medium"]
 
 _PROMPT = """You are analyzing a single still frame extracted from a video.
 
-Look at the image and determine: is a movie poster, a movie title card, or
-a clearly identifiable movie scene visible in this image?
+Look at the image and determine EITHER of the following:
 
-- If you can identify one or more movies, name each movie's title (and the
-  release year, if you can tell it).
-- If nothing identifiable is visible, say so by returning an empty list.
+1. Is a movie poster, a movie title card, or a clearly identifiable movie
+   scene visible in this image?
+2. Is there any creator-added ON-SCREEN TEXT overlay in this image (a
+   caption, a lower-third, a listicle-style text card, etc. -- text that
+   was added on top of the video, not text that's part of the scene
+   itself) that names a movie or TV show? This is common in "rate these
+   movies" / "movies like X" style videos, where the creator types each
+   title directly onto the frame instead of showing a poster.
+
+- If you can identify one or more movies/shows via EITHER signal above,
+  name each one's title (and the release year, if you can tell it).
+- If nothing identifiable is visible via either signal, say so by
+  returning an empty list.
 
 Respond with ONLY a JSON array, and nothing else: no prose before or after
 it, no markdown code fences. Each element must be an object with keys
@@ -231,7 +253,14 @@ class VisionLLMPosterDetector:
     """`PosterDetector` that asks a vision-chat-capable LLM about a frame.
 
     Structurally satisfies `core.protocols.PosterDetector`
-    (`detect(frame) -> list[Candidate]`) without inheriting from it.
+    (`detect(frame) -> list[Candidate]`) without inheriting from it. Per
+    `_PROMPT` above, "about a frame" covers both posters/title cards/scenes
+    AND creator-burned on-screen text overlays naming a movie/show -- the
+    class/Protocol name stays `VisionLLMPosterDetector`/`PosterDetector`
+    (not renamed to something broader) since those names are structural
+    identifiers used across `core/protocols.py`, `pipeline/deps.py`,
+    `pipeline/waterfall.py`, and their tests -- renaming is out of scope
+    for a prompt-only widening and would ripple pointlessly.
     """
 
     def __init__(self, chat_client: VisionChatClient) -> None:

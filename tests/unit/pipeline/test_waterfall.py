@@ -2,11 +2,19 @@
 
 Fakes for all four Protocols (`Ingestor`, `CandidateExtractor`,
 `PosterDetector`, `TMDBClient`) live in this file; none of them touch the
-network, a subprocess, or any real third-party client. `sample_frames`
+network, a subprocess, or any real third-party client. `sample_frames_at_interval`
 (a free function, not a Protocol method) is monkeypatched at
-`reel2movie.pipeline.waterfall.sample_frames` -- the name waterfall.py
-imports it under -- rather than adding a new injection seam that isn't in
-the plan.
+`reel2movie.pipeline.waterfall.sample_frames_at_interval` -- the name
+waterfall.py imports it under -- rather than adding a new injection seam
+that isn't in the plan. Most tests ALSO monkeypatch `dedupe_similar_frames`
+to a pass-through identity fake, since they're not about dedup specifically
+and real perceptual dedup would need real on-disk images to compare
+(`sample_frames_at_interval`'s fakes here hand back `FrameSample`s whose
+paths don't necessarily point at real/distinct image files). The one test
+that IS about proving the dedup step is actually wired in
+(`test_dedup_step_is_wired_in_and_filters_frames_before_detection` below)
+deliberately does NOT patch `dedupe_similar_frames` -- it lets the real
+dedup implementation run against real on-disk fixture images instead.
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from reel2movie.core.models import (
     Candidate,
@@ -176,15 +185,21 @@ def _make_deps(
     text_extractor: FakeCandidateExtractor,
     poster_detector: FakePosterDetector | None = None,
     tmdb_client: FakeTMDBClient | None = None,
-    frame_count: int = 6,
+    frame_interval_seconds: float = 1.0,
 ) -> PipelineDeps:
     return PipelineDeps(
         ingestor=ingestor,
         text_extractor=text_extractor,
         poster_detector=poster_detector or FakePosterDetector(),
         tmdb_client=tmdb_client or FakeTMDBClient(),
-        frame_count=frame_count,
+        frame_interval_seconds=frame_interval_seconds,
     )
+
+
+def _identity_dedupe(frames, threshold=None):
+    """Pass-through fake for `dedupe_similar_frames`, for tests that don't
+    care about dedup behavior itself (see module docstring)."""
+    return list(frames)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +313,7 @@ def test_creator_comment_confident_short_circuits_visual_and_filters_comments():
     assert result.recommendations[0].source == SourceTag.CREATOR_COMMENT
 
 
-def test_both_text_sources_empty_triggers_visual_fallback_once():
+def test_both_text_sources_empty_triggers_visual_fallback_once(monkeypatch):
     frame_candidate = Candidate(
         raw_text="Oldboy (2003)", source=SourceTag.FRAME_VISUAL, confidence=0.8
     )
@@ -318,16 +333,16 @@ def test_both_text_sources_empty_triggers_visual_fallback_once():
 
     sample_calls = []
 
-    def fake_sample_frames(video_path, n, duration_seconds, **kwargs):
-        sample_calls.append((video_path, n, duration_seconds))
+    def fake_sample_frames_at_interval(video_path, interval_seconds, duration_seconds, **kwargs):
+        sample_calls.append((video_path, interval_seconds, duration_seconds))
         return [frame]
 
-    original = waterfall_module.sample_frames
-    waterfall_module.sample_frames = fake_sample_frames
-    try:
-        result = run_pipeline(URL, deps)
-    finally:
-        waterfall_module.sample_frames = original
+    monkeypatch.setattr(
+        waterfall_module, "sample_frames_at_interval", fake_sample_frames_at_interval
+    )
+    monkeypatch.setattr(waterfall_module, "dedupe_similar_frames", _identity_dedupe)
+
+    result = run_pipeline(URL, deps)
 
     assert len(ingestor.ensure_video_calls) == 1
     assert len(sample_calls) == 1
@@ -336,28 +351,31 @@ def test_both_text_sources_empty_triggers_visual_fallback_once():
     assert result.recommendations[0].source == SourceTag.FRAME_VISUAL
 
 
-def test_frame_count_passed_through_to_sample_frames(monkeypatch):
+def test_frame_interval_seconds_passed_through_to_sample_frames_at_interval(monkeypatch):
     ingestor = FakeIngestor(metadata=_ingest_result(caption=""))
     extractor = FakeCandidateExtractor()
     deps = _make_deps(
         ingestor=ingestor,
         text_extractor=extractor,
-        frame_count=9,
+        frame_interval_seconds=0.5,
     )
 
     import reel2movie.pipeline.waterfall as waterfall_module
 
     captured = {}
 
-    def fake_sample_frames(video_path, n, duration_seconds, **kwargs):
-        captured["n"] = n
+    def fake_sample_frames_at_interval(video_path, interval_seconds, duration_seconds, **kwargs):
+        captured["interval_seconds"] = interval_seconds
         return []
 
-    monkeypatch.setattr(waterfall_module, "sample_frames", fake_sample_frames)
+    monkeypatch.setattr(
+        waterfall_module, "sample_frames_at_interval", fake_sample_frames_at_interval
+    )
+    monkeypatch.setattr(waterfall_module, "dedupe_similar_frames", _identity_dedupe)
 
     run_pipeline(URL, deps)
 
-    assert captured["n"] == 9
+    assert captured["interval_seconds"] == 0.5
 
 
 def test_nothing_resolves_anywhere_returns_result_without_raising():
@@ -701,8 +719,8 @@ def test_visual_fallback_internal_error_is_swallowed_not_raised(monkeypatch):
 
 def test_visual_fallback_cleans_up_its_own_temp_frame_directory(monkeypatch):
     """Regression test for the temp-dir leak: `waterfall.py` must create its
-    own `output_dir`, pass it to `sample_frames`, and remove it (via
-    `shutil.rmtree`) once poster detection is done with the frames --
+    own `output_dir`, pass it to `sample_frames_at_interval`, and remove it
+    (via `shutil.rmtree`) once poster detection is done with the frames --
     `frame_sampler.py` itself never cleans up what it creates.
     """
     frame_candidate = Candidate(
@@ -712,7 +730,7 @@ def test_visual_fallback_cleans_up_its_own_temp_frame_directory(monkeypatch):
     extractor = FakeCandidateExtractor()  # no confident candidates anywhere
     captured_dirs = []
 
-    def fake_sample_frames(video_path, n, duration_seconds, *, output_dir=None):
+    def fake_sample_frames_at_interval(video_path, interval_seconds, duration_seconds, *, output_dir=None):
         # The directory must already exist (created by waterfall.py) and
         # be passed through explicitly -- not left as None for
         # frame_sampler.py to invent its own untracked tempfile.mkdtemp().
@@ -726,8 +744,9 @@ def test_visual_fallback_cleans_up_its_own_temp_frame_directory(monkeypatch):
 
     poster_detector = FakePosterDetector()
     # Make the poster detector return the candidate for whatever frame path
-    # it's actually handed (captured_dirs isn't known until sample_frames
-    # runs), via a tiny closure instead of the dict-keyed fake.
+    # it's actually handed (captured_dirs isn't known until
+    # sample_frames_at_interval runs), via a tiny closure instead of the
+    # dict-keyed fake.
     def detect(frame):
         poster_detector.calls.append(frame)
         return [frame_candidate]
@@ -744,15 +763,19 @@ def test_visual_fallback_cleans_up_its_own_temp_frame_directory(monkeypatch):
 
     import reel2movie.pipeline.waterfall as waterfall_module
 
-    monkeypatch.setattr(waterfall_module, "sample_frames", fake_sample_frames)
+    monkeypatch.setattr(
+        waterfall_module, "sample_frames_at_interval", fake_sample_frames_at_interval
+    )
+    monkeypatch.setattr(waterfall_module, "dedupe_similar_frames", _identity_dedupe)
 
     result = run_pipeline(URL, deps)
 
     assert len(captured_dirs) == 1
     frames_dir = captured_dirs[0]
     # The directory existed while frames were being read (asserted inside
-    # fake_sample_frames above) but is gone by the time run_pipeline
-    # returns -- cleaned up after poster detection finished using it.
+    # fake_sample_frames_at_interval above) but is gone by the time
+    # run_pipeline returns -- cleaned up after poster detection finished
+    # using it.
     assert not frames_dir.exists()
     assert len(result.recommendations) == 1
     assert result.recommendations[0].source == SourceTag.FRAME_VISUAL
@@ -769,7 +792,7 @@ def test_visual_fallback_cleans_up_temp_dir_even_if_poster_detection_raises(
     extractor = FakeCandidateExtractor()
     captured_dirs = []
 
-    def fake_sample_frames(video_path, n, duration_seconds, *, output_dir=None):
+    def fake_sample_frames_at_interval(video_path, interval_seconds, duration_seconds, *, output_dir=None):
         captured_dirs.append(output_dir)
         return [FrameSample(path=output_dir / "frame_000.jpg", timestamp_seconds=1.0)]
 
@@ -789,7 +812,10 @@ def test_visual_fallback_cleans_up_temp_dir_even_if_poster_detection_raises(
 
     import reel2movie.pipeline.waterfall as waterfall_module
 
-    monkeypatch.setattr(waterfall_module, "sample_frames", fake_sample_frames)
+    monkeypatch.setattr(
+        waterfall_module, "sample_frames_at_interval", fake_sample_frames_at_interval
+    )
+    monkeypatch.setattr(waterfall_module, "dedupe_similar_frames", _identity_dedupe)
 
     result = run_pipeline(URL, deps)
 
@@ -805,14 +831,14 @@ def test_visual_fallback_with_none_duration_and_failed_probe_logs_warning_and_sk
 ):
     """Regression test (updated for the duration-probing fallback):
     `result.duration_seconds=None` must be handled as its own distinct,
-    clearly-logged case -- not passed into `sample_frames` (which would
-    raise `TypeError` on `None <= 0` and get silently swallowed by the
-    blanket `except Exception`, indistinguishable from a genuine "visual
-    detector found nothing" outcome). `ensure_video` now runs
-    unconditionally (new behavior: it's required to attempt the
+    clearly-logged case -- not passed into `sample_frames_at_interval`
+    (which would raise `TypeError` on `None <= 0` and get silently
+    swallowed by the blanket `except Exception`, indistinguishable from a
+    genuine "visual detector found nothing" outcome). `ensure_video` now
+    runs unconditionally (new behavior: it's required to attempt the
     duration-probing fallback at all), but when probing ALSO fails,
-    duration is still genuinely undeterminable and `sample_frames` must
-    never be called.
+    duration is still genuinely undeterminable and
+    `sample_frames_at_interval` must never be called.
     """
     ingestor = FakeIngestor(metadata=_ingest_result(caption="", duration_seconds=None))
     extractor = FakeCandidateExtractor()  # nothing confident from text sources
@@ -821,16 +847,19 @@ def test_visual_fallback_with_none_duration_and_failed_probe_logs_warning_and_sk
     import reel2movie.pipeline.waterfall as waterfall_module
     from reel2movie.visual.frame_sampler import FrameExtractionError
 
-    def sample_frames_must_not_be_called(*args, **kwargs):
+    def sample_frames_at_interval_must_not_be_called(*args, **kwargs):
         raise AssertionError(
-            "sample_frames must never be called when duration is undeterminable"
+            "sample_frames_at_interval must never be called when duration "
+            "is undeterminable"
         )
 
     def probe_duration_seconds_fails(video_path):
         raise FrameExtractionError("could not find a Duration: line; corrupt file")
 
     monkeypatch.setattr(
-        waterfall_module, "sample_frames", sample_frames_must_not_be_called
+        waterfall_module,
+        "sample_frames_at_interval",
+        sample_frames_at_interval_must_not_be_called,
     )
     monkeypatch.setattr(
         waterfall_module, "probe_duration_seconds", probe_duration_seconds_fails
@@ -852,8 +881,8 @@ def test_visual_fallback_with_none_duration_and_failed_probe_logs_warning_and_sk
 def test_visual_fallback_none_duration_falls_back_to_probed_duration(monkeypatch):
     """`result.duration_seconds=None` must no longer short-circuit the
     visual fallback: `ensure_video` runs, `probe_duration_seconds` is
-    tried, and on success `sample_frames` is called with the PROBED
-    duration, not a stale/wrong one.
+    tried, and on success `sample_frames_at_interval` is called with the
+    PROBED duration, not a stale/wrong one.
     """
     frame_candidate = Candidate(
         raw_text="Oldboy (2003)", source=SourceTag.FRAME_VISUAL, confidence=0.8
@@ -881,21 +910,25 @@ def test_visual_fallback_none_duration_falls_back_to_probed_duration(monkeypatch
 
     sample_calls = []
 
-    def fake_sample_frames(video_path, n, duration_seconds, **kwargs):
-        sample_calls.append((video_path, n, duration_seconds))
+    def fake_sample_frames_at_interval(video_path, interval_seconds, duration_seconds, **kwargs):
+        sample_calls.append((video_path, interval_seconds, duration_seconds))
         return [frame]
 
     monkeypatch.setattr(
         waterfall_module, "probe_duration_seconds", fake_probe_duration_seconds
     )
-    monkeypatch.setattr(waterfall_module, "sample_frames", fake_sample_frames)
+    monkeypatch.setattr(
+        waterfall_module, "sample_frames_at_interval", fake_sample_frames_at_interval
+    )
+    monkeypatch.setattr(waterfall_module, "dedupe_similar_frames", _identity_dedupe)
 
     result = run_pipeline(URL, deps)
 
     assert len(ingestor.ensure_video_calls) == 1
     assert len(probe_calls) == 1
     assert len(sample_calls) == 1
-    # sample_frames must receive the PROBED duration, not None/stale.
+    # sample_frames_at_interval must receive the PROBED duration, not
+    # None/stale.
     assert sample_calls[0][2] == probed_duration
     assert len(result.recommendations) == 1
     assert result.recommendations[0].source == SourceTag.FRAME_VISUAL
@@ -920,8 +953,8 @@ def test_visual_fallback_with_valid_metadata_duration_never_probes(monkeypatch):
 
     sample_calls = []
 
-    def fake_sample_frames(video_path, n, duration_seconds, **kwargs):
-        sample_calls.append((video_path, n, duration_seconds))
+    def fake_sample_frames_at_interval(video_path, interval_seconds, duration_seconds, **kwargs):
+        sample_calls.append((video_path, interval_seconds, duration_seconds))
         return []
 
     monkeypatch.setattr(
@@ -929,9 +962,78 @@ def test_visual_fallback_with_valid_metadata_duration_never_probes(monkeypatch):
         "probe_duration_seconds",
         probe_duration_seconds_must_not_be_called,
     )
-    monkeypatch.setattr(waterfall_module, "sample_frames", fake_sample_frames)
+    monkeypatch.setattr(
+        waterfall_module, "sample_frames_at_interval", fake_sample_frames_at_interval
+    )
+    monkeypatch.setattr(waterfall_module, "dedupe_similar_frames", _identity_dedupe)
 
     run_pipeline(URL, deps)
 
     assert len(ingestor.ensure_video_calls) == 1
-    assert sample_calls == [(ingestor.video_path, deps.frame_count, 30.0)]
+    assert sample_calls == [
+        (ingestor.video_path, deps.frame_interval_seconds, 30.0)
+    ]
+
+
+def test_dedup_step_is_wired_in_and_filters_frames_before_detection(
+    monkeypatch, tmp_path
+):
+    """Proves the wiring (sample -> dedup -> detect), not the dedup
+    algorithm's own correctness (that's `tests/unit/visual/test_frame_dedup.py`'s
+    job). `sample_frames_at_interval` is patched to return several
+    `FrameSample`s, several of which are pixel-identical copies of a single
+    tiny fixture image on disk; the REAL `dedupe_similar_frames` runs
+    (nothing fake/identity patched over it here), and the assertion is that
+    `poster_detector.detect()` was only called for the deduped subset --
+    i.e. strictly fewer times than the number of frames `sample_frames_at_interval`
+    produced.
+    """
+    fixture_image_path = tmp_path / "fixture.jpg"
+    Image.new("RGB", (64, 64), color=(10, 20, 30)).save(fixture_image_path, "JPEG")
+
+    different_image_path = tmp_path / "different.jpg"
+    Image.new("RGB", (64, 64), color=(250, 240, 230)).save(different_image_path, "JPEG")
+
+    # Five frames: four pixel-identical copies of the same fixture image
+    # (all pointing at the SAME file -- dedup only reads pixel content, not
+    # path identity) and one genuinely different frame.
+    frames = [
+        FrameSample(path=fixture_image_path, timestamp_seconds=0.0),
+        FrameSample(path=fixture_image_path, timestamp_seconds=1.0),
+        FrameSample(path=fixture_image_path, timestamp_seconds=2.0),
+        FrameSample(path=different_image_path, timestamp_seconds=3.0),
+        FrameSample(path=fixture_image_path, timestamp_seconds=4.0),
+    ]
+
+    ingestor = FakeIngestor(metadata=_ingest_result(caption=""))
+    extractor = FakeCandidateExtractor()  # nothing confident from text sources
+    poster_detector = FakePosterDetector()
+    deps = _make_deps(
+        ingestor=ingestor,
+        text_extractor=extractor,
+        poster_detector=poster_detector,
+    )
+
+    import reel2movie.pipeline.waterfall as waterfall_module
+
+    def fake_sample_frames_at_interval(video_path, interval_seconds, duration_seconds, **kwargs):
+        return frames
+
+    monkeypatch.setattr(
+        waterfall_module, "sample_frames_at_interval", fake_sample_frames_at_interval
+    )
+    # Deliberately NOT patching dedupe_similar_frames -- the real
+    # implementation must run here.
+
+    run_pipeline(URL, deps)
+
+    # The first fixture-image frame is kept unconditionally; the next two
+    # identical copies are dropped as near-duplicates of it; the
+    # genuinely-different frame is kept and becomes the new baseline; the
+    # final fixture-image frame is then compared against THAT baseline
+    # (the different image), so it's different enough to be kept too.
+    # Either way, detect() must have been called strictly fewer times than
+    # the 5 raw sampled frames -- proving the dedup step actually ran
+    # between sampling and detection, not just that detection happened.
+    assert len(poster_detector.calls) < len(frames)
+    assert len(poster_detector.calls) >= 1

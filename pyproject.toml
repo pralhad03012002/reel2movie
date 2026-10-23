@@ -8,6 +8,7 @@ dependencies = [
     "requests",
     "rapidfuzz",
     "imageio-ffmpeg",
+    "Pillow",
     "anthropic>=1.0",
     "python-dotenv",
 ]

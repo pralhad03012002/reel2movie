@@ -6,11 +6,12 @@ happens once, on whichever step's pooled candidates "won" (flow.md step
 [5]: "For every candidate gathered from whichever step won"). This module
 depends only on the Protocol types in `core/protocols.py`
 (`Ingestor`, `CandidateExtractor`, `PosterDetector`, `TMDBClient`) plus the
-two free functions the task spec explicitly names as already-built and
+free functions the task spec explicitly names as already-built and
 callable from here (`tmdb.resolver.resolve_candidate`,
-`visual.frame_sampler.sample_frames`) -- never any concrete *class* from
-`ingest/`, `visual/`, `tmdb/`, or `text_extraction/`. The one place allowed
-to construct those concrete classes is `pipeline/deps.py`.
+`visual.frame_sampler.sample_frames_at_interval`,
+`visual.frame_dedup.dedupe_similar_frames`) -- never any concrete *class*
+from `ingest/`, `visual/`, `tmdb/`, or `text_extraction/`. The one place
+allowed to construct those concrete classes is `pipeline/deps.py`.
 """
 
 from __future__ import annotations
@@ -30,10 +31,11 @@ from reel2movie.core.models import (
 from reel2movie.pipeline.deps import PipelineDeps
 from reel2movie.text_extraction.regex_extractor import HIGH_CONFIDENCE
 from reel2movie.tmdb.resolver import resolve_candidate
+from reel2movie.visual.frame_dedup import dedupe_similar_frames
 from reel2movie.visual.frame_sampler import (
     FrameExtractionError,
     probe_duration_seconds,
-    sample_frames,
+    sample_frames_at_interval,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,7 +128,7 @@ def _extract_from_visual(result: IngestResult, deps: PipelineDeps) -> list[Candi
     1. Duration genuinely undeterminable: metadata was missing/invalid
        *and* probing the downloaded file also failed or also produced an
        invalid value. Logged as its own warning and returns `[]` without
-       ever calling `sample_frames`. Note `ensure_video` has already run
+       ever calling `sample_frames_at_interval`. Note `ensure_video` has already run
        by this point -- a reel whose video is corrupt/unprobeable now
        always pays for the download attempt, which the old
        check-before-downloading flow could sometimes skip. Accepted cost
@@ -140,15 +142,35 @@ def _extract_from_visual(result: IngestResult, deps: PipelineDeps) -> list[Candi
        probing is new, not-yet-proven-reliable behavior worth being able
        to distinguish from metadata-sourced duration in logs.
 
-    Frame-directory lifecycle: `sample_frames` (per its own docstring)
-    hands back a *caller-owned* temp directory of JPEGs when no
-    `output_dir` is given -- nothing in `visual/frame_sampler.py` ever
-    cleans it up. This function is that caller: it creates its own temp
-    directory, passes it explicitly as `output_dir`, and removes it with
-    `shutil.rmtree` once poster detection has read every frame (frames are
-    only needed transiently for `deps.poster_detector.detect()`, not
-    after), inside a `finally` so cleanup happens even if poster detection
-    or frame extraction raises partway through.
+    Frame-directory lifecycle: `sample_frames_at_interval` (per its own
+    docstring, shared with `sample_frames`) hands back a *caller-owned*
+    temp directory of JPEGs when no `output_dir` is given -- nothing in
+    `visual/frame_sampler.py` ever cleans it up. This function is that
+    caller: it creates its own temp directory, passes it explicitly as
+    `output_dir`, and removes it with `shutil.rmtree` once poster
+    detection has read every frame (frames are only needed transiently for
+    `deps.poster_detector.detect()`, not after), inside a `finally` so
+    cleanup happens even if poster detection or frame extraction raises
+    partway through.
+
+    Sampling strategy (changed in this subtask -- see PROGRESS.md "Subtask
+    9"): dense, fixed-interval sampling across the WHOLE video
+    (`sample_frames_at_interval`, every `deps.frame_interval_seconds`,
+    including the very first/last frame) replaced the old sparse,
+    N-equally-spaced, 5%-95%-windowed `sample_frames` call. Rationale: a
+    creator-burned on-screen text overlay naming a movie (as opposed to a
+    poster/title card) can be on screen for as little as 1-2 seconds and
+    can appear right at the start or end of a reel -- both of which the
+    old sparse sampling could miss entirely (the text window falling
+    between two of the 6 sparse samples, or the 5%-95% window excluding
+    the very edges where an intro/outro text card lives). Dense sampling
+    alone would multiply the number of expensive vision-LLM calls per
+    reel, so `dedupe_similar_frames` runs as a cheap, local,
+    Pillow-based pre-filter immediately after sampling and BEFORE any
+    `deps.poster_detector.detect()` call -- collapsing a long static shot
+    (a held poster, a talking-head segment) down to the one frame that
+    actually represents it, so a long static run doesn't burn one Claude
+    call per near-duplicate frame.
     """
     frames_dir = Path(tempfile.mkdtemp(prefix="reel2movie_frames_"))
     try:
@@ -197,14 +219,17 @@ def _extract_from_visual(result: IngestResult, deps: PipelineDeps) -> list[Candi
                 duration_seconds,
             )
 
-        frames = sample_frames(
+        frames = sample_frames_at_interval(
             video_path,
-            deps.frame_count,
+            deps.frame_interval_seconds,
             duration_seconds,
             output_dir=frames_dir,
         )
+        unique_frames = dedupe_similar_frames(
+            frames, threshold=deps.frame_dedup_threshold
+        )
         candidates: list[Candidate] = []
-        for frame in frames:
+        for frame in unique_frames:
             candidates.extend(deps.poster_detector.detect(frame))
         return candidates
     except Exception:

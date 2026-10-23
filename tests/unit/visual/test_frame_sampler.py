@@ -30,6 +30,7 @@ from reel2movie.visual.frame_sampler import (
     FrameExtractionError,
     probe_duration_seconds,
     sample_frames,
+    sample_frames_at_interval,
 )
 
 VIDEO_DURATION_SECONDS = 6.0
@@ -179,6 +180,107 @@ def test_ffmpeg_timeout_raises_frame_extraction_error(sample_video: Path, tmp_pa
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=30)
         with pytest.raises(FrameExtractionError, match="timed out"):
             sample_frames(sample_video, n=1, duration_seconds=VIDEO_DURATION_SECONDS, output_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# sample_frames_at_interval
+# ---------------------------------------------------------------------------
+
+
+def test_sample_frames_at_interval_returns_correctly_spaced_timestamps(
+    sample_video: Path, tmp_path: Path
+) -> None:
+    interval = 2.0
+    samples = sample_frames_at_interval(
+        sample_video, interval, VIDEO_DURATION_SECONDS, output_dir=tmp_path
+    )
+
+    # 0.0, 2.0, 4.0 -- 6.0 is excluded (duration_seconds is exclusive).
+    timestamps = [s.timestamp_seconds for s in samples]
+    assert timestamps == pytest.approx([0.0, 2.0, 4.0])
+
+    for sample in samples:
+        assert sample.path.exists()
+        assert sample.path.stat().st_size > 0
+
+
+def test_sample_frames_at_interval_includes_timestamp_at_the_very_start(
+    sample_video: Path, tmp_path: Path
+) -> None:
+    """Unlike `sample_frames`'s 5%-95% window, this must include a sample
+    at/near 0.0 -- the whole point being that transient on-screen text can
+    appear right at the start of the video."""
+    samples = sample_frames_at_interval(
+        sample_video, 1.0, VIDEO_DURATION_SECONDS, output_dir=tmp_path
+    )
+
+    assert samples[0].timestamp_seconds == pytest.approx(0.0)
+
+
+def test_sample_frames_at_interval_includes_a_timestamp_near_the_tail(
+    sample_video: Path, tmp_path: Path
+) -> None:
+    """The last sampled timestamp must be close to the video's actual end
+    (within one interval of it), unlike `sample_frames`'s 95% cutoff which
+    would exclude the final ~5% entirely."""
+    interval = 1.0
+    samples = sample_frames_at_interval(
+        sample_video, interval, VIDEO_DURATION_SECONDS, output_dir=tmp_path
+    )
+
+    last_timestamp = samples[-1].timestamp_seconds
+    assert VIDEO_DURATION_SECONDS - interval <= last_timestamp < VIDEO_DURATION_SECONDS
+
+
+@pytest.mark.parametrize("bad_interval", [0.0, -1.0])
+def test_sample_frames_at_interval_invalid_interval_raises_value_error(
+    sample_video: Path, tmp_path: Path, bad_interval: float
+) -> None:
+    with pytest.raises(ValueError, match="interval_seconds must be"):
+        sample_frames_at_interval(
+            sample_video, bad_interval, VIDEO_DURATION_SECONDS, output_dir=tmp_path
+        )
+
+
+@pytest.mark.parametrize("bad_duration", [0.0, -1.0])
+def test_sample_frames_at_interval_invalid_duration_raises_value_error(
+    sample_video: Path, tmp_path: Path, bad_duration: float
+) -> None:
+    with pytest.raises(ValueError, match="duration_seconds must be"):
+        sample_frames_at_interval(
+            sample_video, 1.0, bad_duration, output_dir=tmp_path
+        )
+
+
+def test_sample_frames_at_interval_propagates_frame_extraction_error(
+    sample_video: Path, tmp_path: Path
+) -> None:
+    """The shared `_extract_frame_at` helper's error handling must still
+    apply through this entry point too -- doesn't need exhaustive
+    re-coverage of every ffmpeg failure mode (that's `sample_frames`'s
+    existing tests' job), just confirmation the error actually propagates
+    here."""
+    fake_stderr = "fake ffmpeg failure: no such filter or seek error"
+    with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["ffmpeg"], returncode=1, stdout="", stderr=fake_stderr
+        )
+        with pytest.raises(FrameExtractionError, match=fake_stderr):
+            sample_frames_at_interval(
+                sample_video, 1.0, VIDEO_DURATION_SECONDS, output_dir=tmp_path
+            )
+
+
+def test_sample_frames_at_interval_uses_distinct_filename_pattern(
+    sample_video: Path, tmp_path: Path
+) -> None:
+    """Output filenames use `frame_{i:04d}.jpg`, distinct from
+    `sample_frames`'s `frame_{i:03d}.jpg` pattern."""
+    samples = sample_frames_at_interval(
+        sample_video, 2.0, VIDEO_DURATION_SECONDS, output_dir=tmp_path
+    )
+
+    assert samples[0].path.name == "frame_0000.jpg"
 
 
 # ---------------------------------------------------------------------------

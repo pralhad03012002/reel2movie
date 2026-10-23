@@ -7157,3 +7157,449 @@ end-to-end against the real CLI post-refactor, at a level unit tests
 (mocked `subprocess.run`) can't catch.
 
 VERDICT: ACCEPTABLE
+
+## Subtask 9 — dense frame sampling + perceptual dedup + on-screen text detection — status: done
+
+This is the BUILD step only -- no review pass has happened yet (a separate
+pass does that next), so this entry is deliberately `status: building`,
+not `done`, and the "Review findings" section below is a placeholder, not
+fabricated findings.
+
+### Motivation (why this subtask exists)
+
+The visual fallback (`pipeline/waterfall.py`'s `_extract_from_visual`)
+previously sampled only 6 sparse, equally-spaced frames per reel
+(`visual/frame_sampler.sample_frames`, within the inner 5%-95% window) and
+asked a vision LLM whether each showed a movie poster/title card
+(`visual/vision_llm_detector.VisionLLMPosterDetector`). This misses a
+common real-world pattern -- "rate these movies" / "movies like X" reels
+where the creator burns the title directly onto the video as a transient
+on-screen text overlay (a caption, a lower-third, a listicle-style text
+card) rather than ever showing an actual poster. If that overlay is only
+on screen for 1-2 seconds, it can fall entirely between two of the 6
+sparse samples -- a false negative the old sampling strategy couldn't
+avoid no matter how good the vision prompt was, since the frame carrying
+the answer was never even extracted. Three changes together fix this:
+(1) dense 1-frame-per-second sampling across the WHOLE video including
+both edges, (2) a cheap perceptual-dedup pre-filter so a long static shot
+doesn't multiply the number of (expensive, Claude-CLI-backed) vision calls
+per reel, and (3) widening the existing vision prompt to also ask about
+on-screen text, reusing the exact same `VisionChatClient` backend (no new
+provider, no new billing path).
+
+### What's built
+
+Files created:
+- `reel2movie/visual/frame_dedup.py` (new module) — pure function
+  `dedupe_similar_frames(frames: list[FrameSample], threshold: float =
+  0.04) -> list[FrameSample]`. Pillow-only (`Image`, `ImageChops`,
+  `ImageStat`), no ffmpeg/subprocess, no network. Always keeps `frames[0]`
+  unconditionally (empty input returns `[]`); every later frame is
+  fingerprinted (`Image.open(path)` inside a `with` block so file handles
+  don't accumulate across dozens of frames, `.convert("L")` grayscale,
+  `.resize((64, 64))`, `.copy()` to detach from the closed file handle) and
+  compared via `ImageChops.difference(...)` +
+  `ImageStat.Stat(diff).mean[0] / 255.0` (a single float in `[0, 1]`,
+  unambiguous since both images are single-band "L" mode) against the
+  fingerprint of the last frame that was actually KEPT -- not the
+  immediately-previous candidate. That distinction is the whole point: a
+  long run of near-static frames collapses to exactly one kept frame
+  because every candidate in the run is judged against the SAME original
+  kept frame, instead of a naive "compare to previous" walk that would let
+  slow drift accumulate past the threshold one small step at a time
+  without ever being compared back to where the run actually started.
+  `threshold=0.04` is explicitly documented in the module docstring as an
+  UNVALIDATED starting guess, not tuned against real reel footage --
+  callers/reviewers should expect this number to be revisited once real
+  reels are run through it.
+- `tests/unit/visual/test_frame_dedup.py` (7 tests) — all pure
+  Pillow-generated synthetic JPEGs written to `tmp_path` (`Image.new("RGB",
+  (64, 64), color=...)`), no ffmpeg involved:
+  - empty input → `[]`; single frame → returned unchanged.
+  - a 5-frame run of the identical solid color collapses to just the
+    first frame (proves the long-static-shot collapsing behavior, not
+    "every other frame kept").
+  - a substantially different frame amid a same-color run is kept, and
+    becomes the new baseline.
+  - `test_compares_against_last_kept_not_immediately_previous_frame` --
+    the test specifically designed to distinguish "compare to last KEPT"
+    from the simpler-but-wrong "compare to immediately previous frame":
+    frame A (black) is kept as the baseline, frame B (far from A) is kept
+    and becomes the new baseline, frame C (close to B, computed to land
+    just under the threshold against B) is dropped. A naive
+    "compare-to-previous" implementation would behave identically on this
+    particular 3-frame case (C is compared to B either way, since B is
+    both "previous" and "last kept" here) -- the test's real evidentiary
+    weight is that A is NOT reconsulted for C's decision; if the
+    implementation ever regressed to "reset to frame zero after every
+    keep", this and the collapsing-run test together would catch it, since
+    neither test's expected output is consistent with resetting to A.
+  - two threshold-boundary tests using the SAME pair of grayscale values
+    (100,100,100) vs (105,105,105) -- independently measured (see below)
+    to produce a real mean-abs-difference of `5/255 ≈ 0.0196` after the
+    JPEG round-trip and resize -- asserting it's dropped at
+    `threshold=0.03` (0.0196 < 0.03) and kept at `threshold=0.01` (0.0196 >
+    0.01). This value was verified by actually running the fingerprinting
+    code against the real Pillow-generated+reloaded JPEGs (not assumed
+    from theory), confirming JPEG's lossy compression doesn't perturb a
+    solid-color block's pixel values enough to break the boundary math at
+    these two specific threshold values.
+- `reel2movie/visual/frame_sampler.py` — refactored, not rewritten:
+  - Extracted a new private `_extract_frame_at(video_path: Path,
+    timestamp: float, frame_path: Path) -> None` helper containing exactly
+    the subprocess-call + timeout/nonzero-exit/exit-0-but-empty-file error
+    handling that used to live inline in `sample_frames`'s for-loop,
+    raising `FrameExtractionError` exactly as before (same messages, same
+    conditions). Both `sample_frames` and the new
+    `sample_frames_at_interval` (below) call this one helper -- there is no
+    duplicated ffmpeg-invocation logic between them now.
+  - Added public `sample_frames_at_interval(video_path: Path,
+    interval_seconds: float, duration_seconds: float, *, output_dir: Path
+    | None = None) -> list[FrameSample]`. Timestamps: a plain `while t <
+    duration_seconds: timestamps.append(t); t += interval_seconds` walk
+    starting at `0.0` -- deliberately NOT `sample_frames`'s 5%-95% window,
+    since that dodge exists specifically to avoid intro/outro bumpers for
+    POSTER detection (a poster is rarely the very first/last thing shown);
+    this function exists for reading on-screen TEXT, which can
+    legitimately appear right at the very start or end of a reel, so
+    skipping those edges here would defeat the point of dense sampling.
+    Raises `ValueError` on `interval_seconds <= 0` or `duration_seconds <=
+    0`, same style/message pattern as `sample_frames`. Same
+    caller-owns-`output_dir`/`mkdtemp()`-when-omitted contract as
+    `sample_frames` (see Subtask 5's "Temp-directory ownership/cleanup
+    decision" section above -- unchanged reasoning, just documented again
+    in the new function's own docstring). Output filenames use
+    `frame_{i:04d}.jpg` (4 digits vs. `sample_frames`'s 3) -- a deliberate
+    visual signal that these came from a different function, not a
+    correctness requirement (a 60s reel at the 1s default interval needs
+    only ~60 frames, nowhere near 3-digit overflow), in case a future
+    caller ever points both functions at the same directory (neither does
+    today).
+  - Module docstring rewritten to explain both sampling strategies and
+    when each is used.
+- `tests/unit/visual/test_frame_sampler.py` — 9 new tests added (2
+  parametrized into 2 cases each, so 11 actual runs) for
+  `sample_frames_at_interval`, reusing the existing module-scoped
+  `sample_video` fixture (6s synthetic `testsrc` at `rate=10`): correct
+  timestamp spacing for a 2s interval over the 6s fixture (`[0.0, 2.0,
+  4.0]`, confirming `6.0` itself is excluded per the exclusive-of-duration
+  rule); a timestamp at/near `0.0` (unlike `sample_frames`, which starts at
+  5% of duration); a timestamp within one interval of the true end (unlike
+  `sample_frames`'s 95% cutoff); `interval_seconds<=0` and
+  `duration_seconds<=0` each raise `ValueError`; one representative
+  `FrameExtractionError`-propagates case via the same `subprocess.run`
+  mocking pattern already used for `sample_frames` (not exhaustively
+  re-proving every ffmpeg failure mode, since `_extract_frame_at` is the
+  single shared implementation already fully covered by `sample_frames`'s
+  existing tests); and a check that the first frame's filename is
+  `frame_0000.jpg` (the distinct 4-digit pattern).
+- `reel2movie/visual/vision_llm_detector.py` — prompt widened, architecture
+  untouched:
+  - `_PROMPT` now asks about EITHER (a) a movie poster/title card/clearly
+    identifiable scene (the original ask) OR (b) a creator-added on-screen
+    TEXT overlay (caption/lower-third/listicle-style text card -- text
+    added on top of the video, not text that's part of the filmed scene
+    itself) naming a movie/show. The output JSON contract
+    (`[{"title", "year", "confidence"}, ...]`) is unchanged -- this is
+    additive to what the model looks for, not a schema change, and it's
+    still the exact same single Claude call per frame (no second call, no
+    new backend).
+  - Module and class docstrings (`VisionLLMPosterDetector`) updated to
+    describe the widened scope. Deliberately did NOT rename
+    `VisionLLMPosterDetector`, `PosterDetector`, or `VisionChatClient` --
+    those are structural identifiers referenced across
+    `core/protocols.py`, `pipeline/deps.py`, `pipeline/waterfall.py`, and
+    their tests; renaming for a prompt-only change would ripple pointlessly
+    and wasn't asked for.
+  - `tests/unit/visual/test_vision_llm_detector.py` needed NO changes: its
+    tests all assert on parsed `Candidate` output from canned fake
+    responses (the established pattern), never on the literal `_PROMPT`
+    text -- confirmed by reading the whole file before touching anything.
+- `reel2movie/pipeline/waterfall.py` — wired the new sample → dedup →
+  detect pipeline into `_extract_from_visual`, replacing the old
+  sample → detect pipeline:
+  ```python
+  frames = sample_frames_at_interval(
+      video_path, deps.frame_interval_seconds, duration_seconds, output_dir=frames_dir
+  )
+  unique_frames = dedupe_similar_frames(frames, threshold=deps.frame_dedup_threshold)
+  candidates: list[Candidate] = []
+  for frame in unique_frames:
+      candidates.extend(deps.poster_detector.detect(frame))
+  ```
+  Everything else in that function is structurally unchanged: duration
+  resolution (metadata-or-probe, with the same three distinct logged
+  outcomes), `ensure_video` timing, and the `frames_dir`
+  create-pass-cleanup-in-`finally` lifecycle via `shutil.rmtree`. Imports
+  updated (`sample_frames_at_interval` + `probe_duration_seconds` from
+  `frame_sampler`, `dedupe_similar_frames` from the new `frame_dedup`
+  module); module docstring's list of free functions this module is
+  allowed to call updated to match. One stale docstring reference to
+  `sample_frames` inside the duration-undeterminable-outcome explanation
+  was also corrected to `sample_frames_at_interval` while making this
+  change (found by grepping the file for every remaining `sample_frames`
+  mention after the edit, not missed).
+- `reel2movie/pipeline/deps.py` — `PipelineDeps.frame_count: int =
+  _DEFAULT_FRAME_COUNT` (= 6) replaced with two fields:
+  `frame_interval_seconds: float = _DEFAULT_FRAME_INTERVAL_SECONDS` (= 1.0)
+  and `frame_dedup_threshold: float = _DEFAULT_FRAME_DEDUP_THRESHOLD` (=
+  0.04, deliberately mirroring `frame_dedup.py`'s own default exactly).
+  Both module constants carry the same "not yet empirically tuned against
+  real reel footage" caveat as `frame_dedup.py`'s docstring -- 1.0s was
+  picked because it gives a 1-2 second on-screen text overlay a
+  near-guaranteed chance of landing in at least one sampled frame, not
+  because it was measured against real reels. `build_default_pipeline_deps()`
+  needed no changes beyond what the field rename implies -- confirmed by
+  reading it directly, it never referenced `frame_count` (or either new
+  field) by name; both new fields simply keep their dataclass defaults
+  through that function untouched.
+- `reel2movie/cli.py` — `--frame-count` (`type=int`) replaced with
+  `--frame-interval-seconds` (`type=float`, default `None` meaning "use
+  `PipelineDeps`' own default" -- same override pattern as before,
+  overriding `deps.frame_interval_seconds` instead of `deps.frame_count`).
+  Help text updated, including an explicit note that no flag is exposed
+  for the dedup threshold (deliberately -- see "Deferred / judgment calls"
+  below). Module docstring's `sample_frames` seam-patching example updated
+  to `sample_frames_at_interval` to match what `test_waterfall.py` actually
+  patches now.
+- `pyproject.toml` — added `"Pillow"` to `dependencies` (already present
+  in the environment at 11.3.0, confirmed via `python3 -c "import PIL;
+  print(PIL.__version__)"` before relying on it).
+
+### Test fixes/additions across the suite (frame_count → frame_interval_seconds/frame_dedup_threshold, sample_frames → sample_frames_at_interval)
+
+- `tests/unit/pipeline/test_waterfall.py`:
+  - `_make_deps()` helper's `frame_count: int = 6` param renamed to
+    `frame_interval_seconds: float = 1.0`.
+  - Added a module-level `_identity_dedupe(frames, threshold=None)`
+    pass-through fake, and a module docstring explaining the per-test
+    choice: most existing tests monkeypatch BOTH
+    `waterfall_module.sample_frames_at_interval` (renamed from
+    `sample_frames`, same seam-patching convention) AND
+    `waterfall_module.dedupe_similar_frames` (to the identity fake) --
+    since those tests aren't about dedup specifically and the fake frames
+    they hand back don't necessarily point at real, distinct on-disk
+    images for a real perceptual diff to operate on meaningfully.
+  - Every test that previously patched `sample_frames` now patches
+    `sample_frames_at_interval` with a 3-arg signature
+    `(video_path, interval_seconds, duration_seconds, **kwargs)` (renamed
+    from `n` to `interval_seconds` to match the new function's actual
+    parameter), and (except where noted) also patches
+    `dedupe_similar_frames` to `_identity_dedupe`. Renamed:
+    `test_frame_count_passed_through_to_sample_frames` →
+    `test_frame_interval_seconds_passed_through_to_sample_frames_at_interval`;
+    `deps.frame_count` → `deps.frame_interval_seconds` in the one
+    remaining direct-field assertion
+    (`test_visual_fallback_with_valid_metadata_duration_never_probes`).
+  - New test: `test_dedup_step_is_wired_in_and_filters_frames_before_detection`
+    -- the ONE test, per the task spec, that proves the wiring (not the
+    dedup algorithm's own correctness, which `test_frame_dedup.py` already
+    covers in isolation). Patches `sample_frames_at_interval` to return 5
+    `FrameSample`s -- 4 of them pointing at the SAME on-disk fixture JPEG
+    (a solid `(10, 20, 30)` 64x64 image) and 1 pointing at a substantially
+    different fixture (`(250, 240, 230)`) -- and deliberately does NOT
+    patch `dedupe_similar_frames`, letting the real implementation run.
+    Asserts `poster_detector.calls` (the `FakePosterDetector`'s own call
+    log) has strictly fewer entries than the 5 raw sampled frames and at
+    least 1 -- proving frames were actually filtered between sampling and
+    detection, not merely that detection ran at all. (Traced through by
+    hand: kept = [frame0 (first, unconditional), frame3 (different enough
+    from frame0's baseline), frame4 (different enough from frame3, which
+    became the new baseline after frame3 was kept)] = 3 of 5 kept, 2
+    dropped -- consistent with "strictly fewer than 5, at least 1".)
+- `tests/unit/pipeline/test_deps.py`:
+  `test_builds_without_raising_when_required_env_vars_present`'s
+  `assert deps.frame_count > 0` → `assert deps.frame_interval_seconds > 0`
+  plus an added `assert deps.frame_dedup_threshold >= 0` (covering both new
+  fields, not just the renamed one).
+- `tests/unit/test_cli.py`: `test_frame_count_override_reaches_pipeline_deps`
+  → `test_frame_interval_seconds_override_reaches_pipeline_deps` (asserts
+  `--frame-interval-seconds 3` reaches `deps.frame_interval_seconds` as
+  `3.0`, and that the override mutates the actual object, not a copy, same
+  as before); `test_no_frame_count_override_leaves_default_untouched` →
+  `test_no_frame_interval_seconds_override_leaves_default_untouched`
+  (unchanged in substance, just renamed/re-pointed at the new field).
+
+### Deferred / judgment calls the orchestrating conversation should know about before review
+
+- **`threshold=0.04` (both in `frame_dedup.py` and as
+  `PipelineDeps.frame_dedup_threshold`'s default) and
+  `frame_interval_seconds=1.0` are UNVALIDATED starting guesses**, exactly
+  as the task spec instructed -- neither has been run against a single
+  real downloaded reel yet (only the synthetic ffmpeg `testsrc` fixture and
+  pure-Pillow synthetic images in this subtask's own tests). The task spec
+  explicitly says the orchestrating conversation plans to validate/adjust
+  these empirically against real reels after this subtask lands; flagging
+  this prominently rather than letting a reviewer mistake the number for
+  something already tuned.
+- **No CLI flag for the dedup threshold**, per the task spec's explicit
+  instruction not to speculatively add one. It remains reachable only by
+  constructing/mutating a `PipelineDeps` directly (as
+  `build_default_pipeline_deps()` + manual attribute assignment, same
+  pattern the CLI itself uses for `frame_interval_seconds`).
+- **`dedupe_similar_frames`'s fingerprint size (`64x64`, grayscale) was not
+  separately parameterized** -- it's a module-level constant
+  (`_FINGERPRINT_SIZE`), not exposed to callers at all. The task spec's
+  function signature only exposes `threshold`, so this follows that
+  signature exactly rather than adding an unasked-for knob.
+- **Dense sampling plus real-world reel lengths**: a 1-second interval over
+  a, say, 90-second reel produces up to 90 raw frames before dedup runs.
+  This subtask did not add any upper bound/cap on frame count for
+  unusually long input videos -- the task spec didn't ask for one, and
+  `dedupe_similar_frames` is expected to collapse most of a long static
+  reel down to a small kept set before any frame reaches the (expensive)
+  vision LLM call regardless. Worth watching in review if genuinely long
+  reels turn out to be common in practice.
+- **Pillow version**: added as a bare `"Pillow"` dependency (no version
+  pin) in `pyproject.toml`, matching the un-pinned style already used for
+  `yt-dlp`/`requests`/`rapidfuzz` in that same file (only `anthropic` has a
+  floor pin, `>=1.0`) -- not a special-cased decision for this subtask,
+  just consistency with the existing file's convention.
+
+### Test results
+
+```
+python3 -m pytest tests/unit -q
+261 passed in 3.58s
+```
+
+244 (prior total, per the last Follow-up entry above) + 17 new tests (7 in
+new `tests/unit/visual/test_frame_dedup.py` + 9 new
+`sample_frames_at_interval` tests in `tests/unit/visual/test_frame_sampler.py`
++ 1 new `test_dedup_step_is_wired_in_and_filters_frames_before_detection`
+in `tests/unit/pipeline/test_waterfall.py`) = 261. Renamed tests
+(`test_frame_count_...` → `test_frame_interval_seconds_...`, etc.) don't
+add to this count, only genuinely new tests do. Count only grew, never
+dropped -- every pre-existing test (after being updated for the
+rename/wiring change, not deleted) still passes.
+
+### Review findings
+
+Reviewed via `/code-review` (medium, forked) on the current working-tree
+diff (`git status`/`git diff` -- nothing committed), `/ponytail:ponytail-review`
+on the six named files (`visual/frame_dedup.py`, `visual/frame_sampler.py`,
+`visual/vision_llm_detector.py`, `pipeline/waterfall.py`,
+`pipeline/deps.py`, `cli.py`), and independent manual verification of the
+specific behavioral contract points the task called out, not trusted from
+the build report above.
+
+**Own verification of the five called-out behavioral points:**
+
+1. **`dedupe_similar_frames` compares each candidate against the last-KEPT
+   frame, confirmed by reading the loop directly** (`visual/frame_dedup.py`
+   L112-120): `last_kept_fingerprint` is only ever reassigned inside the
+   `if difference >= threshold:` branch (i.e. only when a frame is actually
+   kept), and every candidate's `_mean_abs_difference` call always reads
+   whatever `last_kept_fingerprint` currently holds -- a dropped candidate
+   never updates it. This is genuinely "compare to last kept," not "compare
+   to immediately previous."
+2. **`sample_frames_at_interval` covers ~0 to the tail with no 5%/95%
+   dodge, confirmed by reading `_compute`-style logic directly**
+   (`visual/frame_sampler.py` L286-290): a plain `t = 0.0; while t <
+   duration_seconds: ...; t += interval_seconds` walk, with no `0.05 *` /
+   `0.95 *` window anywhere in this function (that window is
+   `_compute_timestamps`'s, used only by the separate `sample_frames`).
+   First timestamp is exactly `0.0`; last is `< duration_seconds`, not
+   `0.95 * duration_seconds`.
+3. **Waterfall wiring: sample -> dedup -> detect, in order, using
+   `deps.frame_interval_seconds`/`deps.frame_dedup_threshold`, confirmed by
+   reading `_extract_from_visual` directly** (`pipeline/waterfall.py`
+   L222-234): `sample_frames_at_interval(video_path,
+   deps.frame_interval_seconds, duration_seconds, output_dir=frames_dir)`
+   feeds straight into `dedupe_similar_frames(frames,
+   threshold=deps.frame_dedup_threshold)`, and only `unique_frames` (the
+   dedup output) is iterated into `deps.poster_detector.detect()`. No
+   hardcoded `6`/`0.04` literal anywhere in this function -- both values
+   come from `deps`.
+4. **Zero changes outside this subtask's scope, confirmed via `git
+   status`:** `git status --porcelain -- reel2movie/ingest
+   reel2movie/tmdb reel2movie/text_extraction reel2movie/core
+   reel2movie/config.py` returns nothing. The full `git status` shows
+   changes confined to `PROGRESS.md`, `pyproject.toml`, `cli.py`,
+   `pipeline/deps.py`, `pipeline/waterfall.py`, `visual/frame_sampler.py`,
+   `visual/vision_llm_detector.py`, their tests, plus the two new
+   untracked files (`visual/frame_dedup.py` + its test).
+5. **Independent test run, not trusted from the build report:**
+   `python3 -m pytest tests/unit -q` -> **261 passed in 3.41s**, run
+   directly in this review pass -- matches the build report's claimed
+   count exactly.
+
+**Vision prompt widened correctly, output contract unchanged (confirmed by
+reading `_PROMPT` directly, `visual/vision_llm_detector.py` L217-249):**
+the prompt now asks EITHER (1) poster/title-card/identifiable-scene (the
+original ask) OR (2) a creator-added on-screen TEXT overlay naming a
+movie/show, explicitly distinguishing it from text that's part of the
+filmed scene. The required JSON shape
+(`[{"title", "year"?, "confidence"}, ...]`) and its three confidence labels
+are untouched between the old and new prompt text -- this is additive to
+what the model looks for, not a schema change, confirmed by diffing the
+prompt string directly rather than assuming from the PROGRESS.md narrative.
+
+**From `/code-review` (correctness) + `/ponytail:ponytail-review`
+(over-engineering), all non-blocking:**
+
+- **Non-blocking, flagged prominently** -- `pipeline/waterfall.py`'s module
+  docstring still claims "Implements `flow.md` steps [2]-[6] exactly," but
+  `flow.md` step [4] explicitly says "pick N equally-spaced timestamps
+  (not a dense scan)" (confirmed by reading `flow.md` L31-34 directly) --
+  the literal opposite of what `_extract_from_visual` now does. This is a
+  deliberate, sanctioned behavior change (the entire point of this
+  subtask, per its own Motivation section above), not an accidental bug,
+  but `flow.md` itself was not updated to reflect the new dense-sampling
+  contract, so the module's "implements flow.md exactly" claim is now
+  false on its face. Same category/severity as Subtask 7's
+  `CONFIDENCE_THRESHOLD`-literal finding (non-blocking, correct as
+  shipped, but a doc/spec-drift risk for the next reader who trusts the
+  docstring over the code). Recommend updating `flow.md` step [4]'s text
+  in a follow-up, not re-opening this subtask for it.
+- **Non-blocking** -- `visual/frame_sampler.py`'s `sample_frames` (the old
+  sparse, N-equally-spaced, 5%-95%-windowed function) now has zero
+  production call sites: `pipeline/waterfall.py`'s only call site was
+  switched to `sample_frames_at_interval`, and a repo-wide grep
+  (`grep -rn "sample_frames\b" reel2movie/`) confirms nothing outside
+  `frame_sampler.py`'s own definition/docstrings calls it. It is exercised
+  only by its own dedicated tests now. Not flagged blocking since the task
+  spec explicitly asked for a refactor ("not rewritten") that keeps
+  `sample_frames` intact and only adds `sample_frames_at_interval`
+  alongside it -- but a future subtask should decide whether to delete it
+  (and its tests) or find it a real caller.
+- **Non-blocking** -- `pipeline/deps.py`'s `_DEFAULT_FRAME_DEDUP_THRESHOLD
+  = 0.04` is a second, independently-declared literal that merely mirrors
+  `visual/frame_dedup.py`'s own `_DEFAULT_THRESHOLD = 0.04` by convention,
+  not by import. Both docstrings explicitly flag the *value* as an
+  unvalidated placeholder expected to change -- but nothing enforces the
+  two literals staying equal once it does, raising the same "two sources
+  of truth, kept in sync only by convention" risk Subtask 7's
+  `CONFIDENCE_THRESHOLD` finding already named and accepted as
+  non-blocking. Recommend importing `frame_dedup`'s constant into
+  `deps.py` instead of re-declaring it, in a follow-up.
+- **Non-blocking, low severity** -- `sample_frames_at_interval`'s timestamp
+  walk (`t = 0.0; while t < duration_seconds: ...; t += interval_seconds`)
+  accumulates ordinary binary floating-point error across repeated
+  addition. For round values like the current default (`1.0`) this is a
+  non-issue, but a caller passing a non-binary-exact interval (e.g. `0.3`)
+  can get one more or one fewer frame than a clean `duration/interval`
+  division implies, depending on which side of the true boundary the
+  accumulated error lands on. Worst case is a single extra/missing sample
+  at the tail of an already-dense scan, not a crash or a silent large
+  miscount -- not worth blocking a subtask whose own stated defaults are
+  round numbers, but worth a `math.ceil`/integer-step rewrite if a
+  non-round interval ever becomes a real override value.
+- **From `/ponytail:ponytail-review`:** the diff is otherwise lean --
+  `_extract_frame_at` is a genuine, newly-shared helper eliminating real
+  duplication between `sample_frames` and `sample_frames_at_interval`
+  (the opposite of over-engineering), `frame_dedup.py`'s three functions
+  each do exactly one job with no speculative parameterization beyond
+  what the task spec's own function signature asked for, and `cli.py`'s
+  flag rename is a pure 1:1 swap. No reinvented stdlib, no unneeded
+  dependency, no speculative abstraction beyond the two items above (both
+  already non-blocking and already named by `/code-review` too).
+
+No blocking findings. Both new-module algorithmic claims (compare-to-last-
+kept, whole-video coverage), the waterfall wiring order and its use of the
+new `deps` fields, the untouched-directories claim, the independently-run
+test count, and the widened-but-contract-preserving vision prompt all check
+out under direct, independent verification -- not merely re-reading the
+build report's claims.
+
+VERDICT: ACCEPTABLE

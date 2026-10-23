@@ -26,7 +26,8 @@ def test_builds_without_raising_when_required_env_vars_present(monkeypatch):
     deps = build_default_pipeline_deps()
 
     assert isinstance(deps, PipelineDeps)
-    assert deps.frame_count > 0
+    assert deps.frame_interval_seconds > 0
+    assert deps.frame_dedup_threshold >= 0
 
 
 def test_builds_without_anthropic_key_when_backend_defaults_to_claude_code(

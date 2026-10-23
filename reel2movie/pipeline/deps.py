@@ -36,11 +36,24 @@ from reel2movie.visual.vision_llm_detector import (
     VisionLLMPosterDetector,
 )
 
-# How many frames `run_pipeline`'s visual-fallback step samples when a
-# `PipelineDeps` doesn't override it. Not tuned against real data -- a
-# round, modest number for "a handful of equally-spaced samples", per
-# flow.md step [4]'s "not a dense scan" instruction.
-_DEFAULT_FRAME_COUNT = 6
+# How often (in seconds) `run_pipeline`'s visual-fallback step samples
+# frames when a `PipelineDeps` doesn't override it. 1.0 was picked so a
+# transient on-screen text overlay held for only 1-2 seconds (per this
+# subtask's `PROGRESS.md` entry -- the motivating case: creator-burned
+# "movies like X" text cards that can fall entirely between two sparse
+# samples) has a near-guaranteed chance of landing in at least one sampled
+# frame. NOT yet empirically tuned against real reel footage -- a
+# deliberate starting guess, same caveat as `visual/frame_dedup.py`'s
+# threshold.
+_DEFAULT_FRAME_INTERVAL_SECONDS = 1.0
+
+# Perceptual-dedup threshold (see `visual/frame_dedup.dedupe_similar_frames`)
+# applied to the dense frame samples above before any frame reaches the
+# (expensive) vision LLM call. Mirrors `frame_dedup.py`'s own default
+# exactly -- NOT yet empirically tuned against real reel footage, a
+# deliberate starting guess the orchestrating conversation plans to
+# validate/adjust against real reels after this subtask lands.
+_DEFAULT_FRAME_DEDUP_THRESHOLD = 0.04
 
 
 @dataclass
@@ -56,7 +69,20 @@ class PipelineDeps:
     text_extractor: CandidateExtractor
     poster_detector: PosterDetector
     tmdb_client: TMDBClient
-    frame_count: int = _DEFAULT_FRAME_COUNT
+    # Interval (seconds) between dense frame samples in the visual-fallback
+    # step (see `visual/frame_sampler.sample_frames_at_interval`). Replaces
+    # the old `frame_count` (sparse, N equally-spaced samples) now that the
+    # visual fallback samples densely across the WHOLE video instead -- see
+    # `pipeline/waterfall.py`'s `_extract_from_visual` for the full
+    # rationale.
+    frame_interval_seconds: float = _DEFAULT_FRAME_INTERVAL_SECONDS
+    # Perceptual-dedup threshold (see `visual/frame_dedup.dedupe_similar_frames`)
+    # applied to those dense samples before any frame reaches the vision
+    # LLM call, so a long static shot doesn't burn one Claude call per
+    # near-identical frame. Internal-only knob: no CLI flag exposes this
+    # (see `cli.py`'s docstring) since no one has asked for it to be
+    # user-tunable yet.
+    frame_dedup_threshold: float = _DEFAULT_FRAME_DEDUP_THRESHOLD
     # Optional: a `TextChatClient` for `tmdb.resolver.resolve_candidate()`'s
     # caption-context disambiguation step (see PROGRESS.md's "Follow-up —
     # disambiguate tied exact matches" section). Defaults to `None` so any

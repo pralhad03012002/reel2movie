@@ -1,4 +1,5 @@
-"""Sample still frames from a video at N equally-spaced timestamps.
+"""Sample still frames from a video, either sparsely (N equally-spaced
+timestamps) or densely (every `interval_seconds`).
 
 This is the visual-fallback path only (per `flow.md`, reached rarely in the
 real pipeline, only once caption and creator-comment extraction both fail to
@@ -13,6 +14,29 @@ the standard, reliable way to grab a single frame at an exact seek point.
 imageio's higher-level frame-reading API is not used here: it's built around
 sequential/streamed reads, which is awkward for a handful of independent,
 arbitrary-timestamp seeks.
+
+Two public sampling strategies live here, for two different jobs:
+
+- `sample_frames` — sparse, N equally-spaced samples within the *inner*
+  5%-95% window of the video, used for poster/title-card detection. A
+  poster/title card is typically held on screen for a while and is never
+  the very first/last thing shown (intro bumpers, outros, black frames
+  tend to sit at the very start/end), so skipping those edges avoids
+  wasting samples on frames unlikely to show a poster at all.
+- `sample_frames_at_interval` — dense, fixed-interval samples covering the
+  WHOLE video including both edges, used for reading transient on-screen
+  TEXT overlays (see `pipeline/waterfall.py`'s `_extract_from_visual` and
+  this subtask's `PROGRESS.md` entry). Unlike a poster, a creator-burned
+  text caption naming a movie can appear for as little as 1-2 seconds and
+  can appear right at the start or end of a reel (e.g. a "swipe up for
+  more" style intro card, or a final "which one's your favorite" card) —
+  the 5%-95%-window dodge that's correct for poster detection would
+  actively defeat dense text-reading sampling by skipping exactly the
+  frames most likely to carry a quick title-card overlay.
+
+Both strategies share the same per-timestamp ffmpeg invocation (see
+`_extract_frame_at`) — only which timestamps get requested, and the output
+filename pattern, differ between them.
 """
 
 from __future__ import annotations
@@ -65,6 +89,83 @@ def _compute_timestamps(n: int, duration_seconds: float) -> list[float]:
     return [start + i * step for i in range(n)]
 
 
+def _extract_frame_at(video_path: Path, timestamp: float, frame_path: Path) -> None:
+    """Extract a single frame from `video_path` at `timestamp` into `frame_path`.
+
+    Shared by `sample_frames` and `sample_frames_at_interval` — the only
+    difference between those two callers is WHICH timestamps/filenames get
+    requested, never how a single frame is actually pulled out of the
+    video, so that one subprocess invocation (with its timeout/error
+    handling) lives here exactly once rather than being copy-pasted per
+    caller.
+
+    Invokes the `imageio_ffmpeg`-bundled ffmpeg binary directly:
+    `ffmpeg -ss <timestamp> -i <video_path> -frames:v 1 -pix_fmt yuvj420p
+    -y <frame_path>`.
+
+    Raises:
+        FrameExtractionError: if the ffmpeg subprocess times out, returns
+            a nonzero exit code, or returns exit code 0 but the expected
+            output file is missing or empty (ffmpeg can exit 0 while
+            writing nothing, e.g. "Output file is empty, nothing was
+            encoded" when seeking near the edge of a sparse video) — the
+            message includes ffmpeg's captured stderr when available.
+    """
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    # -pix_fmt yuvj420p: forces a pixel format the mjpeg encoder always
+    # accepts. Some source videos (including this module's own synthetic
+    # testsrc fixture) decode to a pixel format (e.g. yuv444p, or
+    # non-full-range yuv420p) that ffmpeg's mjpeg encoder rejects with
+    # "Non full-range YUV is non-standard" / "Error while opening encoder"
+    # and silently writes zero bytes. Forcing the format here is cheap and
+    # fixes that without depending on how any given input video happens to
+    # be encoded.
+    command = [
+        ffmpeg_exe,
+        "-ss",
+        str(timestamp),
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "yuvj420p",
+        "-y",
+        str(frame_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=_FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise FrameExtractionError(
+            f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS}s extracting "
+            f"frame at timestamp {timestamp:.3f}s from {video_path}"
+        ) from exc
+
+    if result.returncode != 0:
+        raise FrameExtractionError(
+            f"ffmpeg failed to extract frame at timestamp {timestamp:.3f}s "
+            f"from {video_path} (exit code {result.returncode}): "
+            f"{result.stderr}"
+        )
+
+    # ffmpeg can exit 0 while writing nothing at all (observed: seeking
+    # near the edge of a sparse video produces "Output file is empty,
+    # nothing was encoded" in stderr alongside a zero exit code). Trust
+    # the output file, not the exit code: it must exist and be non-empty.
+    if not frame_path.exists() or frame_path.stat().st_size == 0:
+        raise FrameExtractionError(
+            f"ffmpeg reported success (exit code 0) extracting frame at "
+            f"timestamp {timestamp:.3f}s from {video_path}, but the "
+            f"output file {frame_path} is missing or empty. ffmpeg "
+            f"stderr: {result.stderr}"
+        )
+
+
 def sample_frames(
     video_path: Path,
     n: int,
@@ -75,9 +176,8 @@ def sample_frames(
     """Extract N equally-spaced frames from `video_path` as JPEGs.
 
     Timestamps are computed by `_compute_timestamps` (see its docstring).
-    Each frame is extracted via a direct subprocess call to the
-    `imageio_ffmpeg`-bundled ffmpeg binary:
-    `ffmpeg -ss <timestamp> -i <video_path> -frames:v 1 -y <output_path>`.
+    Each frame is extracted via `_extract_frame_at` (a direct subprocess
+    call to the `imageio_ffmpeg`-bundled ffmpeg binary).
 
     Output directory handling (caller-ownership question, resolved here):
     if `output_dir` is given, frames are written there (caller owns it,
@@ -114,65 +214,85 @@ def sample_frames(
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     timestamps = _compute_timestamps(n, duration_seconds)
 
     samples: list[FrameSample] = []
     for i, timestamp in enumerate(timestamps):
         frame_path = output_dir / f"frame_{i:03d}.jpg"
-        # -pix_fmt yuvj420p: forces a pixel format the mjpeg encoder always
-        # accepts. Some source videos (including this module's own
-        # synthetic testsrc fixture) decode to a pixel format (e.g.
-        # yuv444p, or non-full-range yuv420p) that ffmpeg's mjpeg encoder
-        # rejects with "Non full-range YUV is non-standard" / "Error while
-        # opening encoder" and silently writes zero bytes. Forcing the
-        # format here is cheap and fixes that without depending on how any
-        # given input video happens to be encoded.
-        command = [
-            ffmpeg_exe,
-            "-ss",
-            str(timestamp),
-            "-i",
-            str(video_path),
-            "-frames:v",
-            "1",
-            "-pix_fmt",
-            "yuvj420p",
-            "-y",
-            str(frame_path),
-        ]
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=_FFMPEG_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise FrameExtractionError(
-                f"ffmpeg timed out after {_FFMPEG_TIMEOUT_SECONDS}s extracting "
-                f"frame at timestamp {timestamp:.3f}s from {video_path}"
-            ) from exc
+        _extract_frame_at(video_path, timestamp, frame_path)
+        samples.append(FrameSample(path=frame_path, timestamp_seconds=timestamp))
 
-        if result.returncode != 0:
-            raise FrameExtractionError(
-                f"ffmpeg failed to extract frame at timestamp {timestamp:.3f}s "
-                f"from {video_path} (exit code {result.returncode}): "
-                f"{result.stderr}"
-            )
+    return samples
 
-        # ffmpeg can exit 0 while writing nothing at all (observed: seeking
-        # near the edge of a sparse video produces "Output file is empty,
-        # nothing was encoded" in stderr alongside a zero exit code). Trust
-        # the output file, not the exit code: it must exist and be non-empty.
-        if not frame_path.exists() or frame_path.stat().st_size == 0:
-            raise FrameExtractionError(
-                f"ffmpeg reported success (exit code 0) extracting frame at "
-                f"timestamp {timestamp:.3f}s from {video_path}, but the "
-                f"output file {frame_path} is missing or empty. ffmpeg "
-                f"stderr: {result.stderr}"
-            )
 
+def sample_frames_at_interval(
+    video_path: Path,
+    interval_seconds: float,
+    duration_seconds: float,
+    *,
+    output_dir: Path | None = None,
+) -> list[FrameSample]:
+    """Extract frames from `video_path` every `interval_seconds`, start to end.
+
+    Timestamps are `0.0, interval_seconds, 2*interval_seconds, ...` up to
+    (exclusive of) `duration_seconds` -- a plain `while t < duration_seconds`
+    walk, always yielding at least the `0.0` timestamp since
+    `duration_seconds > 0` is enforced below. Deliberately NOT
+    `sample_frames`'s 5%-95% window: that dodge exists to avoid intro/outro
+    bumpers for POSTER detection, where a poster is unlikely to be the very
+    first/last thing shown. This function exists for reading creator-burned
+    ON-SCREEN TEXT overlays instead, which can legitimately appear right at
+    the very start or end of a reel (e.g. an opening "swipe for more" card
+    or a closing "which one's yours" card) -- skipping those edges here
+    would defeat the whole point of dense sampling by skipping exactly the
+    frames most likely to carry a quick title card. See the module
+    docstring for the full `sample_frames` vs. `sample_frames_at_interval`
+    rationale.
+
+    Each frame is extracted via `_extract_frame_at` (shared with
+    `sample_frames` -- see its docstring), so both functions raise/behave
+    identically on any given ffmpeg failure.
+
+    Output directory handling is identical to `sample_frames`'s: caller
+    owns `output_dir` if given; otherwise a fresh `tempfile.mkdtemp()`
+    directory is created and handed back for the caller to clean up (never
+    a `TemporaryDirectory()` context manager -- see `sample_frames`'s
+    docstring for why).
+
+    Output filenames use a distinct `frame_{i:04d}.jpg` pattern (4 digits,
+    not `sample_frames`'s 3) -- not because 3 digits would overflow at
+    realistic reel lengths (a 60s reel at the default 1s interval needs
+    only ~60 frames, well under 1000), but to make it visually obvious at a
+    glance that these are a different function's output, in case a future
+    caller ever points both functions at the same directory (they don't
+    today, but nothing stops it from changing).
+
+    Raises:
+        ValueError: if `interval_seconds <= 0` or `duration_seconds <= 0`.
+        FrameExtractionError: see `_extract_frame_at`.
+    """
+    if interval_seconds <= 0:
+        raise ValueError(
+            f"interval_seconds must be > 0, got {interval_seconds}"
+        )
+    if duration_seconds <= 0:
+        raise ValueError(f"duration_seconds must be > 0, got {duration_seconds}")
+
+    if output_dir is None:
+        output_dir = Path(tempfile.mkdtemp(prefix="reel2movie_frames_"))
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamps: list[float] = []
+    t = 0.0
+    while t < duration_seconds:
+        timestamps.append(t)
+        t += interval_seconds
+
+    samples: list[FrameSample] = []
+    for i, timestamp in enumerate(timestamps):
+        frame_path = output_dir / f"frame_{i:04d}.jpg"
+        _extract_frame_at(video_path, timestamp, frame_path)
         samples.append(FrameSample(path=frame_path, timestamp_seconds=timestamp))
 
     return samples

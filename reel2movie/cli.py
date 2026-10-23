@@ -18,7 +18,7 @@ accessed via ``reel2movie.pipeline.deps.build_default_pipeline_deps`` /
 tests can monkeypatch them as ``reel2movie.cli.build_default_pipeline_deps``
 / ``reel2movie.cli.run_pipeline`` -- the same seam-patching pattern earlier
 subtasks used (e.g. ``tests/unit/pipeline/test_waterfall.py`` patching
-``sample_frames`` on the ``waterfall`` module object).
+``sample_frames_at_interval`` on the ``waterfall`` module object).
 
 Error handling: ``build_default_pipeline_deps()`` raises a plain
 ``RuntimeError`` when a required env var (``TMDB_API_KEY`` /
@@ -60,12 +60,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="URL of the reel to process (e.g. an Instagram Reel link).",
     )
     parser.add_argument(
-        "--frame-count",
-        type=int,
+        "--frame-interval-seconds",
+        type=float,
         default=None,
         help=(
-            "Override the number of frames sampled during the visual "
-            "fallback step (default: PipelineDeps' own default)."
+            "Override the interval (in seconds) between frames sampled "
+            "during the visual fallback step (default: PipelineDeps' own "
+            "default). No flag is exposed for the frame-dedup threshold -- "
+            "that stays an internal-only knob for now."
         ),
     )
     return parser
@@ -125,8 +127,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"reel2movie: configuration error: {exc}", file=sys.stderr)
         return 1
 
-    if args.frame_count is not None:
-        deps.frame_count = args.frame_count
+    if args.frame_interval_seconds is not None:
+        deps.frame_interval_seconds = args.frame_interval_seconds
 
     try:
         result = run_pipeline(args.reel_url, deps)
