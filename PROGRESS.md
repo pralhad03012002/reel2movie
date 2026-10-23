@@ -7603,3 +7603,187 @@ out under direct, independent verification -- not merely re-reading the
 build report's claims.
 
 VERDICT: ACCEPTABLE
+
+### Follow-up — tolerate per-timestamp extraction failures
+
+Real end-to-end testing against 11 live Instagram reels (after this
+subtask landed) surfaced a genuine bug in `sample_frames_at_interval`,
+caught via the actual pipeline run against
+`https://www.instagram.com/reel/DeCngQIST-o/`, which returned ZERO
+recommendations despite the video almost certainly having detectable
+content. The real stderr:
+
+```
+reel2movie.visual.frame_sampler.FrameExtractionError: ffmpeg reported success (exit code 0)
+extracting frame at timestamp 158.000s from .../Video by akshatonli [DeCngQIST-o].mp4,
+but the output file .../frame_0158.jpg is missing or empty. ffmpeg stderr: ffmpeg version 7.1 ...
+```
+
+**Root cause:** this is the same documented ffmpeg quirk this subtask's
+own docstrings and tests already named ("Output file is empty, nothing
+was encoded" / "a real ffmpeg quirk specific to very sparse frame
+grids") -- seeking very close to the true end of a video stream can make
+ffmpeg exit 0 while writing nothing. `sample_frames` mostly dodges this
+by staying within its 5%-95% window, but `sample_frames_at_interval`
+deliberately samples the full 0-to-duration range INCLUDING the tail (by
+design -- that's the whole point of this subtask, catching on-screen
+text that can appear right at a reel's edges), so any reel whose
+duration doesn't land cleanly on an interval boundary can produce a
+final timestamp right at the stream's ragged edge. Before this fix, that
+one failing timestamp's `FrameExtractionError` propagated straight out
+of `sample_frames_at_interval` (via the shared `_extract_frame_at`
+helper), and `pipeline/waterfall.py`'s `_extract_from_visual` wraps the
+whole sample→dedup→detect sequence in one broad
+`except Exception: logger.exception(...); return []` -- so one failed
+frame at timestamp 158 silently discarded every OTHER successfully-
+extracted frame's detections too. A reel with ~150 good frames and 1 bad
+one at the tail returned nothing at all, instead of the 150 good frames'
+worth of results.
+
+**Fix:** `sample_frames_at_interval`'s per-timestamp loop now catches
+`FrameExtractionError` itself, logs a warning naming the skipped
+timestamp and the video path plus the underlying error, and continues
+to the next timestamp -- returning whatever subset of `FrameSample`s
+succeeded (an empty list, not a raise, if literally every timestamp
+fails). This is a deliberately narrower change than it might look:
+`sample_frames` (the old sparse function) and `_extract_frame_at` itself
+are completely untouched and still raise on the first failure exactly as
+before -- `sample_frames`'s fixed-`n` callers (poster detection) expect a
+complete, fixed-size result and existing tests assert that all-or-nothing
+contract. Only `sample_frames_at_interval`'s caller-facing contract
+changed, from all-or-nothing to best-effort-partial. Both functions'
+docstrings (and the module docstring's summary) now spell out this
+difference explicitly, citing this exact production failure as the
+motivating case, the same way other docstrings in this file already cite
+specific observed ffmpeg quirks.
+
+`pipeline/waterfall.py`'s `_extract_from_visual` was checked and needs no
+change: `dedupe_similar_frames` already returns `[]` outright for an
+empty input list (confirmed by reading `frame_dedup.py`'s own docstring
+and early-return), and handles any shorter-than-expected, non-empty list
+identically to a "complete" one -- the `for frame in unique_frames:
+candidates.extend(deps.poster_detector.detect(frame))` loop has no
+dependency on the list being any particular length. A partial frame list
+from `sample_frames_at_interval` therefore already flows through
+correctly as "fewer frames to run detection on," same as if the video had
+simply been shorter.
+
+**Tests:** `tests/unit/visual/test_frame_sampler.py`'s
+`test_sample_frames_at_interval_propagates_frame_extraction_error` (which
+asserted the OLD all-or-nothing contract for this function -- it mocked
+every timestamp to fail and asserted a raise) is no longer true of the
+new behavior and was replaced by two tests instead:
+`test_sample_frames_at_interval_every_timestamp_failing_returns_empty_list`
+(same mock setup, now asserts `== []` with no raise) and the new
+regression test
+`test_sample_frames_at_interval_skips_one_failing_timestamp_and_returns_the_rest`,
+which patches `subprocess.run` with a `side_effect` that fails only the
+single timestamp matching `"3.0"` (exit code 0, empty output -- the exact
+quirk from the real stderr above) while letting every other timestamp's
+call fall through to the real ffmpeg binary, then asserts the 5 other
+timestamps' frames all come back correctly (non-empty files on disk) and
+the failed one is simply absent. All other `sample_frames_at_interval`
+tests from this subtask's original build (spacing, start/tail inclusion,
+invalid-argument `ValueError`s, filename pattern) are unchanged and still
+pass, as do all of `sample_frames`'s own failure-mode tests (unaffected,
+since `sample_frames` and `_extract_frame_at`'s raising behavior were not
+touched).
+
+Full suite: 261 -> 262 passed (`python3 -m pytest tests/unit -q`) -- net
++1 (one test replaced by two, per the above).
+
+#### Review findings
+
+Reviewed via `/code-review` (medium) against the working-tree diff,
+`/ponytail:ponytail-review` against `reel2movie/visual/frame_sampler.py`,
+and a manual verification pass (not trusting the fix report): read
+`sample_frames_at_interval`, `sample_frames`, and `_extract_frame_at`
+directly in full; read `pipeline/waterfall.py`'s `_extract_from_visual`
+and `frame_dedup.dedupe_similar_frames` directly; ran
+`git status --short` and `git status --short -- reel2movie/pipeline/waterfall.py`;
+independently ran `python3 -m pytest tests/unit -q`; read the new/changed
+tests in `tests/unit/visual/test_frame_sampler.py` in full.
+
+**From `/code-review` (correctness/cleanup):** no findings. Scoped
+correctly: the new `try/except FrameExtractionError: ...; continue` lives
+only in `sample_frames_at_interval`'s loop; `sample_frames` and
+`_extract_frame_at` are untouched; the `waterfall.py` caller already had
+the right broad exception handling plus a `finally: shutil.rmtree`, so no
+further change was needed there. 26/26 relevant tests pass.
+
+**From `/ponytail:ponytail-review`:** no findings ("Lean already. Ship.",
+net -0 lines possible). The actual code delta is minimal for the shape of
+fix needed -- one `import logging` + one `logger` line + a 15-line
+try/except/continue around the existing `_extract_frame_at` call, no new
+class, no retry/backoff abstraction, no config knob, and no speculative
+unification of `sample_frames`'s and `sample_frames_at_interval`'s now-
+divergent error contracts (correctly left as two separate, simple
+functions rather than one parameterized by a "failure policy"). The bulk
+of the diff's line count is docstring prose, out of this review's
+code-complexity scope.
+
+**Manual verification (own reading, not the fix report):**
+- `sample_frames_at_interval` (frame_sampler.py L350-370): confirmed the
+  per-timestamp loop now wraps `_extract_frame_at(...)` in
+  `try/except FrameExtractionError as exc: logger.warning(...); continue`,
+  returning whatever subset of `FrameSample`s succeeded (`[]` if every
+  timestamp fails). Matches the report exactly.
+- `sample_frames` (L179-235) and `_extract_frame_at` (L102-176): read both
+  in full. Confirmed byte-for-byte unchanged raise-on-first-failure
+  behavior -- `sample_frames`'s loop still calls `_extract_frame_at`
+  directly with no try/except, so a `FrameExtractionError` still
+  propagates straight out, exactly as before. No drift into the sparse
+  path.
+- `git status --short -- reel2movie/pipeline/waterfall.py` returns
+  nothing (file untouched), confirmed. Read `_extract_from_visual`
+  (waterfall.py L101-239) directly: `frames = sample_frames_at_interval(...)`
+  now may return a partial or empty list instead of raising; this flows
+  into `unique_frames = dedupe_similar_frames(frames, ...)`; read
+  `dedupe_similar_frames` (frame_dedup.py L87-122) directly and confirmed
+  its `if not frames: return []` early-return handles the empty case, and
+  a non-empty-but-shorter list is handled identically to a full one (same
+  comparison-against-last-kept-fingerprint loop, no length assumption).
+  The subsequent `for frame in unique_frames: candidates.extend(deps.poster_detector.detect(frame))`
+  loop simply runs zero or fewer times on a trimmed list -- no exception
+  path, so `_extract_from_visual` returns `[]` or a partial
+  `candidates` list cleanly, never hitting its own `except Exception`
+  handler as a side effect of this fix. Confirmed this really does fix
+  the reported production bug: one bad tail timestamp no longer
+  propagates up and discards every other frame's detections.
+- `git status --short` (full repo): shows exactly `PROGRESS.md`,
+  `reel2movie/visual/frame_sampler.py`, `tests/unit/visual/test_frame_sampler.py`
+  -- nothing under `ingest/`, `tmdb/`, `text_extraction/`, `core/`,
+  `config.py`, `frame_dedup.py`, `vision_llm_detector.py`, `cli.py`, or
+  `deps.py`. Confirmed.
+- `python3 -m pytest tests/unit -q`: independently re-ran, got
+  `262 passed in 6.41s`. Matches the claimed 261 -> 262.
+- Read `tests/unit/visual/test_frame_sampler.py`'s two new/changed tests
+  in full.
+  `test_sample_frames_at_interval_skips_one_failing_timestamp_and_returns_the_rest`
+  is a genuine partial-failure test, not trivially true: it patches
+  `subprocess.run` with a `side_effect` that fails only the call whose
+  timestamp argument is `"3.0"` (exit 0, empty-output stderr -- the exact
+  real-world quirk) while delegating every other timestamp to the real
+  ffmpeg binary via a captured `real_run` reference, then asserts the
+  other 5 timestamps (`[0.0, 1.0, 2.0, 4.0, 5.0]`) come back with actual
+  non-empty files written to disk by real ffmpeg, and that `3.0` is simply
+  absent from the result. This genuinely exercises the "mixed success/
+  failure across a dense sample set" path, not a mocked-everything
+  tautology.
+  `test_sample_frames_at_interval_every_timestamp_failing_returns_empty_list`
+  mocks `subprocess.run` to return exit code 1 for every call (same setup
+  the old test used, which previously asserted a raise), now asserts
+  `== []`. This genuinely exercises the "every timestamp fails" path
+  since each call independently raises inside `_extract_frame_at` and is
+  independently caught-and-skipped by the loop, converging on `[]` rather
+  than failing fast on the first one.
+
+No blocking findings. The fix is correctly and narrowly scoped (only
+`sample_frames_at_interval`'s per-timestamp failure handling changed),
+the claimed unchanged behavior for `sample_frames`/`_extract_frame_at`/
+`waterfall.py` was independently confirmed by reading the code rather than
+trusting the report, the test count and the two new tests' realism were
+independently confirmed, and the diff footprint matches exactly what was
+claimed.
+
+VERDICT: ACCEPTABLE

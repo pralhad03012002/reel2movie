@@ -32,15 +32,23 @@ Two public sampling strategies live here, for two different jobs:
   more" style intro card, or a final "which one's your favorite" card) —
   the 5%-95%-window dodge that's correct for poster detection would
   actively defeat dense text-reading sampling by skipping exactly the
-  frames most likely to carry a quick title-card overlay.
+  frames most likely to carry a quick title-card overlay. Its sampled
+  range includes the ragged tail of the stream, so unlike `sample_frames`
+  it tolerates a single timestamp's extraction failing: that timestamp is
+  skipped (logged as a warning) and the remaining frames are still
+  returned, rather than the whole call raising -- see its docstring's
+  "Best-effort vs. all-or-nothing" section for the real-world bug that
+  motivated this.
 
 Both strategies share the same per-timestamp ffmpeg invocation (see
-`_extract_frame_at`) — only which timestamps get requested, and the output
-filename pattern, differ between them.
+`_extract_frame_at`) — only which timestamps get requested, the output
+filename pattern, and (as of the fix above) how a single timestamp's
+failure is handled, differ between them.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 import tempfile
@@ -49,6 +57,8 @@ from pathlib import Path
 import imageio_ffmpeg
 
 from reel2movie.core.models import FrameSample
+
+logger = logging.getLogger(__name__)
 
 
 class FrameExtractionError(RuntimeError):
@@ -250,8 +260,53 @@ def sample_frames_at_interval(
     rationale.
 
     Each frame is extracted via `_extract_frame_at` (shared with
-    `sample_frames` -- see its docstring), so both functions raise/behave
-    identically on any given ffmpeg failure.
+    `sample_frames` -- see its docstring) for the actual ffmpeg
+    invocation, but this function's *handling* of a per-timestamp failure
+    deliberately differs from `sample_frames`'s -- see "Best-effort vs.
+    all-or-nothing" below.
+
+    Best-effort vs. all-or-nothing (real-world bug, now fixed): unlike
+    `sample_frames`, a `FrameExtractionError` raised by `_extract_frame_at`
+    for any ONE timestamp is caught here, logged as a warning (naming the
+    failed timestamp and `video_path`), and that timestamp is skipped --
+    extraction continues with the remaining timestamps, and whatever
+    subset of `FrameSample`s succeeded is returned. If every timestamp
+    fails, this returns `[]` rather than raising.
+
+    This is intentionally NOT what `sample_frames` does (it still raises
+    on the first failure, all-or-nothing, and that behavior is unchanged
+    -- see its docstring and tests). The two functions can afford
+    different contracts because their callers want different things:
+    `sample_frames`'s sparse, fixed-`n` callers (poster detection) are
+    built around getting back exactly the N frames they asked for, so a
+    partial result would silently mean "poster detection ran on fewer/
+    different samples than the caller thinks it configured" -- raising is
+    the honest behavior there. `sample_frames_at_interval`'s dense,
+    variable-length-list callers (on-screen text detection via
+    `pipeline/waterfall.py`'s `_extract_from_visual`) already treat "how
+    many frames came back" as an open question (it depends on video
+    length and dedup), and a single bad timestamp out of what can be
+    hundreds should not discard every other, perfectly good frame's worth
+    of detections.
+
+    This surfaced as a real production bug (not a hypothetical): running
+    the full pipeline against a live Instagram reel
+    (https://www.instagram.com/reel/DeCngQIST-o/) produced ZERO
+    recommendations because a single tail timestamp (158.0s) hit the
+    documented "ffmpeg reports exit code 0 but writes nothing" quirk (see
+    `_extract_frame_at`'s docstring -- the same quirk `sample_frames`
+    dodges by staying within its 5%-95% window). Before this fix, that one
+    failing timestamp's `FrameExtractionError` propagated straight out of
+    this function and `_extract_from_visual`'s broad
+    `except Exception: return []` discarded all ~150 OTHER already-
+    successfully-extracted frames' worth of detections along with it --
+    silently turning "150 good frames and 1 bad one" into "no results at
+    all". Because this function samples the full 0-to-duration range
+    (including the ragged tail end of the stream, by design -- see the
+    module docstring), any reel whose duration doesn't land cleanly on an
+    interval boundary can hit this edge case, making it a routine
+    occurrence here in a way it isn't for `sample_frames`'s windowed
+    sampling.
 
     Output directory handling is identical to `sample_frames`'s: caller
     owns `output_dir` if given; otherwise a fresh `tempfile.mkdtemp()`
@@ -269,7 +324,10 @@ def sample_frames_at_interval(
 
     Raises:
         ValueError: if `interval_seconds <= 0` or `duration_seconds <= 0`.
-        FrameExtractionError: see `_extract_frame_at`.
+
+    Never raises `FrameExtractionError` for a per-timestamp ffmpeg
+    failure (see "Best-effort vs. all-or-nothing" above) -- such failures
+    are caught, logged, and skipped instead.
     """
     if interval_seconds <= 0:
         raise ValueError(
@@ -292,7 +350,21 @@ def sample_frames_at_interval(
     samples: list[FrameSample] = []
     for i, timestamp in enumerate(timestamps):
         frame_path = output_dir / f"frame_{i:04d}.jpg"
-        _extract_frame_at(video_path, timestamp, frame_path)
+        try:
+            _extract_frame_at(video_path, timestamp, frame_path)
+        except FrameExtractionError as exc:
+            # Best-effort: skip this one timestamp and keep going -- see
+            # the docstring's "Best-effort vs. all-or-nothing" section for
+            # why this differs from `sample_frames`'s raise-on-first-
+            # failure behavior.
+            logger.warning(
+                "skipping frame at timestamp %.3fs from %s: extraction "
+                "failed (%s)",
+                timestamp,
+                video_path,
+                exc,
+            )
+            continue
         samples.append(FrameSample(path=frame_path, timestamp_seconds=timestamp))
 
     return samples

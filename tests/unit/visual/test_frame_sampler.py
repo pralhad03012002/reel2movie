@@ -252,23 +252,64 @@ def test_sample_frames_at_interval_invalid_duration_raises_value_error(
         )
 
 
-def test_sample_frames_at_interval_propagates_frame_extraction_error(
+def test_sample_frames_at_interval_skips_one_failing_timestamp_and_returns_the_rest(
     sample_video: Path, tmp_path: Path
 ) -> None:
-    """The shared `_extract_frame_at` helper's error handling must still
-    apply through this entry point too -- doesn't need exhaustive
-    re-coverage of every ffmpeg failure mode (that's `sample_frames`'s
-    existing tests' job), just confirmation the error actually propagates
-    here."""
+    """Regression test for the real-world bug (see the docstring's
+    "Best-effort vs. all-or-nothing" section): a single timestamp hitting
+    ffmpeg's "exit code 0 but the output file is missing/empty" quirk
+    (observed in production at timestamp 158.0s on a real Instagram reel)
+    must not discard every OTHER successfully-extracted frame. Here,
+    `interval=1.0` over a 6s video asks for timestamps
+    [0, 1, 2, 3, 4, 5]; only the timestamp-3 extraction is made to fail
+    (exit code 0, no output file written), matching the real quirk
+    exactly -- the other five must still come back.
+    """
+    real_run = subprocess.run
+
+    def fake_run(command, **kwargs):
+        timestamp_str = command[2]  # ["ffmpeg", "-ss", "<timestamp>", ...]
+        if timestamp_str == "3.0":
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="",
+                stderr="Output file is empty, nothing was encoded",
+            )
+        return real_run(command, **kwargs)
+
+    with patch(
+        "reel2movie.visual.frame_sampler.subprocess.run", side_effect=fake_run
+    ):
+        samples = sample_frames_at_interval(
+            sample_video, 1.0, VIDEO_DURATION_SECONDS, output_dir=tmp_path
+        )
+
+    timestamps = [s.timestamp_seconds for s in samples]
+    assert timestamps == pytest.approx([0.0, 1.0, 2.0, 4.0, 5.0])
+    for sample in samples:
+        assert sample.path.exists()
+        assert sample.path.stat().st_size > 0
+
+
+def test_sample_frames_at_interval_every_timestamp_failing_returns_empty_list(
+    sample_video: Path, tmp_path: Path
+) -> None:
+    """If literally every timestamp fails, this returns `[]` rather than
+    raising -- `_extract_from_visual`'s existing fallback-to-empty
+    handling already treats an empty frame list the same as "no frames",
+    so there is nothing further for this function to signal by raising.
+    """
     fake_stderr = "fake ffmpeg failure: no such filter or seek error"
     with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(
             args=["ffmpeg"], returncode=1, stdout="", stderr=fake_stderr
         )
-        with pytest.raises(FrameExtractionError, match=fake_stderr):
-            sample_frames_at_interval(
-                sample_video, 1.0, VIDEO_DURATION_SECONDS, output_dir=tmp_path
-            )
+        samples = sample_frames_at_interval(
+            sample_video, 1.0, VIDEO_DURATION_SECONDS, output_dir=tmp_path
+        )
+
+    assert samples == []
 
 
 def test_sample_frames_at_interval_uses_distinct_filename_pattern(
