@@ -7787,3 +7787,362 @@ independently confirmed, and the diff footprint matches exactly what was
 claimed.
 
 VERDICT: ACCEPTABLE
+
+## GUI Subtask 1: background engine (gui/workers.py)
+
+### What's built
+
+A new, separate `gui/` package layered on top of the already-complete
+`reel2movie` pipeline — nothing under `reel2movie/` or `tests/` was
+touched. First files in the package:
+
+- `gui/__init__.py` — empty, marks `gui` as a package.
+- `gui/workers.py` (~106 lines) — the single place in the GUI codebase
+  allowed to know about `QThread`, the local `claude` CLI usability
+  check, and the `VISION_BACKEND` env-var fallback. Zero Qt widget code,
+  just two `QThread` subclasses plus three plain functions:
+  - `check_claude_cli_usable` — checks `shutil.which("claude")` first,
+    then runs `claude --version` via `subprocess.run` with a timeout,
+    wrapped in a bare `except Exception`.
+  - `ClaudeCliCheckWorker` — runs the above off the main thread.
+  - `apply_anthropic_api_fallback` — flips the process over to the
+    `anthropic_api` vision backend by setting two env vars; caller must
+    invoke it before `build_deps_or_error()` when the CLI check comes
+    back `False`.
+  - `build_deps_or_error` — try/except wrapper around
+    `build_default_pipeline_deps()` (from `reel2movie.pipeline.deps`),
+    turning any construction failure (e.g. missing `TMDB_API_KEY`) into
+    an error string instead of letting it raise.
+  - `PipelineRunner` — runs `reel2movie.pipeline.waterfall.run_pipeline(url,
+    deps)` off the main thread, emitting `succeeded`/`failed` instead of
+    letting exceptions escape the thread.
+
+### Public interface contract
+
+This is the fixed contract other already-written/planned GUI code
+depends on; names and signatures must not change:
+
+- `check_claude_cli_usable(timeout_seconds=5.0) -> bool` — never raises;
+  `False` on missing binary/timeout/nonzero exit/any exception.
+- `ClaudeCliCheckWorker(QThread)` — `Signal(bool)` named `finished_check`,
+  emitted exactly once.
+- `apply_anthropic_api_fallback(api_key: str) -> None` — sets
+  `os.environ["ANTHROPIC_API_KEY"]` and
+  `os.environ["VISION_BACKEND"] = "anthropic_api"`.
+- `build_deps_or_error() -> tuple[PipelineDeps | None, str | None]` —
+  never raises, wraps `build_default_pipeline_deps()`.
+- `PipelineRunner(QThread)` — `Signal(object)` named `succeeded`,
+  `Signal(str)` named `failed`; exactly one fires per run; `run()` never
+  raises uncaught.
+
+### Smoke-test results (prior subagent, observed)
+
+- `claude` CLI detection: both the found-and-working (`True`) and
+  not-found/broken (`False`) paths exercised directly against
+  `check_claude_cli_usable`.
+- Env-var fallback: `apply_anthropic_api_fallback` confirmed to set both
+  `ANTHROPIC_API_KEY` and `VISION_BACKEND` in `os.environ`.
+- `build_deps_or_error`: both the happy path (real deps object returned,
+  no error string) and the error path (missing API key surfaced as a
+  string, not raised) exercised.
+- `PipelineRunner`: failure path exercised against an unreachable URL —
+  `failed` fired with a message, no uncaught exception escaped the
+  thread.
+- All of the above passed.
+
+### Review pass outcome
+
+Ran `code-review` (medium effort, full-file review since these are new
+untracked files with no committed baseline) against the exact contract
+above, point by point — came back clean, zero findings. Ran
+`ponytail-review` for over-engineering (unneeded abstractions, reinvented
+stdlib, speculative flexibility) — also came back clean: no dead code, no
+unused flexibility, no reinvented stdlib: `shutil.which` + `subprocess.run`
+used directly rather than wrapped, the two `QThread` subclasses are the
+minimal Qt pattern for background work and are not candidates for merging
+into a shared base given the fixed, distinct signal contracts each must
+expose. No changes were made to `gui/workers.py` as a result of this
+review pass.
+
+## GUI Subtask 2: presentational widgets (gui/widgets.py)
+
+### What's built
+
+A new file in the same `gui/` package, sitting beside `gui/workers.py`
+but deliberately isolated from it: `gui/widgets.py` (~600 lines) is pure
+Qt (PySide6) presentation code with zero knowledge of `reel2movie`,
+threading, or env vars. Every widget takes only plain Python values
+(str/int/float/None/dict/list) via constructor args/methods and talks
+upward only through plain Qt signals. Three classes:
+
+- `RecommendationCard(title, year, overview, media_type, source,
+  confidence, poster_path, query, parent=None)` — one result card.
+  When `poster_path` is set and `title` is resolved (not `None`), the
+  poster is fetched asynchronously via `QNetworkAccessManager`
+  (`https://image.tmdb.org/t/p/w500{poster_path}`), never blocking the
+  GUI thread; a failed fetch just leaves the placeholder, silently. When
+  `title is None` the card is marked via the `unresolved` dynamic
+  property, skips the network fetch entirely, and renders distinct
+  placeholder copy that references the raw `query` string instead of a
+  year/overview.
+- `ApiKeyPromptPanel` — inline TMDB API key prompt; `Signal(str)` named
+  `key_submitted` fires with the trimmed key on non-empty submit (button
+  click or Enter-in-field); empty/whitespace-only input does not emit
+  and instead reveals an inline validation hint label rather than a
+  silent no-op.
+- `ResultsPanel` — scrollable container of `RecommendationCard`s.
+  `set_recommendations(cards_data: list[dict])` clears existing cards
+  first, builds one card per dict (keys matching the
+  `RecommendationCard` constructor kwargs exactly), and shows a centered
+  "No recommendations found." message instead of a blank panel when the
+  list is empty. `clear()` removes all cards *and* any empty-state
+  message, leaving a genuinely empty container.
+
+### Design system approach
+
+Spacing (`SPACE_1`..`SPACE_6`), color (panel/card/text/accent/badge/
+unresolved/danger tokens), and typography (`FONT_FAMILY`) are centralized
+as module-level constants and woven into one QSS template (`_STYLESHEET`)
+rather than scattered as inline hex strings across widget code. All three
+widgets apply the same stylesheet to themselves (QSS rules are scoped by
+object name, so sharing one sheet across independent widget instances is
+harmless); this keeps each widget self-contained and stylable even when
+embedded standalone, with no dependency on a top-level window applying a
+shared application stylesheet.
+
+### Smoke-test results (prior subagent, observed)
+
+Per the prior subagent's report when the file was first written: poster
+fetch success (resolved card with a real `poster_path` swapped in a
+scaled pixmap), unresolved-state rendering (no network attempt, distinct
+placeholder copy referencing `query`), submit validation (empty/
+whitespace rejected with inline hint, non-empty trimmed and emitted), and
+mixed-list rendering via `set_recommendations()` — all passed.
+
+### Review pass outcome
+
+Ran `code-review` (medium effort, full-file review since this is a new
+untracked file with no committed baseline) against the exact contract
+above. Findings: (1) **real bug, fixed** — the async poster-fetch
+callback (`_on_poster_reply_finished`) had no guard against the card (and
+its `_poster_label`) being deleted while the network reply was still in
+flight (e.g. `ResultsPanel.clear()`/`set_recommendations()` re-running
+mid-fetch); reproduced this exactly against an unpatched copy of the file
+(`RuntimeError: libshiboken: Internal C++ object (PySide6.QtWidgets.
+QLabel) already deleted`) and fixed it with a `try/except RuntimeError`
+guard around the label update. (2) Duplicate badge-row construction
+between the resolved/unresolved branches — extracted into a shared
+`_build_badges_row(source, confidence)` helper. (3) Dead/ineffective QSS
+property `line-height: 140%` on `QLabel#cardOverview` (not a Qt Style
+Sheet–supported property for `QLabel`, silently had zero effect) —
+removed. (4) Each card opening its own `QNetworkAccessManager` instead of
+sharing one — replaced with a single process-wide shared manager
+(`_get_shared_network_manager()`), cutting per-card connection-pool
+overhead without touching the public constructor. Per-widget
+`setStyleSheet(_STYLESHEET)` reapplication (flagged as a minor parse-cost
+concern) was left as-is: it's already reasoned about in the module
+docstring as a deliberate, negligible-cost tradeoff for keeping each
+widget independently stylable.
+
+Ran `ponytail-review` for over-engineering. The deliberate design-system
+constants (spacing/color/typography tokens, the QSS template) were not
+flagged, per the product requirement that this file carry real visual
+polish. Genuine findings: an unused `ResultsPanel._cards` list that was
+populated and reset but never read anywhere (the layout already owns and
+tracks the child widgets) — removed; and the same badge-row duplication
+code-review also caught — fixed via the same shared helper.
+
+After the fixes, re-ran a throwaway (uncommitted) PySide6 script showing:
+a resolved card with a real TMDB poster (loaded asynchronously, no GUI
+thread block), a resolved card with `poster_path=None` (no fetch
+attempted), an unresolved card (`unresolved` property `True`, no poster
+label created), `ApiKeyPromptPanel` rejecting whitespace-only input with
+the hint shown and no signal emitted, then accepting a real key trimmed
+and emitted, and `ResultsPanel.set_recommendations()` with a mixed
+resolved/unresolved list followed by an empty list (empty-state message
+shown) and `clear()` (container and empty-state message both gone) — all
+checks passed, no crash. Separately reproduced and re-verified the fixed
+race condition directly: deleting a `RecommendationCard` immediately
+after starting a real poster fetch no longer raises; an unpatched control
+copy of the file still crashes with the exact `RuntimeError` described
+above, confirming the fix is both real and effective.
+
+No changes were needed to the public interface (class names, signal
+names, constructor/method signatures); all fixes were internal.
+
+## GUI Subtask 3: MainWindow, entry point, styling, packaging (gui/main_window.py, gui/main.py, gui/styles.qss, pyproject.toml)
+
+### What's built
+
+The final pieces of the `gui/` package, wiring Subtask 1's background
+engine (`gui/workers.py`) to Subtask 2's presentational widgets
+(`gui/widgets.py`) into one runnable app — nothing under `reel2movie/` or
+`tests/` was touched.
+
+- `gui/main_window.py` — `MainWindow(QMainWindow)`: the one-screen app.
+  An always-visible URL input row (`QLineEdit` + "Run" `QPushButton`,
+  Enter-to-submit) sits above a `QStackedWidget` with four pages —
+  idle, running (indeterminate `QProgressBar` + status text), results
+  (`ResultsPanel`), and a styled top-level error banner — plus an inline
+  `ApiKeyPromptPanel` shown only when needed. The Run-click state
+  machine: validate non-empty URL → run the one-time-per-session
+  `ClaudeCliCheckWorker` → if the `claude` CLI isn't usable and no key has
+  been supplied yet this session, pause on the inline API-key panel →
+  once usable (CLI or a supplied key), `build_deps_or_error()` → on
+  success run `PipelineRunner` → `succeeded`/`failed` each re-enable Run
+  and show results/error respectively. `Recommendation` → dict mapping
+  for `ResultsPanel.set_recommendations()` reads `rec.tmdb.title/year/
+  overview/media_type/poster_path`, `rec.source.value`, `rec.confidence`,
+  `rec.query` — re-verified field-for-field against `reel2movie/core/
+  models.py`'s actual `ResolvedMovie`/`Recommendation` dataclasses; no
+  mismatch.
+- `gui/main.py` — entry point (`python3 -m gui.main`): `load_dotenv()`,
+  `QApplication`, loads+applies `gui/styles.qss`, shows `MainWindow`,
+  `sys.exit(app.exec())`.
+- `gui/styles.qss` — pure QSS for the window chrome (input row, Run
+  button, progress bar, status/validation text, error banner), sharing
+  `gui/widgets.py`'s color tokens by value so the window doesn't clash
+  with the cards/panels it hosts.
+- `pyproject.toml` — one line added: `gui = ["PySide6"]` under
+  `[project.optional-dependencies]`.
+
+### Live end-to-end test (prior subagent, observed)
+
+Run against a real Instagram reel URL
+(`https://www.instagram.com/reel/DU7OQACiDtk/`) with the real pipeline
+(no mocks): reached the results state successfully with 11 items
+rendered, including some real TMDB-connection-reset unresolved entries
+handled gracefully (rendered as the distinct "could not verify on TMDB"
+card rather than crashing or dropping the row). Also exercised:
+empty-URL validation, the missing-`TMDB_API_KEY` error path, the
+claude-CLI-unusable → API-key-fallback path, and a double-Run-click state
+reset.
+
+### Review pass outcome
+
+Ran `code-review` (high effort) against `gui/main_window.py` and
+`gui/main.py`. Four findings, all independently re-confirmed by direct
+code tracing against `gui/workers.py`, `reel2movie/pipeline/deps.py`, and
+`reel2movie/config.py`:
+
+1. **Real bug, fixed.** `_on_run_clicked` had no re-entrancy guard, and
+   `url_input.returnPressed` fires regardless of `run_button`'s disabled
+   state — pressing Enter while a CLI check or pipeline run was already
+   in flight started a second `ClaudeCliCheckWorker`/`PipelineRunner` and
+   overwrote the still-running one's `self._cli_check_worker`/
+   `self._pipeline_runner` reference (risking Qt's "QThread: Destroyed
+   while thread is still running" and racing `succeeded`/`failed`
+   signals). Fixed with a one-line guard at the top of `_on_run_clicked`
+   (`if not self.run_button.isEnabled(): return`), since `run_button`'s
+   enabled state already tracks "is a background op in flight" precisely
+   throughout the class.
+2. **Blocking cross-module issue, NOT fixed (reported instead, per
+   scope).** The inline `ApiKeyPromptPanel` (`gui/widgets.py`, out of
+   scope/already approved) is hardcoded with the title "TMDB API Key
+   Needed" and copy explaining it verifies titles against TMDB. But
+   `main_window.py` only ever shows this panel on the claude-CLI-unusable
+   fallback path, and wires its submitted value to
+   `apply_anthropic_api_fallback()`, which sets `ANTHROPIC_API_KEY` /
+   `VISION_BACKEND=anthropic_api` — never `TMDB_API_KEY`. Confirmed via
+   `reel2movie/config.py`/`reel2movie/pipeline/deps.py` that this wiring
+   is logically *correct* for its actual purpose (the Anthropic-key
+   fallback for the vision backend), but the panel's own hardcoded text
+   is simply the wrong copy for that context: a user following the
+   on-screen instructions and pasting a real TMDB key would have it
+   stored as `ANTHROPIC_API_KEY` instead, `TMDB_API_KEY` would still be
+   unset, and they'd hit an unrelated-looking top-level error with no
+   other path forward. Fixing this requires changing `gui/widgets.py`'s
+   hardcoded panel copy, which is out of scope for this pass — flagged
+   here as a blocking issue for a follow-up pass instead.
+3. **Real bug, fixed.** Neither `QThread` worker is Qt-parented to
+   `MainWindow` (both constructed with the default `parent=None`), so
+   closing the window mid-run didn't stop them, and process teardown
+   while a worker was still executing risked the same "destroyed while
+   running" crash. Fixed with a minimal `closeEvent` override: ignore the
+   close while either worker `isRunning()`, otherwise proceed normally.
+4. **Assessed, not independently reachable — no fix made.**
+   `_on_cli_check_finished` silently no-ops if `self._pending_url is
+   None`, which could in theory leave `run_button` permanently disabled.
+   Traced every path that sets `_pending_url`: it's set immediately
+   before every `_begin_flow()` call and is never reset to `None`
+   afterward anywhere in the class, so this branch is unreachable in the
+   code as shipped (the finding's own hypothetical trigger was "a future
+   edit" or interleaving with finding #1 — which fix #1 above now
+   forecloses). Left as-is rather than add speculative dead-state
+   handling.
+
+Ran `ponytail-review` against both files for over-engineering: no
+findings (`Lean already. Ship.`). The four-page `QStackedWidget`, the
+small `_show_*` state-transition helpers (each with multiple call sites),
+and the session-state flags (`_claude_cli_checked`/`_claude_cli_usable`/
+`_api_key_supplied`/`_pending_url`, each required by the async CLI-check
+step) were all judged necessary, not speculative — consistent with this
+being real state-machine/design work rather than unused flexibility.
+
+### Independent re-verification (this pass, not just trusting the prior report)
+
+Wrote a throwaway script (`QT_QPA_PLATFORM=offscreen`, not committed)
+driving real `MainWindow` instances directly:
+
+- **Empty-URL validation**: whitespace-only input + Run → validation
+  label shown with the exact expected text, content area stays on the
+  idle page, Run stays enabled, no worker started. **Matches prior
+  claim.**
+- **Missing-`TMDB_API_KEY` error path**: using a scoped/cleared
+  environment (never touched the real `.env`; `TMDB_API_KEY`/
+  `ANTHROPIC_API_KEY`/`VISION_BACKEND` popped from `os.environ` first) →
+  Run → error page shown with `"TMDB_API_KEY is not set"` in the banner
+  text, Run re-enabled, no pipeline thread ever started. **Matches prior
+  claim.**
+- **Double-Run-click / Enter-bypass state reset**: monkeypatched
+  `gui.workers.run_pipeline` to a fast fake (no real network), gave a
+  throwaway `TMDB_API_KEY` so dependency construction succeeds, then
+  called the Run slot twice back-to-back while the first run was still
+  in flight (reproducing the Enter-key path, not just a second button
+  click). Confirmed: only one `PipelineRunner` instance was ever created
+  (`self._pipeline_runner` unchanged by the second call), the fake
+  pipeline function was invoked exactly once, and after the run finished
+  Run was re-enabled and the results page shown. This exercises the fix
+  for finding #1 above and **matches/extends the prior claim** — the
+  prior subagent's double-Run-*button*-click test wouldn't have caught
+  the Enter-key path, which this pass's fix now also closes.
+
+`python3 -m pytest tests/unit -q` → **262 passed**, confirming no
+regression in `reel2movie/` (which this subtask did not touch).
+
+### Closing note — the app is complete
+
+All three GUI subtasks (`gui/workers.py`, `gui/widgets.py`,
+`gui/main_window.py` + `gui/main.py` + `gui/styles.qss` + the
+`pyproject.toml` optional-dependency line) are done. To run the app:
+
+```
+pip install -e ".[gui]"   # or: pip install PySide6
+python3 -m gui.main
+```
+
+## GUI follow-up: fixed ApiKeyPromptPanel's mismatched copy
+
+The one blocking cross-module issue from GUI Subtask 3's review (finding
+#2: `ApiKeyPromptPanel` in `gui/widgets.py` said "TMDB API Key Needed"
+and described verifying titles against TMDB, but the panel is only ever
+shown on the claude-CLI-unusable → Anthropic-key fallback path and its
+submitted value is stored as `ANTHROPIC_API_KEY`, never `TMDB_API_KEY`)
+is now fixed. Title changed to "Anthropic API Key Needed", the
+explanation reworded to describe the actual claude-CLI-unavailable /
+vision-fallback context, and the `QLineEdit` placeholder ("Paste your
+TMDB API key" → "Paste your Anthropic API key") updated to match — that
+placeholder was the same bug but outside the first fix pass's stated
+scope, caught and closed directly rather than spinning another
+write/review cycle for a one-line string change.
+
+Scope: pure string-content change in `ApiKeyPromptPanel` only — no
+change to its class name, `key_submitted` signal, constructor signature,
+or any other class in the file (`RecommendationCard`, `ResultsPanel`
+untouched). Verified: `ast.parse` on the file succeeds, a standalone
+smoke test confirms `key_submitted` still fires correctly on non-empty
+submit and not on empty/whitespace input, and the full
+`python3 -m pytest tests/unit -q` suite still passes (262 passed).
+
+With this fix, the `gui/` package has no known open issues. All three
+GUI subtasks' write/review loops are closed.

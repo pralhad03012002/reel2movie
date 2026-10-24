@@ -1,0 +1,83 @@
+/*
+ * Window-chrome styling for the top-level reel2movie GUI: the URL input
+ * row, Run button, indeterminate progress bar, status text, validation
+ * hint, and top-level error banner.
+ *
+ * Palette mirrors the design tokens already established in gui/widgets.py
+ * (its module-level _STYLESHEET / color constants) so the surrounding
+ * window doesn't clash with the cards/panels it hosts. This file only
+ * covers chrome that widgets.py does not already style itself.
+ */
+
+QWidget#centralWidget {
+    background-color: #F3F4F8;
+}
+
+QLineEdit#urlInput {
+    background-color: #FFFFFF;
+    border: 1px solid #E3E5EC;
+    border-radius: 6px;
+    padding: 9px 12px;
+    font-size: 14px;
+    color: #1A1D29;
+}
+
+QLineEdit#urlInput:focus {
+    border: 1px solid #4F5DFF;
+}
+
+QPushButton#runButton {
+    background-color: #4F5DFF;
+    color: #FFFFFF;
+    font-size: 14px;
+    font-weight: 600;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 22px;
+}
+
+QPushButton#runButton:hover {
+    background-color: #4047C4;
+}
+
+QPushButton#runButton:pressed {
+    background-color: #4047C4;
+}
+
+QPushButton#runButton:disabled {
+    background-color: #C9CDFB;
+    color: #F3F4F8;
+}
+
+QLabel#validationLabel {
+    color: #C0392B;
+    font-size: 12px;
+}
+
+QProgressBar#progressBar {
+    background-color: #EEF0FF;
+    border: none;
+    border-radius: 6px;
+    min-height: 8px;
+    max-height: 8px;
+}
+
+QProgressBar#progressBar::chunk {
+    background-color: #4F5DFF;
+    border-radius: 6px;
+}
+
+QLabel#statusLabel {
+    color: #5B6072;
+    font-size: 14px;
+}
+
+QLabel#errorBanner {
+    background-color: #FDECEC;
+    color: #C0392B;
+    border: 1px solid #C0392B;
+    border-radius: 8px;
+    padding: 16px;
+    font-size: 14px;
+    font-weight: 500;
+}

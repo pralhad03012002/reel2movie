@@ -10,3 +10,6 @@ dist/
 build/
 tests/fixtures/*.mp4
 *.mp4
+graphify-out/cache/
+graphify-out/.graphify_python
+graphify-out/.graphify_root

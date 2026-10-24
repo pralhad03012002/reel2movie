@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+gui = ["PySide6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
