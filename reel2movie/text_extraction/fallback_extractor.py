@@ -15,6 +15,8 @@ works for any two `CandidateExtractor`-shaped objects.
 
 from __future__ import annotations
 
+import threading
+
 from reel2movie.core.models import Candidate, SourceTag
 from reel2movie.core.protocols import CandidateExtractor
 
@@ -31,8 +33,30 @@ class FallbackCandidateExtractor:
         self._primary = primary
         self._fallback = fallback
 
-    def extract(self, text: str, source: SourceTag) -> list[Candidate]:
-        primary_result = self._primary.extract(text, source)
+    def extract(
+        self,
+        text: str,
+        source: SourceTag,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> list[Candidate]:
+        """Try `primary.extract()`, then `fallback.extract()` if empty.
+
+        `cancel_event`, if given, is passed through to BOTH the `primary`
+        and `fallback` extractors' `.extract()` calls -- but only when
+        it's actually set (not `None`), so a pre-existing
+        `CandidateExtractor`-shaped test double that only implements
+        `extract(text, source)` (predating this parameter) keeps working
+        unmodified for every call site that doesn't use cancellation.
+        """
+        if cancel_event is not None:
+            primary_result = self._primary.extract(
+                text, source, cancel_event=cancel_event
+            )
+        else:
+            primary_result = self._primary.extract(text, source)
         if primary_result:
             return primary_result
+        if cancel_event is not None:
+            return self._fallback.extract(text, source, cancel_event=cancel_event)
         return self._fallback.extract(text, source)

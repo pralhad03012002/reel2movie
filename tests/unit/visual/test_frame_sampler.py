@@ -147,8 +147,8 @@ def test_patched_nonzero_ffmpeg_exit_raises_frame_extraction_error_with_stderr(
     sample_video: Path, tmp_path: Path
 ) -> None:
     fake_stderr = "fake ffmpeg failure: no such filter or seek error"
-    with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
-        mock_run.return_value = subprocess.CompletedProcess(
+    with patch("reel2movie.visual.frame_sampler.run_cancelable") as mock_run_cancelable:
+        mock_run_cancelable.return_value = subprocess.CompletedProcess(
             args=["ffmpeg"], returncode=1, stdout="", stderr=fake_stderr
         )
         with pytest.raises(FrameExtractionError, match=fake_stderr):
@@ -167,8 +167,8 @@ def test_exit_code_0_but_empty_output_raises_frame_extraction_error(
     sparse-video edge case, which is timing-sensitive.
     """
     fake_stderr = "Output file is empty, nothing was encoded"
-    with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
-        mock_run.return_value = subprocess.CompletedProcess(
+    with patch("reel2movie.visual.frame_sampler.run_cancelable") as mock_run_cancelable:
+        mock_run_cancelable.return_value = subprocess.CompletedProcess(
             args=["ffmpeg"], returncode=0, stdout="", stderr=fake_stderr
         )
         with pytest.raises(FrameExtractionError, match=fake_stderr):
@@ -176,8 +176,8 @@ def test_exit_code_0_but_empty_output_raises_frame_extraction_error(
 
 
 def test_ffmpeg_timeout_raises_frame_extraction_error(sample_video: Path, tmp_path: Path) -> None:
-    with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=30)
+    with patch("reel2movie.visual.frame_sampler.run_cancelable") as mock_run_cancelable:
+        mock_run_cancelable.side_effect = subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=30)
         with pytest.raises(FrameExtractionError, match="timed out"):
             sample_frames(sample_video, n=1, duration_seconds=VIDEO_DURATION_SECONDS, output_dir=tmp_path)
 
@@ -265,9 +265,9 @@ def test_sample_frames_at_interval_skips_one_failing_timestamp_and_returns_the_r
     (exit code 0, no output file written), matching the real quirk
     exactly -- the other five must still come back.
     """
-    real_run = subprocess.run
+    from reel2movie._subprocess_util import run_cancelable as real_run_cancelable
 
-    def fake_run(command, **kwargs):
+    def fake_run_cancelable(command, **kwargs):
         timestamp_str = command[2]  # ["ffmpeg", "-ss", "<timestamp>", ...]
         if timestamp_str == "3.0":
             return subprocess.CompletedProcess(
@@ -276,10 +276,11 @@ def test_sample_frames_at_interval_skips_one_failing_timestamp_and_returns_the_r
                 stdout="",
                 stderr="Output file is empty, nothing was encoded",
             )
-        return real_run(command, **kwargs)
+        return real_run_cancelable(command, **kwargs)
 
     with patch(
-        "reel2movie.visual.frame_sampler.subprocess.run", side_effect=fake_run
+        "reel2movie.visual.frame_sampler.run_cancelable",
+        side_effect=fake_run_cancelable,
     ):
         samples = sample_frames_at_interval(
             sample_video, 1.0, VIDEO_DURATION_SECONDS, output_dir=tmp_path
@@ -301,8 +302,8 @@ def test_sample_frames_at_interval_every_timestamp_failing_returns_empty_list(
     so there is nothing further for this function to signal by raising.
     """
     fake_stderr = "fake ffmpeg failure: no such filter or seek error"
-    with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
-        mock_run.return_value = subprocess.CompletedProcess(
+    with patch("reel2movie.visual.frame_sampler.run_cancelable") as mock_run_cancelable:
+        mock_run_cancelable.return_value = subprocess.CompletedProcess(
             args=["ffmpeg"], returncode=1, stdout="", stderr=fake_stderr
         )
         samples = sample_frames_at_interval(
@@ -367,8 +368,8 @@ def test_probe_duration_seconds_on_corrupt_file_raises_clear_error(
 def test_probe_duration_seconds_timeout_raises_frame_extraction_error(
     sample_video: Path,
 ) -> None:
-    with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=30)
+    with patch("reel2movie.visual.frame_sampler.run_cancelable") as mock_run_cancelable:
+        mock_run_cancelable.side_effect = subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=30)
         with pytest.raises(FrameExtractionError, match="timed out"):
             probe_duration_seconds(sample_video)
 
@@ -376,7 +377,7 @@ def test_probe_duration_seconds_timeout_raises_frame_extraction_error(
 def test_probe_duration_seconds_oserror_raises_frame_extraction_error(
     sample_video: Path,
 ) -> None:
-    with patch("reel2movie.visual.frame_sampler.subprocess.run") as mock_run:
-        mock_run.side_effect = OSError("ffmpeg binary not found")
+    with patch("reel2movie.visual.frame_sampler.run_cancelable") as mock_run_cancelable:
+        mock_run_cancelable.side_effect = OSError("ffmpeg binary not found")
         with pytest.raises(FrameExtractionError, match="could not be run"):
             probe_duration_seconds(sample_video)

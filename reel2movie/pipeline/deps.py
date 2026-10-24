@@ -37,15 +37,17 @@ from reel2movie.visual.vision_llm_detector import (
 )
 
 # How often (in seconds) `run_pipeline`'s visual-fallback step samples
-# frames when a `PipelineDeps` doesn't override it. 1.0 was picked so a
-# transient on-screen text overlay held for only 1-2 seconds (per this
-# subtask's `PROGRESS.md` entry -- the motivating case: creator-burned
-# "movies like X" text cards that can fall entirely between two sparse
-# samples) has a near-guaranteed chance of landing in at least one sampled
-# frame. NOT yet empirically tuned against real reel footage -- a
-# deliberate starting guess, same caveat as `visual/frame_dedup.py`'s
-# threshold.
-_DEFAULT_FRAME_INTERVAL_SECONDS = 1.0
+# frames when a `PipelineDeps` doesn't override it. 0.5 was chosen by
+# empirical A/B testing against 3 real sample Instagram Reel videos (in
+# the repo root), not an arbitrary guess: halving the interval from the
+# original 1.0s to 0.5s caught meaningfully more brief on-screen-text/
+# poster frames -- the motivating case is still creator-burned "movies
+# like X" text cards that can be held for only 1-2 seconds and fall
+# entirely between two sparse samples -- at an acceptable ~22%-58%
+# increase in vision-LLM call count. Going denser still, to 0.2s (5x the
+# original rate), was tested and rejected: it cost +26% to +248% more
+# vision-LLM calls for diminishing additional catch rate.
+_DEFAULT_FRAME_INTERVAL_SECONDS = 0.5
 
 # Perceptual-dedup threshold (see `visual/frame_dedup.dedupe_similar_frames`)
 # applied to the dense frame samples above before any frame reaches the

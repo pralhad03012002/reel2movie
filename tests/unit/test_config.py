@@ -15,6 +15,8 @@ from reel2movie.config import (
     get_instagram_cookies_file,
     get_tmdb_token,
     get_vision_backend,
+    get_whisper_cpp_binary,
+    get_whisper_cpp_model_path,
 )
 
 
@@ -92,3 +94,35 @@ def test_get_vision_backend_raises_on_invalid_value(monkeypatch):
     monkeypatch.setenv("VISION_BACKEND", "something_else")
     with pytest.raises(RuntimeError, match="VISION_BACKEND"):
         get_vision_backend()
+
+
+def test_get_whisper_cpp_binary_defaults_to_whisper_cli_when_unset(monkeypatch):
+    monkeypatch.delenv("WHISPER_CPP_BINARY", raising=False)
+    assert get_whisper_cpp_binary() == "whisper-cli"
+
+
+def test_get_whisper_cpp_binary_defaults_to_whisper_cli_when_empty(monkeypatch):
+    monkeypatch.setenv("WHISPER_CPP_BINARY", "")
+    assert get_whisper_cpp_binary() == "whisper-cli"
+
+
+def test_get_whisper_cpp_binary_returns_value_when_set(monkeypatch):
+    monkeypatch.setenv("WHISPER_CPP_BINARY", "/usr/local/bin/main")
+    assert get_whisper_cpp_binary() == "/usr/local/bin/main"
+
+
+def test_get_whisper_cpp_model_path_returns_path_when_set(monkeypatch):
+    monkeypatch.setenv("WHISPER_CPP_MODEL_PATH", "/models/ggml-large-v3-turbo.bin")
+    assert get_whisper_cpp_model_path() == Path("/models/ggml-large-v3-turbo.bin")
+
+
+def test_get_whisper_cpp_model_path_raises_when_unset(monkeypatch):
+    monkeypatch.delenv("WHISPER_CPP_MODEL_PATH", raising=False)
+    with pytest.raises(RuntimeError, match="WHISPER_CPP_MODEL_PATH"):
+        get_whisper_cpp_model_path()
+
+
+def test_get_whisper_cpp_model_path_raises_when_empty(monkeypatch):
+    monkeypatch.setenv("WHISPER_CPP_MODEL_PATH", "")
+    with pytest.raises(RuntimeError, match="WHISPER_CPP_MODEL_PATH"):
+        get_whisper_cpp_model_path()

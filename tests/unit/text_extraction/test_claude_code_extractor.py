@@ -84,9 +84,9 @@ class TestClaudeCodeTextChatClient:
         canned_stdout = _canned_cli_json(result_text='[{"title": "Dhobi Ghat"}]')
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
             )
 
@@ -95,8 +95,8 @@ class TestClaudeCodeTextChatClient:
 
         assert result == '[{"title": "Dhobi Ghat"}]'
 
-        mock_run.assert_called_once()
-        (cmd,), kwargs = mock_run.call_args
+        mock_run_cancelable.assert_called_once()
+        (cmd,), kwargs = mock_run_cancelable.call_args
         assert cmd[0] == "claude"
         assert "-p" in cmd
         assert "--output-format" in cmd and "json" in cmd
@@ -106,9 +106,7 @@ class TestClaudeCodeTextChatClient:
         assert "--permission-mode" in cmd and "bypassPermissions" in cmd
         assert "--no-session-persistence" in cmd
         assert cmd[-1] == "extract movie titles from this text"
-        assert kwargs["capture_output"] is True
-        assert kwargs["text"] is True
-        assert kwargs["timeout"] == 60.0
+        assert kwargs["timeout_seconds"] == 60.0
 
     def test_chat_raises_on_is_error_true(self) -> None:
         canned_stdout = _canned_cli_json(
@@ -116,9 +114,9 @@ class TestClaudeCodeTextChatClient:
         )
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
             )
 
@@ -136,9 +134,9 @@ class TestClaudeCodeTextChatClient:
         )
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
             )
 
@@ -148,9 +146,9 @@ class TestClaudeCodeTextChatClient:
 
     def test_chat_raises_on_non_json_stdout(self) -> None:
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"],
                 returncode=0,
                 stdout="not valid json at all",
@@ -163,9 +161,9 @@ class TestClaudeCodeTextChatClient:
 
     def test_chat_raises_on_nonzero_exit_code(self) -> None:
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"],
                 returncode=1,
                 stdout="",
@@ -178,9 +176,9 @@ class TestClaudeCodeTextChatClient:
 
     def test_chat_raises_clear_error_on_timeout_not_raw_exception(self) -> None:
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.side_effect = subprocess.TimeoutExpired(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.side_effect = subprocess.TimeoutExpired(
                 cmd=["claude"], timeout=60.0
             )
 
@@ -192,9 +190,9 @@ class TestClaudeCodeTextChatClient:
         self,
     ) -> None:
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.side_effect = FileNotFoundError(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.side_effect = FileNotFoundError(
                 "[Errno 2] No such file or directory: 'claude'"
             )
 
@@ -206,9 +204,9 @@ class TestClaudeCodeTextChatClient:
         canned_stdout = _canned_cli_json(result_text="ok")
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["my-claude"], returncode=0, stdout=canned_stdout, stderr=""
             )
 
@@ -218,9 +216,9 @@ class TestClaudeCodeTextChatClient:
             result = client.chat("prompt")
 
         assert result == "ok"
-        (cmd,), kwargs = mock_run.call_args
+        (cmd,), kwargs = mock_run_cancelable.call_args
         assert cmd[0] == "my-claude"
-        assert kwargs["timeout"] == 12.5
+        assert kwargs["timeout_seconds"] == 12.5
 
 
 # ---------------------------------------------------------------------------

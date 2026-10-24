@@ -53,6 +53,15 @@ class InstagramIngestor:
     def __init__(self, client: YtDlpClient, *, cookies_file: Path | None = None) -> None:
         self._client = client
         self._cookies_file = cookies_file
+        # Keyed by reel URL. Avoids re-downloading when `ensure_video()` is
+        # called more than once for the same reel within this instance's
+        # lifetime (e.g. a caller invoking it unconditionally/upfront
+        # rather than lazily). Only successful downloads are cached -- a
+        # failed attempt is not stored, so a retry after a failure (e.g.
+        # transient network error) actually retries instead of re-raising
+        # a cached failure. Process-local only: no TTL/eviction, no disk
+        # persistence.
+        self._video_cache: dict[str, Path] = {}
 
     def fetch_metadata(self, url: str) -> IngestResult:
         """Fetch caption/comments/duration/creator id without downloading video."""
@@ -103,18 +112,28 @@ class InstagramIngestor:
         )
 
     def ensure_video(self, result: IngestResult) -> Path:
-        """Download the video for ``result`` and return its local path."""
+        """Download the video for ``result`` and return its local path.
+
+        Idempotent within this instance's lifetime: a second call for a
+        URL that was already downloaded successfully returns the cached
+        path without re-invoking yt-dlp (see ``self._video_cache``).
+        """
+        cached = self._video_cache.get(result.url)
+        if cached is not None:
+            return cached
+
         info = self._client.extract_info(
             result.url, cookies_file=self._cookies_file, download=True
         )
 
         requested = info.get("requested_downloads") or []
-        if requested and requested[0].get("filepath"):
-            return Path(requested[0]["filepath"])
-
-        filename = info.get("_filename")
-        if filename:
-            return Path(filename)
+        filepath = (requested[0].get("filepath") if requested else None) or info.get(
+            "_filename"
+        )
+        if filepath:
+            path = Path(filepath)
+            self._video_cache[result.url] = path
+            return path
 
         raise IngestError(
             f"yt-dlp download response for {result.url!r} did not include "

@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+
+from reel2movie._subprocess_util import SubprocessCancelled, run_cancelable
 
 
 class ClaudeCliError(RuntimeError):
@@ -28,8 +31,24 @@ class ClaudeCliError(RuntimeError):
     """
 
 
+class ClaudeCliCancelled(ClaudeCliError):
+    """Raised when `cancel_event` fires while the `claude` CLI call is in flight.
+
+    A distinct subclass (not just a `ClaudeCliError` message string) so a
+    caller -- e.g. a future parallel-race orchestrator -- can tell "this
+    job lost the race, nothing actually went wrong" apart from a real
+    failure (timeout, bad exit code, malformed reply, etc.), which all
+    still raise the plain `ClaudeCliError`.
+    """
+
+
 def run_claude_cli(
-    args: list[str], *, claude_binary: str, timeout_seconds: float, context: str
+    args: list[str],
+    *,
+    claude_binary: str,
+    timeout_seconds: float,
+    context: str,
+    cancel_event: "threading.Event | None" = None,
 ) -> str:
     """Run `claude_binary` with `args`, parse its `--output-format json`
     reply, and return the `result` text.
@@ -38,7 +57,14 @@ def run_claude_cli(
     processed (e.g. an image path, or a text-extraction context string) --
     it has no effect on parsing or control flow.
 
+    `cancel_event`, if given, lets a caller abort the in-flight subprocess
+    early (real OS-level termination, not just abandoning the wait) -- see
+    `reel2movie._subprocess_util.run_cancelable`. Defaults to `None`,
+    which disables cancellation entirely and behaves exactly as before.
+
     Raises:
+        ClaudeCliCancelled: if `cancel_event` fires before the subprocess
+            finishes (a `ClaudeCliError` subclass -- see its docstring).
         ClaudeCliError: on subprocess timeout, the `claude` binary being
             missing/not on PATH/not executable (any OSError from
             `subprocess.run` itself), a non-zero exit code, stdout that
@@ -46,12 +72,15 @@ def run_claude_cli(
             parsed reply with a non-empty `permission_denials` list.
     """
     try:
-        result = subprocess.run(
+        result = run_cancelable(
             args,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+            timeout_seconds=timeout_seconds,
+            cancel_event=cancel_event,
         )
+    except SubprocessCancelled as exc:
+        raise ClaudeCliCancelled(
+            f"`{claude_binary}` CLI call was cancelled {context}"
+        ) from exc
     except subprocess.TimeoutExpired as exc:
         raise ClaudeCliError(
             f"`{claude_binary}` CLI timed out after {timeout_seconds}s {context}"

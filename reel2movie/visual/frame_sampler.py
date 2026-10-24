@@ -52,10 +52,12 @@ import logging
 import re
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 import imageio_ffmpeg
 
+from reel2movie._subprocess_util import SubprocessCancelled, run_cancelable
 from reel2movie.core.models import FrameSample
 
 logger = logging.getLogger(__name__)
@@ -99,7 +101,13 @@ def _compute_timestamps(n: int, duration_seconds: float) -> list[float]:
     return [start + i * step for i in range(n)]
 
 
-def _extract_frame_at(video_path: Path, timestamp: float, frame_path: Path) -> None:
+def _extract_frame_at(
+    video_path: Path,
+    timestamp: float,
+    frame_path: Path,
+    *,
+    cancel_event: "threading.Event | None" = None,
+) -> None:
     """Extract a single frame from `video_path` at `timestamp` into `frame_path`.
 
     Shared by `sample_frames` and `sample_frames_at_interval` — the only
@@ -111,7 +119,9 @@ def _extract_frame_at(video_path: Path, timestamp: float, frame_path: Path) -> N
 
     Invokes the `imageio_ffmpeg`-bundled ffmpeg binary directly:
     `ffmpeg -ss <timestamp> -i <video_path> -frames:v 1 -pix_fmt yuvj420p
-    -y <frame_path>`.
+    -y <frame_path>`, via `run_cancelable` so an in-flight extraction can
+    be killed early if `cancel_event` fires (default `None` -- no
+    cancellation, same behavior as before).
 
     Raises:
         FrameExtractionError: if the ffmpeg subprocess times out, returns
@@ -120,6 +130,10 @@ def _extract_frame_at(video_path: Path, timestamp: float, frame_path: Path) -> N
             writing nothing, e.g. "Output file is empty, nothing was
             encoded" when seeking near the edge of a sparse video) — the
             message includes ffmpeg's captured stderr when available.
+        SubprocessCancelled: if `cancel_event` fires before ffmpeg
+            finishes -- propagated as-is (not wrapped in
+            `FrameExtractionError`), so callers can distinguish "this lost
+            the race" from a real extraction failure.
     """
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     # -pix_fmt yuvj420p: forces a pixel format the mjpeg encoder always
@@ -144,11 +158,10 @@ def _extract_frame_at(video_path: Path, timestamp: float, frame_path: Path) -> N
         str(frame_path),
     ]
     try:
-        result = subprocess.run(
+        result = run_cancelable(
             command,
-            capture_output=True,
-            text=True,
-            timeout=_FFMPEG_TIMEOUT_SECONDS,
+            timeout_seconds=_FFMPEG_TIMEOUT_SECONDS,
+            cancel_event=cancel_event,
         )
     except subprocess.TimeoutExpired as exc:
         raise FrameExtractionError(
@@ -241,6 +254,7 @@ def sample_frames_at_interval(
     duration_seconds: float,
     *,
     output_dir: Path | None = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> list[FrameSample]:
     """Extract frames from `video_path` every `interval_seconds`, start to end.
 
@@ -322,12 +336,35 @@ def sample_frames_at_interval(
     caller ever points both functions at the same directory (they don't
     today, but nothing stops it from changing).
 
+    Cancellation (`cancel_event`, default `None` -- no cancellation, same
+    behavior as before): checked at the TOP of the per-timestamp loop
+    (before even starting the next frame's `_extract_frame_at` call) so
+    this stops requesting further frames promptly once cancelled, not
+    just whenever the one ffmpeg call currently in flight happens to
+    notice -- and also passed through to `_extract_frame_at` itself so
+    that in-flight call gets killed too, rather than being left to run to
+    completion.
+
+    Chosen return contract on cancellation: whatever `FrameSample`s were
+    successfully extracted BEFORE the cancellation is returned (a partial,
+    best-effort result) -- the same "best effort, not all-or-nothing"
+    philosophy this function already applies to a single timestamp's
+    extraction failure (see "Best-effort vs. all-or-nothing" above), not a
+    raised exception. This is deliberate, not an oversight: a caller
+    racing this against other extraction methods wants whatever signal was
+    already gathered, not to have it thrown away. To avoid this silently
+    looking like "the video just had fewer frames than expected", a
+    cancellation is always logged as a warning naming how many of the
+    requested timestamps were actually attempted before stopping.
+
     Raises:
         ValueError: if `interval_seconds <= 0` or `duration_seconds <= 0`.
 
     Never raises `FrameExtractionError` for a per-timestamp ffmpeg
     failure (see "Best-effort vs. all-or-nothing" above) -- such failures
-    are caught, logged, and skipped instead.
+    are caught, logged, and skipped instead. Never raises
+    `SubprocessCancelled` either -- see "Cancellation" above for why a
+    cancellation instead returns the partial result gathered so far.
     """
     if interval_seconds <= 0:
         raise ValueError(
@@ -349,9 +386,39 @@ def sample_frames_at_interval(
 
     samples: list[FrameSample] = []
     for i, timestamp in enumerate(timestamps):
+        # Checked BEFORE starting the next frame's extraction (not only
+        # inside the except-clause below) so a cancellation stops further
+        # ffmpeg calls from being requested at all, not just whichever one
+        # happens to be in flight -- see the docstring's "Cancellation"
+        # section.
+        if cancel_event is not None and cancel_event.is_set():
+            logger.warning(
+                "sample_frames_at_interval cancelled before timestamp "
+                "%.3fs from %s -- returning the %d/%d frame(s) already "
+                "extracted",
+                timestamp,
+                video_path,
+                len(samples),
+                len(timestamps),
+            )
+            break
+
         frame_path = output_dir / f"frame_{i:04d}.jpg"
         try:
-            _extract_frame_at(video_path, timestamp, frame_path)
+            _extract_frame_at(
+                video_path, timestamp, frame_path, cancel_event=cancel_event
+            )
+        except SubprocessCancelled:
+            logger.warning(
+                "sample_frames_at_interval cancelled mid-extraction at "
+                "timestamp %.3fs from %s -- returning the %d/%d frame(s) "
+                "already extracted",
+                timestamp,
+                video_path,
+                len(samples),
+                len(timestamps),
+            )
+            break
         except FrameExtractionError as exc:
             # Best-effort: skip this one timestamp and keep going -- see
             # the docstring's "Best-effort vs. all-or-nothing" section for
@@ -370,7 +437,9 @@ def sample_frames_at_interval(
     return samples
 
 
-def probe_duration_seconds(video_path: Path) -> float:
+def probe_duration_seconds(
+    video_path: Path, *, cancel_event: "threading.Event | None" = None
+) -> float:
     """Determine a video's duration by probing the actual file on disk.
 
     `imageio-ffmpeg` bundles only the `ffmpeg` binary, not `ffprobe`, so
@@ -388,21 +457,28 @@ def probe_duration_seconds(video_path: Path) -> float:
     platform's own reported duration is missing or invalid (see
     `pipeline/waterfall.py`'s `_extract_from_visual`).
 
+    `cancel_event`, if given, lets a caller kill the in-flight ffmpeg
+    probe early (default `None` -- no cancellation, same behavior as
+    before); see `reel2movie._subprocess_util.run_cancelable`.
+
     Raises:
         FrameExtractionError: if the ffmpeg subprocess times out, the
             ffmpeg binary can't be run at all (`OSError`), or no
             parseable `Duration:` line is found in stderr (e.g. a
             corrupt or non-video file) -- the message includes a
             snippet of ffmpeg's stderr for debuggability.
+        SubprocessCancelled: if `cancel_event` fires before ffmpeg
+            finishes -- propagated as-is (not wrapped in
+            `FrameExtractionError`), so callers can distinguish "this lost
+            the race" from a real probing failure.
     """
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     command = [ffmpeg_exe, "-i", str(video_path)]
     try:
-        result = subprocess.run(
+        result = run_cancelable(
             command,
-            capture_output=True,
-            text=True,
-            timeout=_FFMPEG_TIMEOUT_SECONDS,
+            timeout_seconds=_FFMPEG_TIMEOUT_SECONDS,
+            cancel_event=cancel_event,
         )
     except subprocess.TimeoutExpired as exc:
         raise FrameExtractionError(

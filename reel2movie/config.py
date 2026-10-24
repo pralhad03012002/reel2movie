@@ -71,6 +71,47 @@ def get_vision_backend() -> str:
     return value
 
 
+def get_whisper_cpp_binary() -> str:
+    """Return the whisper.cpp CLI binary name/path from ``WHISPER_CPP_BINARY``.
+
+    Defaults to ``"whisper-cli"`` when the env var is unset or empty --
+    the current whisper.cpp CLI binary name (the older `main` name is
+    historical; `whisper-cli` is what the current Homebrew `whisper.cpp`
+    formula installs on macOS). Mirrors ``get_vision_backend()``'s
+    "optional, sensible default, never raises on unset" style rather than
+    ``get_anthropic_key()``'s "required" style: not every pipeline run
+    reaches the audio-transcript fallback, so this must never raise just
+    because the env var wasn't set.
+    """
+    return os.environ.get("WHISPER_CPP_BINARY", "") or "whisper-cli"
+
+
+def get_whisper_cpp_model_path() -> Path:
+    """Return the configured whisper.cpp ggml model path from
+    ``WHISPER_CPP_MODEL_PATH``.
+
+    Mirrors ``get_anthropic_key()``'s "conditional, only required when
+    actually needed" style rather than ``get_vision_backend()``'s
+    always-has-a-default style: unlike the CLI binary name (one
+    reasonable default exists), there is no safe default *model file
+    path* to assume -- ggml model files are multi-hundred-MB-to-multi-GB
+    downloads this project never bundles, so guessing a path would just
+    defer an unset-config error from here to a more confusing "file not
+    found" deeper inside ``audio/whisper_cpp_transcriber.py``. This is
+    only called (and so only required) when the pipeline actually reaches
+    the audio-transcript fallback step -- never eagerly at import time.
+
+    Raises:
+        RuntimeError: if the env var is unset or empty.
+    """
+    value = os.environ.get("WHISPER_CPP_MODEL_PATH", "")
+    if not value:
+        raise RuntimeError(
+            f"WHISPER_CPP_MODEL_PATH is not set ({_ENV_EXAMPLE_HINT})."
+        )
+    return Path(value)
+
+
 def get_instagram_cookies_file() -> Path | None:
     """Return the configured Instagram cookies file path, if any.
 

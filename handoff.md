@@ -38,7 +38,7 @@ python3 -m reel2movie "https://www.instagram.com/reel/<id>/"
 Prints a JSON object to stdout (see "Output contract" below) and exits 0,
 or prints a one-line error to stderr and exits 1 (config errors, unreachable
 URL). `--frame-interval-seconds <float>` overrides the dense-sampling
-interval (default 1.0s); there is currently no CLI flag for the frame-dedup
+interval (default 0.5s); there is currently no CLI flag for the frame-dedup
 threshold (internal-only, see `pipeline/deps.py`).
 
 ## The real integration point for a GUI: don't shell out, import it

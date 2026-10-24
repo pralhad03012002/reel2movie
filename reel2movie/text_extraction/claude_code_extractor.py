@@ -32,6 +32,7 @@ shared constants by import, not duplicating magic numbers (see
 
 from __future__ import annotations
 
+import threading
 from typing import Protocol, runtime_checkable
 
 from reel2movie._candidate_parsing import parse_movie_candidates
@@ -52,7 +53,9 @@ class TextChatClient(Protocol):
     reasoning, no file/image access required.
     """
 
-    def chat(self, prompt: str) -> str: ...
+    def chat(
+        self, prompt: str, *, cancel_event: threading.Event | None = None
+    ) -> str: ...
 
 
 # Alias (not a subclass) of the shared `ClaudeCliError` raised by
@@ -76,15 +79,23 @@ class ClaudeCodeTextChatClient:
         self._claude_binary = claude_binary
         self._timeout_seconds = timeout_seconds
 
-    def chat(self, prompt: str) -> str:
+    def chat(
+        self, prompt: str, *, cancel_event: threading.Event | None = None
+    ) -> str:
         """Ask the `claude` CLI to answer `prompt`, return the text reply.
+
+        `cancel_event`, if given, lets a caller kill the in-flight `claude`
+        CLI subprocess early -- passed straight through to
+        `run_claude_cli()`. Defaults to `None` (no cancellation).
 
         Raises:
             ClaudeCodeTextError: on subprocess timeout, the `claude`
                 binary being missing/not on `PATH`/not executable (any
                 `OSError` from `subprocess.run` itself), non-zero exit,
                 non-JSON stdout, `is_error: true`, or a non-empty
-                `permission_denials` list in the parsed reply.
+                `permission_denials` list in the parsed reply. Also
+                raised (as its `ClaudeCliCancelled` subclass) if
+                `cancel_event` fires before the subprocess finishes.
         """
         return run_claude_cli(
             [
@@ -102,6 +113,7 @@ class ClaudeCodeTextChatClient:
             claude_binary=self._claude_binary,
             timeout_seconds=self._timeout_seconds,
             context="extracting movie titles from text",
+            cancel_event=cancel_event,
         )
 
 
@@ -163,11 +175,24 @@ class ClaudeCodeCandidateExtractor:
     def __init__(self, chat_client: TextChatClient) -> None:
         self._chat_client = chat_client
 
-    def extract(self, text: str, source: SourceTag) -> list[Candidate]:
+    def extract(
+        self,
+        text: str,
+        source: SourceTag,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> list[Candidate]:
         """Ask the chat client about `text`, parse the reply into Candidates.
 
         Skips the CLI call entirely (returns `[]`) for empty/whitespace-
         only text -- no point spending a subprocess call on nothing.
+
+        `cancel_event`, if given, is passed through to the
+        `TextChatClient.chat()` call -- but only when it's actually set
+        (not `None`), so a pre-existing `TextChatClient`-shaped test
+        double that only implements `chat(prompt)` (predating this
+        parameter) keeps working unmodified for every call site that
+        doesn't use cancellation.
 
         Never raises on a malformed/non-JSON/unexpected-shape reply from
         the model -- a single bad extraction shouldn't crash the whole
@@ -178,7 +203,10 @@ class ClaudeCodeCandidateExtractor:
             return []
 
         prompt = _PROMPT_TEMPLATE.replace("{text}", text)
-        raw_response = self._chat_client.chat(prompt)
+        if cancel_event is not None:
+            raw_response = self._chat_client.chat(prompt, cancel_event=cancel_event)
+        else:
+            raw_response = self._chat_client.chat(prompt)
 
         return parse_movie_candidates(
             raw_response,

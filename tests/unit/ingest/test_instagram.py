@@ -234,6 +234,60 @@ def test_ensure_video_raises_ingest_error_when_no_path_available():
         ingestor.ensure_video(result)
 
 
+def test_ensure_video_caches_successful_download_and_does_not_redownload():
+    """Calling `ensure_video()` twice for the same URL must only hit the
+    underlying yt-dlp download once -- the second call returns the cached
+    path. Guards against the duplicate-download bug: a caller invoking
+    `ensure_video()` unconditionally/upfront (rather than lazily, once)
+    for the same reel should not pay for the download twice.
+    """
+    fixture = _load_fixture()
+    client = FakeYtDlpClient(metadata_response=fixture)
+    ingestor = InstagramIngestor(client)
+    url = "https://www.instagram.com/reel/CxSampleReelId123/"
+    result = ingestor.fetch_metadata(url)
+
+    client.download_response = {
+        **fixture,
+        "requested_downloads": [{"filepath": "/tmp/downloads/reel123.mp4"}],
+    }
+
+    first = ingestor.ensure_video(result)
+    second = ingestor.ensure_video(result)
+
+    assert first == Path("/tmp/downloads/reel123.mp4")
+    assert second == first
+    download_calls = [c for c in client.calls if c["download"] is True]
+    assert len(download_calls) == 1
+
+
+def test_ensure_video_does_not_cache_failures_and_retries_on_next_call():
+    """A failed `ensure_video()` call must not poison the cache -- a
+    subsequent call for the same URL should actually retry the download
+    rather than re-raising (or silently succeeding from) a cached failure.
+    """
+    fixture = _load_fixture()
+    client = FakeYtDlpClient(metadata_response=fixture)
+    ingestor = InstagramIngestor(client)
+    result = ingestor.fetch_metadata("https://www.instagram.com/reel/x/")
+
+    client.download_response = {**fixture}  # no filepath/_filename -> raises
+
+    with pytest.raises(IngestError, match="filepath"):
+        ingestor.ensure_video(result)
+
+    client.download_response = {
+        **fixture,
+        "requested_downloads": [{"filepath": "/tmp/downloads/retry.mp4"}],
+    }
+
+    video_path = ingestor.ensure_video(result)
+
+    assert video_path == Path("/tmp/downloads/retry.mp4")
+    download_calls = [c for c in client.calls if c["download"] is True]
+    assert len(download_calls) == 2
+
+
 def test_ensure_video_passes_cookies_file_through_to_client():
     fixture = _load_fixture()
     client = FakeYtDlpClient(metadata_response=fixture)

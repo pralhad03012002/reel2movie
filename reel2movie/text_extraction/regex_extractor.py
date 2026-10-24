@@ -22,6 +22,7 @@ deliberate scope limit, not a bug.
 from __future__ import annotations
 
 import re
+import threading
 
 from reel2movie.core.models import Candidate, SourceTag
 
@@ -88,7 +89,17 @@ def _clean_list_title(raw: str) -> str:
 class RegexCandidateExtractor:
     """Pure, stateless `CandidateExtractor`: regex/string logic only."""
 
-    def extract(self, text: str, source: SourceTag) -> list[Candidate]:
+    def extract(
+        self,
+        text: str,
+        source: SourceTag,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> list[Candidate]:
+        # cancel_event is accepted only for signature compatibility with
+        # core.protocols.CandidateExtractor -- this extractor is pure
+        # regex/string logic with no subprocess or I/O, so there is
+        # nothing in flight to actually cancel. Not an oversight.
         if not text:
             return []
 

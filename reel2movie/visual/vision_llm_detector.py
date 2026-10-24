@@ -37,6 +37,7 @@ always a constructor parameter, supplied by the caller (a later
 from __future__ import annotations
 
 import base64
+import threading
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -56,7 +57,13 @@ class VisionChatClient(Protocol):
     provider later without touching `VisionLLMPosterDetector` at all.
     """
 
-    def chat(self, image_path: Path, prompt: str) -> str: ...
+    def chat(
+        self,
+        image_path: Path,
+        prompt: str,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> str: ...
 
 
 # Maps a frame file's extension to the Anthropic API's expected image
@@ -80,8 +87,26 @@ class AnthropicVisionChatClient:
         self._client = anthropic.Anthropic(api_key=api_key)
         self._model = model
 
-    def chat(self, image_path: Path, prompt: str) -> str:
+    def chat(
+        self,
+        image_path: Path,
+        prompt: str,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
         """Send one image + a text prompt to Claude, return the text reply.
+
+        `cancel_event` is accepted only for signature compatibility with
+        `VisionChatClient` -- it CANNOT actually be honored here. This is
+        a known, accepted limitation, not a bug: this call goes through
+        the `anthropic` SDK's blocking HTTP request (`messages.create`),
+        not a local subprocess this module controls, so there is no
+        local OS process to terminate. Under `VISION_BACKEND=anthropic_api`,
+        a "cancelled" call still runs to completion server-side and is
+        billed as normal -- the caller just won't wait for or use its
+        result (it should move on once `cancel_event` fires, same as any
+        other racing extractor, but this client itself does not abort the
+        in-flight HTTP request).
 
         Raises:
             ValueError: if `image_path`'s extension isn't a recognized
@@ -166,15 +191,27 @@ class ClaudeCodeVisionChatClient:
         self._claude_binary = claude_binary
         self._timeout_seconds = timeout_seconds
 
-    def chat(self, image_path: Path, prompt: str) -> str:
+    def chat(
+        self,
+        image_path: Path,
+        prompt: str,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
         """Ask the `claude` CLI to read `image_path` then answer `prompt`.
+
+        `cancel_event`, if given, lets a caller kill the in-flight `claude`
+        CLI subprocess early -- passed straight through to
+        `run_claude_cli()`. Defaults to `None` (no cancellation).
 
         Raises:
             ClaudeCodeVisionError: on subprocess timeout, the `claude`
                 binary being missing/not on `PATH`/not executable (any
                 `OSError` from `subprocess.run` itself), non-zero exit,
                 non-JSON stdout, `is_error: true`, or a non-empty
-                `permission_denials` list in the parsed reply.
+                `permission_denials` list in the parsed reply. Also
+                raised (as its `ClaudeCliCancelled` subclass) if
+                `cancel_event` fires before the subprocess finishes.
         """
         combined_prompt = (
             f"Read the image file at {image_path} using your Read tool. {prompt}"
@@ -196,6 +233,7 @@ class ClaudeCodeVisionChatClient:
             claude_binary=self._claude_binary,
             timeout_seconds=self._timeout_seconds,
             context=f"analyzing {image_path}",
+            cancel_event=cancel_event,
         )
 
 
@@ -266,15 +304,29 @@ class VisionLLMPosterDetector:
     def __init__(self, chat_client: VisionChatClient) -> None:
         self._chat_client = chat_client
 
-    def detect(self, frame: FrameSample) -> list[Candidate]:
+    def detect(
+        self, frame: FrameSample, *, cancel_event: threading.Event | None = None
+    ) -> list[Candidate]:
         """Ask the chat client about `frame`, parse the reply into Candidates.
+
+        `cancel_event`, if given, is passed through to the
+        `VisionChatClient.chat()` call -- but only when it's actually set
+        (not `None`), so a pre-existing `VisionChatClient`-shaped test
+        double that only implements `chat(image_path, prompt)` (predating
+        this parameter) keeps working unmodified for every call site that
+        doesn't use cancellation.
 
         Never raises on a malformed/non-JSON/unexpected-shape reply from the
         model — a single bad frame detection shouldn't crash the whole
         pipeline, so any parsing failure is logged and `[]` is returned
         instead.
         """
-        raw_response = self._chat_client.chat(frame.path, _PROMPT)
+        if cancel_event is not None:
+            raw_response = self._chat_client.chat(
+                frame.path, _PROMPT, cancel_event=cancel_event
+            )
+        else:
+            raw_response = self._chat_client.chat(frame.path, _PROMPT)
 
         return parse_movie_candidates(
             raw_response,

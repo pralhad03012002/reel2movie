@@ -369,9 +369,9 @@ class TestClaudeCodeVisionChatClient:
         )
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
             )
 
@@ -380,8 +380,8 @@ class TestClaudeCodeVisionChatClient:
 
         assert result == "This is a classic TV color bar test pattern."
 
-        mock_run.assert_called_once()
-        (cmd,), kwargs = mock_run.call_args
+        mock_run_cancelable.assert_called_once()
+        (cmd,), kwargs = mock_run_cancelable.call_args
         assert cmd[0] == "claude"
         assert "-p" in cmd
         assert "--output-format" in cmd and "json" in cmd
@@ -391,9 +391,7 @@ class TestClaudeCodeVisionChatClient:
         combined_prompt = cmd[-1]
         assert str(image_path) in combined_prompt
         assert "describe the colors" in combined_prompt
-        assert kwargs["capture_output"] is True
-        assert kwargs["text"] is True
-        assert kwargs["timeout"] == 60.0
+        assert kwargs["timeout_seconds"] == 60.0
 
     def test_chat_raises_on_is_error_true(self, tmp_path: Path) -> None:
         image_path = tmp_path / "frame_000.jpg"
@@ -403,9 +401,9 @@ class TestClaudeCodeVisionChatClient:
         )
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
             )
 
@@ -430,9 +428,9 @@ class TestClaudeCodeVisionChatClient:
         )
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"], returncode=0, stdout=canned_stdout, stderr=""
             )
 
@@ -445,9 +443,9 @@ class TestClaudeCodeVisionChatClient:
         image_path.write_bytes(b"fake-jpeg-bytes")
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"],
                 returncode=0,
                 stdout="not valid json at all",
@@ -463,9 +461,9 @@ class TestClaudeCodeVisionChatClient:
         image_path.write_bytes(b"fake-jpeg-bytes")
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["claude"],
                 returncode=1,
                 stdout="",
@@ -483,9 +481,9 @@ class TestClaudeCodeVisionChatClient:
         image_path.write_bytes(b"fake-jpeg-bytes")
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.side_effect = subprocess.TimeoutExpired(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.side_effect = subprocess.TimeoutExpired(
                 cmd=["claude"], timeout=60.0
             )
 
@@ -500,9 +498,9 @@ class TestClaudeCodeVisionChatClient:
         image_path.write_bytes(b"fake-jpeg-bytes")
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.side_effect = FileNotFoundError(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.side_effect = FileNotFoundError(
                 "[Errno 2] No such file or directory: 'claude'"
             )
 
@@ -516,9 +514,9 @@ class TestClaudeCodeVisionChatClient:
         canned_stdout = _canned_cli_json(result_text="ok")
 
         with patch(
-            "reel2movie._claude_cli.subprocess.run"
-        ) as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
                 args=["my-claude"], returncode=0, stdout=canned_stdout, stderr=""
             )
 
@@ -528,6 +526,6 @@ class TestClaudeCodeVisionChatClient:
             result = client.chat(image_path, "prompt")
 
         assert result == "ok"
-        (cmd,), kwargs = mock_run.call_args
+        (cmd,), kwargs = mock_run_cancelable.call_args
         assert cmd[0] == "my-claude"
-        assert kwargs["timeout"] == 12.5
+        assert kwargs["timeout_seconds"] == 12.5

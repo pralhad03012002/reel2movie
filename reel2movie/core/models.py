@@ -30,6 +30,7 @@ class SourceTag(StrEnum):
     CAPTION = "caption"
     CREATOR_COMMENT = "creator_comment"
     FRAME_VISUAL = "frame_visual"
+    AUDIO_TRANSCRIPT = "audio_transcript"
 
 
 @dataclass(frozen=True, slots=True)

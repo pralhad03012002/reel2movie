@@ -13,6 +13,7 @@ checks method presence/arity only, not signatures or types).
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -50,7 +51,13 @@ class Ingestor(Protocol):
 class CandidateExtractor(Protocol):
     """Pulls candidate movie-title strings out of a block of text."""
 
-    def extract(self, text: str, source: SourceTag) -> list[Candidate]:
+    def extract(
+        self,
+        text: str,
+        source: SourceTag,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> list[Candidate]:
         ...
 
 
@@ -58,7 +65,19 @@ class CandidateExtractor(Protocol):
 class PosterDetector(Protocol):
     """Detects movie posters/title cards in a single sampled video frame."""
 
-    def detect(self, frame: FrameSample) -> list[Candidate]:
+    def detect(
+        self, frame: FrameSample, *, cancel_event: threading.Event | None = None
+    ) -> list[Candidate]:
+        ...
+
+
+@runtime_checkable
+class AudioTranscriber(Protocol):
+    """Transcribes a 16kHz-mono-WAV audio file's speech into plain text."""
+
+    def transcribe(
+        self, audio_path: Path, *, cancel_event: threading.Event | None = None
+    ) -> str:
         ...
 
 

@@ -30,6 +30,23 @@ def test_builds_without_raising_when_required_env_vars_present(monkeypatch):
     assert deps.frame_dedup_threshold >= 0
 
 
+def test_frame_interval_seconds_defaults_to_half_a_second():
+    """0.5s was chosen via empirical A/B testing (see `deps.py`'s comment
+    above `_DEFAULT_FRAME_INTERVAL_SECONDS`) over the old 1.0s default --
+    pin the exact value so a regression back to 1.0 (or any other value)
+    is caught directly, independent of `build_default_pipeline_deps()`'s
+    wiring.
+    """
+    deps = PipelineDeps(
+        ingestor=None,
+        text_extractor=None,
+        poster_detector=None,
+        tmdb_client=None,
+    )
+
+    assert deps.frame_interval_seconds == 0.5
+
+
 def test_builds_without_anthropic_key_when_backend_defaults_to_claude_code(
     monkeypatch,
 ):
