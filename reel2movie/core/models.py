@@ -82,6 +82,18 @@ class Candidate:
     raw_text: str
     source: SourceTag
     confidence: float
+    # Optional overall "movie" | "tv" | None hint for what the surrounding
+    # source text as a whole is recommending, attached by
+    # `text_extraction/candidate_disambiguation.py`'s
+    # `select_primary_candidates()` to every candidate that survives its
+    # noise-filtering pass (see that module's docstring). `None` — the
+    # default — means "no hint available" (the candidate was never passed
+    # through that filter, or the model didn't give a confident hint),
+    # which every existing construction site implicitly gets for free.
+    # Deliberately placed LAST, with a default, so every existing
+    # `Candidate(...)` construction site (keyword or positional) across
+    # the codebase keeps working unmodified.
+    media_type_hint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

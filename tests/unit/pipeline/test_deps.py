@@ -112,3 +112,63 @@ def test_text_extractor_is_fallback_wrapping_regex_and_claude_code(monkeypatch):
     assert isinstance(deps.text_extractor, FallbackCandidateExtractor)
     assert isinstance(deps.text_extractor._primary, RegexCandidateExtractor)
     assert isinstance(deps.text_extractor._fallback, ClaudeCodeCandidateExtractor)
+
+
+def test_audio_transcriber_is_none_when_whisper_cpp_model_path_unset(monkeypatch):
+    """`build_default_pipeline_deps()` must leave `audio_transcriber`
+    `None` when `WHISPER_CPP_MODEL_PATH` is unset -- whisper.cpp is an
+    optional capability most environments won't have configured, and
+    wiring a real (if lazy) transcriber regardless would make every run's
+    audio-transcript race job attempt a `transcribe()` call that
+    immediately raises `RuntimeError`, logged at ERROR with a full
+    traceback on every single run (see `deps.py`'s own docstring). `None`
+    is the same "capability not available" signal
+    `disambiguation_chat_client` already uses, and makes
+    `pipeline/waterfall.py`'s `_prepare_audio`/
+    `_extract_from_audio_transcript` skip the audio work entirely.
+    """
+    monkeypatch.setenv("TMDB_API_KEY", "fake-tmdb-token")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("VISION_BACKEND", raising=False)
+    monkeypatch.delenv("INSTAGRAM_COOKIES_FILE", raising=False)
+    monkeypatch.delenv("WHISPER_CPP_MODEL_PATH", raising=False)
+
+    deps = build_default_pipeline_deps()
+
+    assert deps.audio_transcriber is None
+
+
+def test_audio_transcriber_is_wired_when_whisper_cpp_model_path_set(monkeypatch):
+    """When `WHISPER_CPP_MODEL_PATH` IS set, `build_default_pipeline_deps()`
+    must wire a real (lazy) `AudioTranscriber` -- still deferring the
+    actual `WhisperCppTranscriber` construction/`WHISPER_CPP_BINARY` read
+    until `.transcribe()` is called (see `_LazyWhisperCppTranscriber`'s
+    docstring), never eagerly at construction time.
+    """
+    monkeypatch.setenv("TMDB_API_KEY", "fake-tmdb-token")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("VISION_BACKEND", raising=False)
+    monkeypatch.delenv("INSTAGRAM_COOKIES_FILE", raising=False)
+    monkeypatch.setenv("WHISPER_CPP_MODEL_PATH", "/fake/model.bin")
+
+    deps = build_default_pipeline_deps()
+
+    assert deps.audio_transcriber is not None
+
+
+def test_pipeline_deps_audio_transcriber_defaults_to_none():
+    """A `PipelineDeps` built directly (e.g. by a test, not via
+    `build_default_pipeline_deps()`) without specifying `audio_transcriber`
+    must default to `None` -- "no audio-transcript capability available",
+    not an error -- so every pre-existing direct `PipelineDeps(...)`
+    construction (predating the audio-transcript race job) keeps working
+    unmodified.
+    """
+    deps = PipelineDeps(
+        ingestor=None,
+        text_extractor=None,
+        poster_detector=None,
+        tmdb_client=None,
+    )
+
+    assert deps.audio_transcriber is None

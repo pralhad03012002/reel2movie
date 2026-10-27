@@ -118,6 +118,18 @@ class WhisperCppTranscriber:
         output_prefix = audio_path.with_suffix("")
         output_txt_path = output_prefix.with_suffix(".txt")
 
+        # Remove any pre-existing output file from a previous run at this
+        # same path BEFORE invoking whisper-cli. Without this, if a caller
+        # ever transcribes the same `audio_path` twice (e.g. a retry) and
+        # this invocation exits 0 without actually (re)writing the file --
+        # the same "reports success but writes nothing" quirk this
+        # codebase already distrusts ffmpeg for, see
+        # `visual.frame_sampler`'s module docstring -- the existence check
+        # below would pass on the STALE file from the earlier run, and a
+        # caller would silently get back an unrelated, out-of-date
+        # transcript instead of an error.
+        output_txt_path.unlink(missing_ok=True)
+
         command = [
             self._whisper_binary,
             "-m",

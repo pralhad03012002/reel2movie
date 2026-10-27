@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from reel2movie._claude_cli import ClaudeCliCancelled
+from reel2movie._subprocess_util import SubprocessCancelled
 from reel2movie.core.models import Candidate, SourceTag
 from reel2movie.text_extraction.claude_code_extractor import (
     ClaudeCodeCandidateExtractor,
@@ -403,3 +406,71 @@ class TestClaudeCodeCandidateExtractorEmptyTextShortCircuit:
 
         assert result == []
         assert fake.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# End-to-end cancellation: ClaudeCodeCandidateExtractor.extract(cancel_event=..)
+# -> ClaudeCodeTextChatClient.chat(cancel_event=..) -> run_claude_cli(cancel_event=..)
+# -> run_cancelable(cancel_event=..). The only thing mocked here is
+# run_cancelable itself (to raise SubprocessCancelled, standing in for a
+# real OS-level kill) -- every layer in between (ClaudeCodeCandidateExtractor,
+# ClaudeCodeTextChatClient, run_claude_cli) is the real, unmocked production
+# code, so this proves the cancellation signal and the resulting
+# ClaudeCliCancelled exception actually propagate all the way up through the
+# full real chain rather than being swallowed or silently "succeeding" with
+# a stale/partial result.
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeCodeCandidateExtractorCancellation:
+    def test_cancel_event_propagates_as_claude_cli_cancelled_through_the_real_chain(
+        self,
+    ) -> None:
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        real_chat_client = ClaudeCodeTextChatClient()
+        extractor = ClaudeCodeCandidateExtractor(real_chat_client)
+
+        with patch(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.side_effect = SubprocessCancelled(
+                "subprocess cancelled"
+            )
+
+            with pytest.raises(ClaudeCliCancelled):
+                extractor.extract(
+                    "some prose caption", SourceTag.CAPTION, cancel_event=cancel_event
+                )
+
+        # The real cancel_event instance must have reached run_cancelable
+        # unchanged, all the way through the real (unmocked)
+        # ClaudeCodeTextChatClient.chat() and run_claude_cli() layers.
+        mock_run_cancelable.assert_called_once()
+        _, kwargs = mock_run_cancelable.call_args
+        assert kwargs["cancel_event"] is cancel_event
+
+    def test_no_cancel_event_does_not_hang_or_silently_succeed_on_a_real_cancellation(
+        self,
+    ) -> None:
+        """Sanity check for the inverse: when cancel_event IS None (the
+        default), a SubprocessCancelled from deep in the chain still isn't
+        possible to trigger via cancellation -- this just confirms the
+        default path calls run_cancelable with cancel_event=None, matching
+        every pre-existing (non-cancellation-aware) call site."""
+        real_chat_client = ClaudeCodeTextChatClient()
+        extractor = ClaudeCodeCandidateExtractor(real_chat_client)
+
+        with patch(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
+                args=["claude"], returncode=0, stdout=_canned_cli_json(result_text="[]"), stderr=""
+            )
+
+            result = extractor.extract("some prose caption", SourceTag.CAPTION)
+
+        assert result == []
+        _, kwargs = mock_run_cancelable.call_args
+        assert kwargs["cancel_event"] is None

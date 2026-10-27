@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -207,8 +208,6 @@ class TestRunClaudeCli:
                 )
 
     def test_cancel_event_is_passed_through_to_run_cancelable(self) -> None:
-        import threading
-
         cancel_event = threading.Event()
         with patch("reel2movie._claude_cli.run_cancelable") as mock_run_cancelable:
             mock_run_cancelable.return_value = subprocess.CompletedProcess(

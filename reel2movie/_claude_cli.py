@@ -31,7 +31,7 @@ class ClaudeCliError(RuntimeError):
     """
 
 
-class ClaudeCliCancelled(ClaudeCliError):
+class ClaudeCliCancelled(ClaudeCliError, SubprocessCancelled):
     """Raised when `cancel_event` fires while the `claude` CLI call is in flight.
 
     A distinct subclass (not just a `ClaudeCliError` message string) so a
@@ -39,6 +39,22 @@ class ClaudeCliCancelled(ClaudeCliError):
     job lost the race, nothing actually went wrong" apart from a real
     failure (timeout, bad exit code, malformed reply, etc.), which all
     still raise the plain `ClaudeCliError`.
+
+    Also inherits from `SubprocessCancelled` (multiple inheritance, not
+    just `ClaudeCliError`): `ClaudeCliCancelled` and `SubprocessCancelled`
+    used to share no common ancestor beyond `Exception` itself, which
+    forced every caller that wants to catch "this was cancelled" (e.g.
+    `pipeline/waterfall.py`'s `_CANCELLED_EXCEPTIONS`) to hardcode a
+    two-exception tuple of both concrete types rather than catching one
+    shared type. Any future cancellable component built on
+    `run_cancelable`/`SubprocessCancelled` is automatically covered by a
+    plain `except SubprocessCancelled` now, without that tuple needing to
+    grow. Safe as multiple inheritance here: neither `ClaudeCliError`
+    (a `RuntimeError` subclass) nor `SubprocessCancelled` (a plain
+    `Exception` subclass) defines a custom `__init__`, so the MRO
+    (`ClaudeCliCancelled` -> `ClaudeCliError` -> `RuntimeError` ->
+    `SubprocessCancelled` -> `Exception` -> `BaseException`) resolves
+    cleanly with no diamond ambiguity.
     """
 
 

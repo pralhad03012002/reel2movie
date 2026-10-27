@@ -2,29 +2,65 @@
 
 from __future__ import annotations
 
+import threading
+
+import pytest
+import requests
+
 from reel2movie.core.models import Candidate, SourceTag, TMDBSearchResult
-from reel2movie.tmdb.resolver import disambiguate_with_context, resolve_candidate
+from reel2movie.tmdb.resolver import (
+    _DISAMBIGUATION_MAJORITY_THRESHOLD,
+    _DISAMBIGUATION_SAMPLE_COUNT,
+    disambiguate_with_context,
+    resolve_candidate,
+    resolve_candidate_with_retry,
+)
 
 
 class FakeChatClient:
-    """A minimal fake `TextChatClient`: configurable canned reply, or a raise.
+    """A minimal fake `TextChatClient`: a single canned reply (repeated for
+    every call), a per-call sequence of replies (for majority-vote tests
+    that need different answers across `disambiguate_with_context`'s
+    `_DISAMBIGUATION_SAMPLE_COUNT` samples), or a raise.
 
     Records every prompt it was asked so a test can assert disambiguation
-    was (or was never) attempted.
+    was (or was never) attempted, and how many times.
+
+    `disambiguate_with_context()`'s `_DISAMBIGUATION_SAMPLE_COUNT` samples
+    now run concurrently (see `resolver.py`'s Fix 4), so this fake's
+    `chat()` can be called from several threads at once -- a `threading.Lock`
+    guards the read-then-increment of `self.call_count` (used both to
+    index into `self.replies` and as the recorded call count) so each
+    concurrent call still deterministically consumes exactly one, distinct
+    reply from the configured sequence, matching this fake's pre-existing
+    single-threaded contract exactly.
     """
 
-    def __init__(self, reply: str = "unknown", error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        reply: str = "unknown",
+        replies: list[str] | None = None,
+        error: Exception | None = None,
+    ) -> None:
         self.reply = reply
+        self.replies = replies
         self.error = error
         self.prompts: list[str] = []
         self.call_count = 0
+        self._lock = threading.Lock()
 
     def chat(self, prompt: str) -> str:
-        self.call_count += 1
-        self.prompts.append(prompt)
-        if self.error is not None:
-            raise self.error
-        return self.reply
+        with self._lock:
+            self.prompts.append(prompt)
+            if self.error is not None:
+                self.call_count += 1
+                raise self.error
+            if self.replies is not None:
+                reply = self.replies[self.call_count]
+                self.call_count += 1
+                return reply
+            self.call_count += 1
+            return self.reply
 
 
 class FakeTMDBClient:
@@ -358,13 +394,74 @@ def test_disambiguate_with_context_returns_none_when_chat_client_raises():
     assert result is None
 
 
+# ---------------------------------------------------------------------------
+# disambiguate_with_context() — majority-vote reliability improvement
+# ---------------------------------------------------------------------------
+
+
+def test_disambiguate_with_context_uses_id_on_unanimous_agreement():
+    """3 consistent replies -> that id is used, and the chat client was
+    actually asked `_DISAMBIGUATION_SAMPLE_COUNT` times, not just once."""
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(replies=["111", "111", "111"])
+
+    result = disambiguate_with_context(candidates, "some context", chat_client)
+
+    assert result is not None
+    assert result.id == 111
+    assert chat_client.call_count == _DISAMBIGUATION_SAMPLE_COUNT
+
+
+def test_disambiguate_with_context_uses_id_on_two_of_three_majority():
+    """2-of-3 majority (one dissenting sample) -> the majority id is still
+    used."""
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(replies=["111", "222", "111"])
+
+    result = disambiguate_with_context(candidates, "some context", chat_client)
+
+    assert result is not None
+    assert result.id == 111
+    assert chat_client.call_count == _DISAMBIGUATION_SAMPLE_COUNT
+
+
+def test_disambiguate_with_context_inconclusive_when_three_different_replies():
+    """No majority (3 different ids) -> treated as inconclusive, falling
+    through to `pick_best()` -- confirmed by the chat client having
+    actually been called the full configured number of times."""
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(replies=["111", "222", "unknown"])
+
+    result = disambiguate_with_context(candidates, "some context", chat_client)
+
+    assert result is None
+    assert chat_client.call_count == _DISAMBIGUATION_SAMPLE_COUNT
+
+
+def test_disambiguate_with_context_inconclusive_when_split_with_no_majority():
+    """A mix of a valid id and "unknown" replies, with no single id
+    reaching the 2-of-3 majority threshold -> inconclusive."""
+    candidates = _tied_rom_com_and_threesome_results()
+    chat_client = FakeChatClient(replies=["111", "unknown", "unknown"])
+
+    result = disambiguate_with_context(candidates, "some context", chat_client)
+
+    assert result is None
+    assert chat_client.call_count == _DISAMBIGUATION_SAMPLE_COUNT
+    # Sanity-check the constant this test's framing relies on.
+    assert _DISAMBIGUATION_MAJORITY_THRESHOLD == 2
+    assert _DISAMBIGUATION_SAMPLE_COUNT == 3
+
+
 def test_disambiguate_with_context_prompt_includes_context_and_overviews():
     candidates = _tied_rom_com_and_threesome_results()
     chat_client = FakeChatClient(reply="111")
 
     disambiguate_with_context(candidates, "THE_UNIQUE_CONTEXT_MARKER", chat_client)
 
-    assert len(chat_client.prompts) == 1
+    # The majority-vote reliability improvement samples the identical
+    # prompt `_DISAMBIGUATION_SAMPLE_COUNT` times, not once.
+    assert len(chat_client.prompts) == _DISAMBIGUATION_SAMPLE_COUNT
     prompt = chat_client.prompts[0]
     assert "THE_UNIQUE_CONTEXT_MARKER" in prompt
     assert "college student navigates chaotic campus life" in prompt
@@ -395,7 +492,10 @@ def test_resolve_candidate_uses_disambiguation_pick_when_confident():
 
     assert resolved is not None
     assert resolved.id == 111
-    assert chat_client.call_count == 1
+    # The majority-vote reliability improvement samples
+    # `_DISAMBIGUATION_SAMPLE_COUNT` times for this one tie-break call, not
+    # once.
+    assert chat_client.call_count == _DISAMBIGUATION_SAMPLE_COUNT
 
 
 def test_resolve_candidate_falls_back_to_pick_best_when_disambiguation_unknown():
@@ -419,7 +519,7 @@ def test_resolve_candidate_falls_back_to_pick_best_when_disambiguation_unknown()
         _candidate("Don't Be Shy"), client_without_disambiguation
     )
 
-    assert chat_client.call_count == 1
+    assert chat_client.call_count == _DISAMBIGUATION_SAMPLE_COUNT
     assert resolved_with_unknown is not None
     assert resolved_without_disambiguation is not None
     assert resolved_with_unknown == resolved_without_disambiguation
@@ -489,3 +589,259 @@ def test_resolve_candidate_disambiguation_not_attempted_with_only_chat_client_no
     assert resolved is not None
     assert resolved.id == 111  # pick_best()'s rank tiebreak, unchanged
     assert chat_client.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# resolve_candidate_with_retry()
+# ---------------------------------------------------------------------------
+
+
+class FlakyThenSucceedsTMDBClient:
+    """A fake `TMDBClient` whose `search()` raises a given exception for
+    the first `fail_times` calls, then succeeds -- used to prove
+    `resolve_candidate_with_retry` retries the WHOLE `resolve_candidate()`
+    call from scratch, not just the low-level HTTP request.
+    """
+
+    def __init__(
+        self, exception: Exception, fail_times: int, results: list[TMDBSearchResult]
+    ) -> None:
+        self._exception = exception
+        self._fail_times = fail_times
+        self._results = results
+        self.call_count = 0
+
+    def search(self, query: str, year: int | None = None) -> list[TMDBSearchResult]:
+        self.call_count += 1
+        if self.call_count <= self._fail_times:
+            raise self._exception
+        return self._results
+
+
+def _http_error(status_code: int, message: str = "error") -> requests.exceptions.HTTPError:
+    """Build a `requests.exceptions.HTTPError` with a real `.response`
+    carrying `status_code` -- matching how `requests` actually raises one
+    (via `response.raise_for_status()`, which always attaches the
+    response), not a bare message-only exception, since
+    `resolve_candidate_with_retry`'s retry-worthiness check
+    (`_is_retryable_http_error`) inspects `exc.response.status_code`.
+    """
+    response = requests.Response()
+    response.status_code = status_code
+    return requests.exceptions.HTTPError(message, response=response)
+
+
+class AlwaysFailingTMDBClient:
+    """A fake `TMDBClient` whose `search()` always raises -- used to prove
+    `resolve_candidate_with_retry` gives up once `deadline_seconds` has
+    elapsed, rather than retrying forever."""
+
+    def __init__(self, exception: Exception) -> None:
+        self._exception = exception
+        self.call_count = 0
+
+    def search(self, query: str, year: int | None = None) -> list[TMDBSearchResult]:
+        self.call_count += 1
+        raise self._exception
+
+
+def test_resolve_candidate_with_retry_succeeds_after_a_connection_error():
+    client = FlakyThenSucceedsTMDBClient(
+        requests.exceptions.ConnectionError("TLS handshake reset"),
+        fail_times=1,
+        results=[_search_result()],
+    )
+
+    resolved = resolve_candidate_with_retry(
+        _candidate("The Matrix (1999)"), client, deadline_seconds=10.0
+    )
+
+    assert resolved is not None
+    assert resolved.id == 603
+    assert client.call_count == 2
+
+
+def test_resolve_candidate_with_retry_succeeds_after_an_http_error():
+    """Per the task spec: `tmdb/client.py`'s own internal retry never
+    retries `requests.exceptions.HTTPError` (a real 4xx/5xx response) --
+    this OUTER retry loop is specifically what covers that case, for a
+    plausibly-transient status code (503)."""
+    client = FlakyThenSucceedsTMDBClient(
+        _http_error(503, "503 Service Unavailable"),
+        fail_times=1,
+        results=[_search_result()],
+    )
+
+    resolved = resolve_candidate_with_retry(
+        _candidate("The Matrix (1999)"), client, deadline_seconds=10.0
+    )
+
+    assert resolved is not None
+    assert resolved.id == 603
+    assert client.call_count == 2
+
+
+def test_resolve_candidate_with_retry_succeeds_after_a_429():
+    """429 (rate limited) is the other explicitly-retryable HTTP status,
+    alongside the 5xx range covered by the test above."""
+    client = FlakyThenSucceedsTMDBClient(
+        _http_error(429, "429 Too Many Requests"),
+        fail_times=1,
+        results=[_search_result()],
+    )
+
+    resolved = resolve_candidate_with_retry(
+        _candidate("The Matrix (1999)"), client, deadline_seconds=10.0
+    )
+
+    assert resolved is not None
+    assert resolved.id == 603
+    assert client.call_count == 2
+
+
+def test_resolve_candidate_with_retry_does_not_retry_a_permanent_http_error():
+    """Regression test: a 401 (e.g. an invalid/expired TMDB token) is a
+    permanent, non-transient failure that will never succeed no matter how
+    many times it's retried. Unlike a 429/5xx, this must propagate
+    immediately -- NOT get retried for the full `deadline_seconds` (5
+    minutes by default), which would turn a config error into a
+    multi-minute hang per candidate instead of an immediate, diagnosable
+    failure.
+    """
+    client = AlwaysFailingTMDBClient(_http_error(401, "401 Unauthorized"))
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        resolve_candidate_with_retry(
+            _candidate("The Matrix (1999)"), client, deadline_seconds=10.0
+        )
+
+    # Exactly one attempt -- no retry at all for a permanent error.
+    assert client.call_count == 1
+
+
+def test_resolve_candidate_with_retry_gives_up_after_deadline_and_returns_none():
+    """Uses a short `deadline_seconds` (not a real 300s/5-minute wait) so
+    this test stays fast: the client always fails, so
+    `resolve_candidate_with_retry` must retry at least once, then give up
+    once the deadline is exceeded -- returning `None` (never raising),
+    mapped by the caller to the existing `tmdb=None` unresolved state.
+    """
+    client = AlwaysFailingTMDBClient(
+        requests.exceptions.ConnectionError("TLS handshake reset")
+    )
+
+    resolved = resolve_candidate_with_retry(
+        _candidate("The Matrix (1999)"), client, deadline_seconds=0.05
+    )
+
+    assert resolved is None
+    assert client.call_count >= 2
+
+
+def test_resolve_candidate_with_retry_tries_at_least_once_even_with_zero_deadline():
+    client = AlwaysFailingTMDBClient(requests.exceptions.Timeout("timed out"))
+
+    resolved = resolve_candidate_with_retry(
+        _candidate("The Matrix (1999)"), client, deadline_seconds=0.0
+    )
+
+    assert resolved is None
+    assert client.call_count == 1
+
+
+def test_resolve_candidate_with_retry_propagates_non_retryable_exceptions():
+    """A genuine bug (anything not in `_RETRYABLE_EXCEPTIONS`) must
+    propagate immediately, unretried -- `resolve_candidate_with_retry`
+    only absorbs connection/timeout/HTTP errors, never every exception."""
+
+    class ExplodingTMDBClient:
+        def search(self, query: str, year: int | None = None):
+            raise TypeError("a genuine bug, not a transient TMDB failure")
+
+    with pytest.raises(TypeError, match="a genuine bug"):
+        resolve_candidate_with_retry(
+            _candidate("The Matrix (1999)"), ExplodingTMDBClient(), deadline_seconds=5.0
+        )
+
+
+def test_resolve_candidate_with_retry_passes_context_and_chat_client_through():
+    """Confirms `resolve_candidate_with_retry` is a thin wrapper that still
+    threads `context`/`chat_client` through to `resolve_candidate` for
+    disambiguation, same as calling `resolve_candidate` directly."""
+    candidates = _tied_rom_com_and_threesome_results()
+    client = FakeTMDBClient(candidates)
+    chat_client = FakeChatClient(reply="111")
+
+    resolved = resolve_candidate_with_retry(
+        _candidate("Don't Be Shy"),
+        client,
+        context="A rom-com about college life, from Amazon Prime.",
+        chat_client=chat_client,
+        deadline_seconds=10.0,
+    )
+
+    assert resolved is not None
+    assert resolved.id == 111
+    assert chat_client.call_count == _DISAMBIGUATION_SAMPLE_COUNT
+
+
+# ---------------------------------------------------------------------------
+# resolve_candidate() — media_type_hint filtering
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_candidate_media_type_hint_filters_results():
+    """A `media_type_hint` that matches SOME of the search results filters
+    the pool down to just those before scoring -- proved by picking a
+    scenario where the unfiltered pool's winner would differ from the
+    filtered pool's winner."""
+    movie_result = _search_result(
+        id=1, title="The Mentalist", media_type="movie", original_rank=0
+    )
+    tv_result = _search_result(
+        id=2, title="The Mentalist", media_type="tv", original_rank=1
+    )
+    client = FakeTMDBClient([movie_result, tv_result])
+
+    resolved = resolve_candidate(
+        _candidate("The Mentalist"), client, media_type_hint="tv"
+    )
+
+    assert resolved is not None
+    assert resolved.id == 2
+    assert resolved.media_type == "tv"
+
+
+def test_resolve_candidate_media_type_hint_matching_none_falls_back_to_unfiltered():
+    """A `media_type_hint` that matches NONE of the search results must
+    fall back to the unfiltered list -- never let an overzealous/wrong
+    hint turn a real set of results into zero."""
+    movie_result = _search_result(id=1, title="The Mentalist", media_type="movie")
+    client = FakeTMDBClient([movie_result])
+
+    resolved = resolve_candidate(
+        _candidate("The Mentalist"), client, media_type_hint="tv"
+    )
+
+    assert resolved is not None
+    assert resolved.id == 1
+    assert resolved.media_type == "movie"
+
+
+def test_resolve_candidate_without_media_type_hint_is_unchanged():
+    """`media_type_hint` defaults to `None` -- behavior is identical to
+    before this feature for a call that doesn't pass it at all."""
+    movie_result = _search_result(
+        id=1, title="The Mentalist", media_type="movie", original_rank=0
+    )
+    tv_result = _search_result(
+        id=2, title="The Mentalist", media_type="tv", original_rank=1
+    )
+    client = FakeTMDBClient([movie_result, tv_result])
+
+    resolved = resolve_candidate(_candidate("The Mentalist"), client)
+
+    assert resolved is not None
+    # pick_best()'s rank tiebreak (original_rank=0) wins, with no
+    # media-type filtering involved at all.
+    assert resolved.id == 1

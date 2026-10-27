@@ -38,6 +38,7 @@ from typing import Protocol, runtime_checkable
 from reel2movie._candidate_parsing import parse_movie_candidates
 from reel2movie._claude_cli import ClaudeCliError, run_claude_cli
 from reel2movie.core.models import Candidate, SourceTag
+from reel2movie.core.protocols import cancel_kwargs
 from reel2movie.text_extraction.regex_extractor import (
     HIGH_CONFIDENCE,
     MEDIUM_CONFIDENCE,
@@ -203,10 +204,7 @@ class ClaudeCodeCandidateExtractor:
             return []
 
         prompt = _PROMPT_TEMPLATE.replace("{text}", text)
-        if cancel_event is not None:
-            raw_response = self._chat_client.chat(prompt, cancel_event=cancel_event)
-        else:
-            raw_response = self._chat_client.chat(prompt)
+        raw_response = self._chat_client.chat(prompt, **cancel_kwargs(cancel_event))
 
         return parse_movie_candidates(
             raw_response,

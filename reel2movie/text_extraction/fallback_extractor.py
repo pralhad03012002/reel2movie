@@ -18,7 +18,7 @@ from __future__ import annotations
 import threading
 
 from reel2movie.core.models import Candidate, SourceTag
-from reel2movie.core.protocols import CandidateExtractor
+from reel2movie.core.protocols import CandidateExtractor, cancel_kwargs
 
 
 class FallbackCandidateExtractor:
@@ -49,14 +49,8 @@ class FallbackCandidateExtractor:
         `extract(text, source)` (predating this parameter) keeps working
         unmodified for every call site that doesn't use cancellation.
         """
-        if cancel_event is not None:
-            primary_result = self._primary.extract(
-                text, source, cancel_event=cancel_event
-            )
-        else:
-            primary_result = self._primary.extract(text, source)
+        kwargs = cancel_kwargs(cancel_event)
+        primary_result = self._primary.extract(text, source, **kwargs)
         if primary_result:
             return primary_result
-        if cancel_event is not None:
-            return self._fallback.extract(text, source, cancel_event=cancel_event)
-        return self._fallback.extract(text, source)
+        return self._fallback.extract(text, source, **kwargs)

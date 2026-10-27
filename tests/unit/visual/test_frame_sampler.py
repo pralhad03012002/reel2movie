@@ -19,15 +19,20 @@ environment.
 
 from __future__ import annotations
 
+import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 import imageio_ffmpeg
 import pytest
 
+from reel2movie._subprocess_util import SubprocessCancelled
 from reel2movie.visual.frame_sampler import (
     FrameExtractionError,
+    _extract_frame_at,
     probe_duration_seconds,
     sample_frames,
     sample_frames_at_interval,
@@ -381,3 +386,135 @@ def test_probe_duration_seconds_oserror_raises_frame_extraction_error(
         mock_run_cancelable.side_effect = OSError("ffmpeg binary not found")
         with pytest.raises(FrameExtractionError, match="could not be run"):
             probe_duration_seconds(sample_video)
+
+
+def test_probe_duration_seconds_passes_cancel_event_through_to_run_cancelable(
+    sample_video: Path,
+) -> None:
+    cancel_event = threading.Event()
+    with patch("reel2movie.visual.frame_sampler.run_cancelable") as mock_run_cancelable:
+        mock_run_cancelable.return_value = subprocess.CompletedProcess(
+            args=["ffmpeg"],
+            returncode=1,
+            stdout="",
+            stderr="Duration: 00:00:06.00, start: 0.000000, bitrate: 1 kb/s",
+        )
+        probe_duration_seconds(sample_video, cancel_event=cancel_event)
+
+    _, kwargs = mock_run_cancelable.call_args
+    assert kwargs["cancel_event"] is cancel_event
+
+
+# ---------------------------------------------------------------------------
+# sample_frames_at_interval: cancel_event
+# ---------------------------------------------------------------------------
+
+
+def test_sample_frames_at_interval_cancel_event_set_before_the_loop_returns_no_frames(
+    sample_video: Path, tmp_path: Path
+) -> None:
+    """Checked at the TOP of the loop, before the first extraction even
+    starts -- a cancel_event that's already set returns an empty, partial
+    result rather than raising or extracting anything."""
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    samples = sample_frames_at_interval(
+        sample_video,
+        1.0,
+        VIDEO_DURATION_SECONDS,
+        output_dir=tmp_path,
+        cancel_event=cancel_event,
+    )
+
+    assert samples == []
+
+
+def test_sample_frames_at_interval_cancel_mid_extraction_returns_partial_result(
+    sample_video: Path, tmp_path: Path
+) -> None:
+    """A cancellation that fires partway through (simulated here via one
+    timestamp's extraction raising SubprocessCancelled, standing in for a
+    real OS-level kill mid-ffmpeg-call) stops further extraction and
+    returns whatever frames were already gathered -- it must not look
+    like "the video just had fewer frames" (that case is covered by the
+    best-effort FrameExtractionError-skipping tests above, which keep
+    going; this one stops)."""
+    from reel2movie._subprocess_util import run_cancelable as real_run_cancelable
+
+    cancel_event = threading.Event()
+
+    def fake_run_cancelable(command, **kwargs):
+        timestamp_str = command[2]  # ["ffmpeg", "-ss", "<timestamp>", ...]
+        if timestamp_str == "2.0":
+            raise SubprocessCancelled("cancelled mid-extraction")
+        return real_run_cancelable(command, **kwargs)
+
+    with patch(
+        "reel2movie.visual.frame_sampler.run_cancelable",
+        side_effect=fake_run_cancelable,
+    ):
+        samples = sample_frames_at_interval(
+            sample_video,
+            1.0,
+            VIDEO_DURATION_SECONDS,
+            output_dir=tmp_path,
+            cancel_event=cancel_event,
+        )
+
+    # Timestamps 0.0 and 1.0 succeeded before the cancellation at 2.0;
+    # nothing after 2.0 was even attempted.
+    timestamps = [s.timestamp_seconds for s in samples]
+    assert timestamps == pytest.approx([0.0, 1.0])
+
+
+def test_extract_frame_at_cancel_event_kills_a_real_slow_ffmpeg_call(
+    tmp_path: Path,
+) -> None:
+    """End-to-end (no mocking of run_cancelable at all): a real ffmpeg
+    subprocess, started via the real `_extract_frame_at` ->
+    `run_cancelable` chain, is actually killed when cancel_event fires --
+    not just abandoned."""
+    # A real video file is irrelevant here: ffmpeg will hang retrying to
+    # open a named pipe that's never written to, which is enough to prove
+    # cancellation actually tears down a real, still-running ffmpeg
+    # process. A plain nonexistent path exits near-instantly instead
+    # (no slow operation to cancel), so a FIFO is used to force ffmpeg to
+    # block.
+    fifo_path = tmp_path / "blocking.fifo"
+    os.mkfifo(fifo_path)
+
+    cancel_event = threading.Event()
+
+    def _trigger() -> None:
+        time.sleep(0.5)
+        cancel_event.set()
+
+    trigger_thread = threading.Thread(target=_trigger, daemon=True)
+    trigger_thread.start()
+    try:
+        start = time.monotonic()
+        try:
+            _extract_frame_at(
+                fifo_path, 0.0, tmp_path / "out.jpg", cancel_event=cancel_event
+            )
+        except SubprocessCancelled:
+            elapsed = time.monotonic() - start
+            assert elapsed < 3.0
+        except FrameExtractionError:
+            # ffmpeg didn't block on the unwritten FIFO long enough for
+            # the 0.5s cancel trigger to matter on this platform/ffmpeg
+            # build -- this test's premise (a real, slow-enough ffmpeg
+            # call to actually cancel) doesn't hold here. Real-subprocess
+            # cancellation itself is still fully covered, platform-
+            # independently, by test_subprocess_util.py's sleep-based
+            # tests, so skip rather than fail on this environment quirk.
+            pytest.skip(
+                "ffmpeg did not block on the FIFO long enough to exercise "
+                "cancellation on this platform/build"
+            )
+    finally:
+        # Always join, even if the assertion/skip above fired early --
+        # otherwise a stray thread (still sleeping toward setting
+        # cancel_event) is left running past this test's end.
+        trigger_thread.join(timeout=2.0)

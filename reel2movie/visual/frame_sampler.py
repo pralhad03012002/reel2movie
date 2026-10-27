@@ -195,12 +195,25 @@ def sample_frames(
     duration_seconds: float,
     *,
     output_dir: Path | None = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> list[FrameSample]:
     """Extract N equally-spaced frames from `video_path` as JPEGs.
 
     Timestamps are computed by `_compute_timestamps` (see its docstring).
     Each frame is extracted via `_extract_frame_at` (a direct subprocess
     call to the `imageio_ffmpeg`-bundled ffmpeg binary).
+
+    `cancel_event`, if given, lets a caller abort early (default `None` --
+    no cancellation, same behavior as before), consistent with this
+    module's other two functions (`sample_frames_at_interval`,
+    `probe_duration_seconds`). Unlike `sample_frames_at_interval`'s
+    best-effort partial-result contract, this function's contract stays
+    all-or-nothing (see its docstring's rationale for why): cancelling
+    simply lets whichever `_extract_frame_at` call is currently in flight
+    raise `SubprocessCancelled`, which propagates straight out of this
+    function uncaught -- there is no partial list of `FrameSample`s to
+    salvage, since callers of this sparse, fixed-`n` function want exactly
+    N frames or nothing.
 
     Output directory handling (caller-ownership question, resolved here):
     if `output_dir` is given, frames are written there (caller owns it,
@@ -226,6 +239,10 @@ def sample_frames(
             nothing was encoded" when seeking near the edge of a sparse
             video) — the message includes ffmpeg's captured stderr when
             available.
+        SubprocessCancelled: if `cancel_event` fires before the
+            in-flight timestamp's ffmpeg call finishes -- propagated as-is
+            (not wrapped in `FrameExtractionError`), same as
+            `_extract_frame_at`'s own contract.
     """
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}")
@@ -242,7 +259,7 @@ def sample_frames(
     samples: list[FrameSample] = []
     for i, timestamp in enumerate(timestamps):
         frame_path = output_dir / f"frame_{i:03d}.jpg"
-        _extract_frame_at(video_path, timestamp, frame_path)
+        _extract_frame_at(video_path, timestamp, frame_path, cancel_event=cancel_event)
         samples.append(FrameSample(path=frame_path, timestamp_seconds=timestamp))
 
     return samples
@@ -385,6 +402,18 @@ def sample_frames_at_interval(
         t += interval_seconds
 
     samples: list[FrameSample] = []
+
+    def _log_cancelled(stage: str) -> None:
+        logger.warning(
+            "sample_frames_at_interval cancelled %s timestamp %.3fs from "
+            "%s -- returning the %d/%d frame(s) already extracted",
+            stage,
+            timestamp,
+            video_path,
+            len(samples),
+            len(timestamps),
+        )
+
     for i, timestamp in enumerate(timestamps):
         # Checked BEFORE starting the next frame's extraction (not only
         # inside the except-clause below) so a cancellation stops further
@@ -392,15 +421,7 @@ def sample_frames_at_interval(
         # happens to be in flight -- see the docstring's "Cancellation"
         # section.
         if cancel_event is not None and cancel_event.is_set():
-            logger.warning(
-                "sample_frames_at_interval cancelled before timestamp "
-                "%.3fs from %s -- returning the %d/%d frame(s) already "
-                "extracted",
-                timestamp,
-                video_path,
-                len(samples),
-                len(timestamps),
-            )
+            _log_cancelled("before")
             break
 
         frame_path = output_dir / f"frame_{i:04d}.jpg"
@@ -409,15 +430,7 @@ def sample_frames_at_interval(
                 video_path, timestamp, frame_path, cancel_event=cancel_event
             )
         except SubprocessCancelled:
-            logger.warning(
-                "sample_frames_at_interval cancelled mid-extraction at "
-                "timestamp %.3fs from %s -- returning the %d/%d frame(s) "
-                "already extracted",
-                timestamp,
-                video_path,
-                len(samples),
-                len(timestamps),
-            )
+            _log_cancelled("mid-extraction at")
             break
         except FrameExtractionError as exc:
             # Best-effort: skip this one timestamp and keep going -- see

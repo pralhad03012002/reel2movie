@@ -18,12 +18,20 @@ means "behave exactly like `subprocess.run` with the given timeout" --
 every existing caller migrating from `subprocess.run` to this helper gets
 that as a safe default.
 
-Implementation note: this never issues one blocking `communicate(timeout=
-...)` call. It instead polls (`proc.wait(timeout=poll_interval_seconds)`
-in a loop) so that, in between polls, it can also check `cancel_event` and
-the overall elapsed-time budget. Only once the process has actually exited
-normally does it call `proc.communicate()`, to drain any output still
-sitting in the pipes.
+Implementation note: this polls via repeated short `proc.communicate(timeout=
+poll_interval_seconds)` calls -- NOT `proc.wait(timeout=...)` -- so that, in
+between polls, it can also check `cancel_event` and the overall elapsed-time
+budget. `communicate()` (unlike `wait()`) actively drains stdout/stderr while
+it waits; `wait()` does not read the pipes at all, so a poll loop built on
+`proc.wait(timeout=...)` alone deadlocks as soon as a child writes more than
+one OS pipe buffer's worth (~64KB) of combined stdout/stderr before exiting --
+the child blocks on `write()` with nothing reading the other end, so `wait()`
+just keeps timing out forever even though the process is alive and would
+otherwise finish almost instantly. This is the exact deadlock
+`subprocess`'s own docs warn about for `Popen.wait()` with `PIPE`s. Per the
+`communicate()` docs, catching `TimeoutExpired` from a `communicate(timeout=
+...)` call and retrying the call is explicitly safe and loses no output --
+that is exactly what the loop below does.
 """
 
 from __future__ import annotations
@@ -58,6 +66,20 @@ def _terminate_then_kill(
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+def _terminate_kill_and_close(proc: subprocess.Popen) -> None:
+    """`_terminate_then_kill()` plus closing the now-dead process's
+    stdout/stderr pipe file descriptors -- the identical 3-line sequence
+    `run_cancelable()`'s cancel and timeout branches both need, factored
+    out so it's written once.
+
+    Closing the pipes here (rather than waiting on GC) reclaims the FDs
+    promptly -- there's nothing left to read once the process is dead.
+    """
+    _terminate_then_kill(proc)
+    proc.stdout.close()
+    proc.stderr.close()
 
 
 def run_cancelable(
@@ -98,20 +120,19 @@ def run_cancelable(
     start = time.monotonic()
     while True:
         try:
-            proc.wait(timeout=poll_interval_seconds)
-            break  # process exited on its own
+            stdout, stderr = proc.communicate(timeout=poll_interval_seconds)
+            break  # process exited on its own; pipes fully drained already
         except subprocess.TimeoutExpired:
             pass  # still running -- fall through to the cancel/timeout checks below
 
         if cancel_event is not None and cancel_event.is_set():
-            _terminate_then_kill(proc)
+            _terminate_kill_and_close(proc)
             raise SubprocessCancelled(
                 f"subprocess {args!r} was cancelled via cancel_event"
             )
 
         if time.monotonic() - start >= timeout_seconds:
-            _terminate_then_kill(proc)
+            _terminate_kill_and_close(proc)
             raise subprocess.TimeoutExpired(args, timeout_seconds)
 
-    stdout, stderr = proc.communicate()
     return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)

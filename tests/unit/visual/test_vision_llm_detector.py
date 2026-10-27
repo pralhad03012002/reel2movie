@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -38,6 +39,21 @@ class FakeVisionChatClient:
     def chat(self, image_path: Path, prompt: str) -> str:
         self.last_image_path = image_path
         self.last_prompt = prompt
+        return self.response_text
+
+
+class FakeVisionChatClientAcceptingCancelEvent:
+    """Same as `FakeVisionChatClient`, but also records any `cancel_event`
+    it was called with -- used to confirm `VisionLLMPosterDetector` actually
+    forwards it, without requiring the pre-existing `FakeVisionChatClient`
+    above to know about the parameter."""
+
+    def __init__(self, response_text: str) -> None:
+        self.response_text = response_text
+        self.last_cancel_event = None
+
+    def chat(self, image_path: Path, prompt: str, *, cancel_event=None) -> str:
+        self.last_cancel_event = cancel_event
         return self.response_text
 
 
@@ -219,6 +235,30 @@ class TestVisionLLMPosterDetectorSourceTag:
         assert all(c.source is SourceTag.FRAME_VISUAL for c in result)
 
 
+class TestVisionLLMPosterDetectorCancelEvent:
+    def test_no_cancel_event_does_not_pass_the_kwarg_to_a_legacy_chat_client(
+        self,
+    ) -> None:
+        """A pre-existing `VisionChatClient`-shaped test double that only
+        implements `chat(image_path, prompt)` (predating `cancel_event`)
+        must keep working when no cancel_event is given."""
+        fake = FakeVisionChatClient(json.dumps([{"title": "Inception", "confidence": "high"}]))
+        detector = VisionLLMPosterDetector(fake)
+
+        result = detector.detect(_frame())
+
+        assert len(result) == 1
+
+    def test_cancel_event_is_forwarded_to_the_chat_client_when_given(self) -> None:
+        cancel_event = threading.Event()
+        fake = FakeVisionChatClientAcceptingCancelEvent("[]")
+        detector = VisionLLMPosterDetector(fake)
+
+        detector.detect(_frame(), cancel_event=cancel_event)
+
+        assert fake.last_cancel_event is cancel_event
+
+
 # ---------------------------------------------------------------------------
 # AnthropicVisionChatClient: mocks the anthropic SDK entirely. No real
 # anthropic.Anthropic() client is ever constructed with a real key, and no
@@ -310,6 +350,33 @@ class TestAnthropicVisionChatClient:
             client = AnthropicVisionChatClient(api_key="fake-key")
             with pytest.raises(ValueError, match="Unsupported image extension"):
                 client.chat(image_path, "prompt")
+
+    def test_chat_accepts_but_does_not_need_cancel_event(self, tmp_path: Path) -> None:
+        """Known, accepted limitation: this backend goes through the
+        `anthropic` SDK's blocking HTTP call, not a local subprocess, so it
+        cannot actually honor cancellation -- it just accepts the param for
+        signature symmetry with `VisionChatClient` and completes normally
+        regardless of `cancel_event`."""
+        image_path = tmp_path / "frame_000.jpg"
+        image_path.write_bytes(self._fake_image_bytes())
+        fake_response = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="[]")]
+        )
+
+        with patch(
+            "reel2movie.visual.vision_llm_detector.anthropic.Anthropic"
+        ) as mock_anthropic_cls:
+            mock_client = MagicMock()
+            mock_client.messages.create.return_value = fake_response
+            mock_anthropic_cls.return_value = mock_client
+
+            client = AnthropicVisionChatClient(api_key="fake-key")
+            cancel_event = threading.Event()
+            cancel_event.set()  # already "cancelled" -- still runs to completion
+            result = client.chat(image_path, "prompt", cancel_event=cancel_event)
+
+        assert result == "[]"
+        mock_client.messages.create.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -529,3 +596,23 @@ class TestClaudeCodeVisionChatClient:
         (cmd,), kwargs = mock_run_cancelable.call_args
         assert cmd[0] == "my-claude"
         assert kwargs["timeout_seconds"] == 12.5
+
+    def test_cancel_event_is_passed_through_to_run_cancelable(
+        self, tmp_path: Path
+    ) -> None:
+        image_path = tmp_path / "frame_000.jpg"
+        image_path.write_bytes(b"fake-jpeg-bytes")
+        cancel_event = threading.Event()
+
+        with patch(
+            "reel2movie._claude_cli.run_cancelable"
+        ) as mock_run_cancelable:
+            mock_run_cancelable.return_value = subprocess.CompletedProcess(
+                args=["claude"], returncode=0, stdout=_canned_cli_json(), stderr=""
+            )
+
+            client = ClaudeCodeVisionChatClient()
+            client.chat(image_path, "prompt", cancel_event=cancel_event)
+
+        _, kwargs = mock_run_cancelable.call_args
+        assert kwargs["cancel_event"] is cancel_event

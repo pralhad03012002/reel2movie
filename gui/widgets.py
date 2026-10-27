@@ -606,10 +606,47 @@ class ResultsPanel(QWidget):
 
         self._content_layout.addStretch(1)
 
+    def add_recommendation(self, card_data: dict) -> None:
+        """Appends ONE new ``RecommendationCard`` without touching any
+        cards already present -- the incremental counterpart to
+        ``set_recommendations``'s full replace, used to trickle streamed
+        results in one at a time as they resolve.
+
+        ``card_data`` has exactly the same keys ``set_recommendations``
+        expects per-item (title, year, overview, media_type, source,
+        confidence, poster_path, query). If the "no recommendations found"
+        empty-state label is currently shown, it's cleared first (this is
+        the first real result arriving). The new card is inserted before
+        the trailing stretch that keeps cards top-aligned -- added lazily
+        here on the first card of a fresh (cleared) panel (an empty
+        ``_content_layout`` -- ``count() == 0`` -- means no stretch exists
+        yet; any other call has one, added by whichever of
+        ``set_recommendations``/``add_recommendation`` added the first
+        card), exactly mirroring ``set_recommendations``'s own trailing
+        ``addStretch(1)``, so the two methods never fight over layout
+        structure.
+
+        Callers that want a clean slate for a new run (rather than
+        appending onto whatever cards a previous run left behind) must
+        call ``clear()`` themselves first -- this method only ever
+        appends.
+        """
+        if self._empty_label is not None:
+            self.clear()
+
+        card = RecommendationCard(parent=self._content, **card_data)
+        if self._content_layout.count() == 0:
+            self._content_layout.addWidget(card)
+            self._content_layout.addStretch(1)
+        else:
+            # Insert just before the trailing stretch added above (or by
+            # an earlier add_recommendation call) the first time around.
+            self._content_layout.insertWidget(self._content_layout.count() - 1, card)
+
     def clear(self) -> None:
         """Removes all cards and any empty-state message, resetting to a
         truly empty container ready for the next ``set_recommendations``
-        call.
+        or ``add_recommendation`` call.
         """
         while self._content_layout.count():
             item = self._content_layout.takeAt(0)

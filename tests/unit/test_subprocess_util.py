@@ -74,6 +74,38 @@ class TestNormalCompletion:
 
         assert result.returncode == 7
 
+    def test_large_output_does_not_deadlock_the_poll_loop(self) -> None:
+        """Regression test: a child writing more than one OS pipe buffer's
+        worth of combined stdout/stderr before exiting must still complete
+        promptly.
+
+        `Popen.wait(timeout=...)` (unlike `Popen.communicate(timeout=...)`)
+        never reads the pipes, so a poll loop built on bare `wait()` calls
+        deadlocks here: the child blocks on `write()` once the ~64KB pipe
+        buffer fills, and `wait()` just keeps timing out even though the
+        process would otherwise finish almost instantly -- it only gets
+        unstuck once the outer `timeout_seconds` budget elapses and the
+        process is killed. A fast, well under `timeout_seconds` completion
+        here proves the implementation actively drains the pipes while
+        polling, not just waits on them.
+        """
+        script = "import sys; sys.stdout.write('x' * 200_000); sys.stdout.flush()"
+
+        start = time.monotonic()
+        result = run_cancelable(
+            [sys.executable, "-c", script],
+            timeout_seconds=10,
+            poll_interval_seconds=0.2,
+        )
+        elapsed = time.monotonic() - start
+
+        assert result.returncode == 0
+        assert len(result.stdout) == 200_000
+        assert elapsed < 3.0, (
+            f"took {elapsed:.2f}s -- looks like the poll loop deadlocked "
+            "on a full pipe buffer instead of draining it"
+        )
+
     def test_cancel_event_none_behaves_like_subprocess_run(self) -> None:
         """`cancel_event=None` is documented as a fully backward-compatible
         stand-in for a plain `subprocess.run(..., timeout=...)` call."""

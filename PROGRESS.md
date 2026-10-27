@@ -8146,3 +8146,1249 @@ submit and not on empty/whitespace input, and the full
 
 With this fix, the `gui/` package has no known open issues. All three
 GUI subtasks' write/review loops are closed.
+
+## Pipeline Rewrite Wave 1: frame sampling, cancellation infra, audio subpackage
+
+First wave of a larger planned rewrite (a parallel "waterfall race"
+architecture: caption/comment/visual/audio candidate extraction running
+concurrently, losers genuinely killed once a winner is found). Three
+pieces, built by three agents in parallel and committed together at
+`a593b4c`, then given an independent second-look review pass (this
+section) before the next wave builds on top of it.
+
+### 1. Frame sampling interval + `ensure_video()` idempotency
+
+- `pipeline/deps.py`'s `_DEFAULT_FRAME_INTERVAL_SECONDS`: `1.0` → `0.5`.
+  Chosen from empirical A/B testing against 3 real sample Instagram Reel
+  videos in the repo root — halving the interval caught meaningfully more
+  brief on-screen-text/poster frames (creator-burned "movies like X" text
+  cards held only 1-2s can fall entirely between two sparse samples) at a
+  22%-58% increase in vision-LLM call count. Going denser still (0.2s) was
+  tested and rejected: +26% to +248% more calls for diminishing catch
+  rate.
+- `ingest/instagram.py`'s `InstagramIngestor.ensure_video()` is now
+  idempotent per URL: a `dict[str, Path]` cache keyed by reel URL, written
+  only on a successful download (a failed attempt is never cached, so a
+  retry after a transient error actually retries). Public contract
+  unchanged (`Ingestor.ensure_video(result) -> Path`); this just avoids a
+  double video download once a caller starts invoking it unconditionally
+  rather than lazily.
+
+### 2. Cancellation infrastructure (`cancel_event` threaded end-to-end)
+
+New `reel2movie/_subprocess_util.py`: `run_cancelable(args, *,
+timeout_seconds, cancel_event=None, poll_interval_seconds=0.2,
+**popen_kwargs) -> subprocess.CompletedProcess` — a drop-in replacement
+for `subprocess.run(args, capture_output=True, text=True,
+timeout=timeout_seconds)` that additionally supports real OS-level
+cancellation via a `threading.Event`: on cancellation or timeout it
+escalates `proc.terminate()` → (2s grace) → `proc.kill()`, always waiting
+for the process to actually exit (no zombies/orphans left behind).
+`cancel_event=None` (the default) disables cancellation entirely, so
+every pre-existing caller migrating from `subprocess.run` gets that as a
+safe default.
+
+`_claude_cli.py`'s `run_claude_cli()` and `visual/frame_sampler.py`'s
+`_extract_frame_at()`/`probe_duration_seconds()` now call
+`run_cancelable()` instead of `subprocess.run()`. A `cancel_event:
+threading.Event | None = None` parameter is threaded through the whole
+extraction call chain (`CandidateExtractor.extract()`,
+`PosterDetector.detect()`, `AudioTranscriber.transcribe()` in
+`core/protocols.py`, plus every real implementation and the local
+`TextChatClient`/`VisionChatClient` Protocols in
+`text_extraction/claude_code_extractor.py` /
+`visual/vision_llm_detector.py`), forwarded at Protocol-boundary call
+sites via a `kwargs = {"cancel_event": cancel_event} if cancel_event is
+not None else {}` expansion — conditional specifically so a pre-existing
+test fake that only implements the old, cancel_event-less signature
+(several exist in `tests/unit/pipeline/test_waterfall.py` and
+`tests/unit/text_extraction/test_fallback_extractor.py`'s own
+`FakeExtractor`) keeps working unmodified. Traced end-to-end for this
+review (see "Review pass outcome" below): a real `cancel_event` passed
+into `FallbackCandidateExtractor.extract()` today reaches
+`run_claude_cli()` → `run_cancelable()` with no silent drop anywhere in
+the chain. `pipeline/waterfall.py` does not pass `cancel_event` at any
+call site yet — that wiring is explicitly deferred to the next wave's
+race orchestrator, not part of this one.
+
+`visual/frame_sampler.py`'s `sample_frames_at_interval()` (dense,
+on-screen-text sampling) has a best-effort cancellation contract:
+whatever `FrameSample`s were extracted before cancellation are returned
+(not raised), logged as a warning naming how many of the N requested
+timestamps were attempted — consistent with its pre-existing
+per-timestamp-failure tolerance (see Subtask 9 follow-up above).
+`sample_frames()` (sparse, poster-detection) deliberately keeps an
+all-or-nothing contract instead: cancelling lets `SubprocessCancelled`
+propagate straight out, since its fixed-`n` callers want exactly N frames
+or nothing.
+
+`visual/vision_llm_detector.py`'s `AnthropicVisionChatClient.chat()`
+accepts `cancel_event` only for signature compatibility — it cannot
+actually be honored (the `anthropic` SDK's blocking HTTP call has no
+local OS process to terminate), which is documented accurately in its
+own docstring as a known, accepted limitation, not silently claimed as
+supported.
+
+### 3. Audio transcription subpackage
+
+New `reel2movie/audio/` subpackage (the audio-transcript fallback: a
+reel's spoken narration can confirm a recommendation even when
+caption/comments/on-screen-text never name it):
+
+- `audio_extractor.extract_audio(video_path, output_dir, *,
+  cancel_event=None) -> Path` — demuxes via the `imageio_ffmpeg`-bundled
+  ffmpeg binary: `ffmpeg -i <video_path> -vn -ar 16000 -ac 1 -c:a
+  pcm_s16le -y <output_dir>/audio.wav`, i.e. 16kHz mono 16-bit PCM,
+  whisper.cpp's documented required input format. Built on
+  `run_cancelable()` from day one. Distrusts a bare zero exit code (same
+  "ffmpeg can exit 0 while writing nothing" lesson `frame_sampler.py`
+  already learned) — checks the output file actually exists and is
+  non-empty.
+- `whisper_cpp_transcriber.WhisperCppTranscriber.transcribe(audio_path,
+  *, cancel_event=None) -> str` — shells out to `whisper-cli -m
+  <model_path> -f <audio_path> -l auto -nt -otxt -of <prefix>` (`-l auto`
+  for multilingual auto-detection, never hardcoded English; `-otxt -of`
+  writes the transcript to `<prefix>.txt` rather than relying on stdout,
+  which interleaves progress/system-info lines). Reads `<prefix>.txt`
+  back and returns it whitespace-stripped. An empty transcript (silent
+  audio) is treated as a legitimate non-error result.
+- `config.py`: `get_whisper_cpp_binary()` (defaults to `"whisper-cli"`
+  when unset, never raises) and `get_whisper_cpp_model_path()` (raises if
+  unset — no safe default for a multi-hundred-MB-to-multi-GB model file
+  path). Both follow the project's existing separation-of-concerns rule
+  (never called from inside `audio/`, only from a future `pipeline/deps.py`
+  wiring). Neither is called from `pipeline/deps.py` yet — correctly so,
+  since the race orchestrator that would wire the audio fallback into the
+  real pipeline is next wave's work, not this one's. `.env.example` gained
+  `WHISPER_CPP_BINARY` / `WHISPER_CPP_MODEL_PATH` documenting both.
+- `core/protocols.py` gained `AudioTranscriber` (`transcribe(audio_path,
+  *, cancel_event=None) -> str`); `core/models.py`'s `SourceTag` gained
+  `AUDIO_TRANSCRIPT`.
+
+### Review pass outcome (independent second look, before the next wave)
+
+Re-derived every claim from the code directly rather than trusting the
+three agents' own already-reported clean reviews. `python3 -m pytest
+tests/unit -q` confirmed **313 passed** at the reviewed snapshot (matching
+the reported count).
+
+**Confirmed working correctly:**
+- `run_cancelable()`'s terminate→grace→kill escalation genuinely kills the
+  OS process in both the cancel and timeout paths (verified with real
+  subprocesses + PID-liveness checks in `tests/unit/test_subprocess_util.py`,
+  not just that the Python call returned/raised).
+- Elapsed-time tracking uses `time.monotonic()` throughout (not wall-clock,
+  not restarted per poll) — correct.
+- `cancel_event` genuinely reaches the real subprocess call in the one
+  production chain traced end-to-end: `FallbackCandidateExtractor.extract(text,
+  source, cancel_event=ev)` → `ClaudeCodeCandidateExtractor.extract(...)` →
+  `ClaudeCodeTextChatClient.chat(prompt, cancel_event=ev)` →
+  `run_claude_cli(..., cancel_event=ev)` → `run_cancelable(...,
+  cancel_event=ev)`. No silent drop at any hop. The conditional-forwarding
+  convention is not dead/speculative compatibility shimming — real,
+  currently-passing tests (`FakeExtractor` in
+  `tests/unit/text_extraction/test_fallback_extractor.py`, the fakes in
+  `tests/unit/pipeline/test_waterfall.py`) exercise exactly the
+  old-signature-fake case it protects.
+- `sample_frames_at_interval()`'s cancellation contract returns a real,
+  non-empty partial `list[FrameSample]` for whatever was extracted before
+  cancellation (not `[]`, not a crash), and its warning log names both the
+  cancellation stage (`"before"` vs. `"mid-extraction at"`) and the X/Y
+  attempted-vs-requested count, so a log reader can tell a genuine
+  cancellation apart from "the video just had fewer frames than expected."
+- `AnthropicVisionChatClient.chat()`'s non-cancellation is accurately
+  documented, and nothing downstream assumes it can be cancelled.
+- Audio subpackage: ffmpeg args verified to actually produce 16kHz mono
+  `pcm_s16le` WAV (matches whisper.cpp's documented requirement exactly);
+  `get_whisper_cpp_*` config functions confirmed called only from tests
+  today (correctly not wired into production yet) and confirmed not to
+  raise at import time.
+
+**Bugs found and fixed directly** (small, well-scoped; all re-verified
+with `python3 -m pytest tests/unit -q` after each fix, plus one targeted
+repro script per bug):
+
+1. **Real pipe-buffer deadlock in `run_cancelable()` (highest-severity
+   finding, caught by an independent `code-review --effort high` pass,
+   then reproduced directly).** The poll loop called bare
+   `proc.wait(timeout=poll_interval_seconds)`, which — unlike
+   `communicate()` — never reads `stdout`/`stderr`. A child writing more
+   than one OS pipe buffer's worth (~64KB) of combined output before
+   exiting blocks on `write()` with nothing draining the other end, so
+   `wait()` just keeps timing out even though the process would otherwise
+   finish almost instantly; it only unblocks once the full
+   `timeout_seconds` budget elapses and the process gets killed. This is
+   the exact deadlock `subprocess`'s own docs warn about. Reproduced with
+   a throwaway script (child writes 200KB to stdout, `timeout_seconds=5`):
+   hung for the full 5s before being killed and raising `TimeoutExpired`,
+   instead of returning the real result in milliseconds. **Not caught by
+   the existing test suite** — none of `test_subprocess_util.py`'s cases
+   exercised a child with non-trivial output. Fixed by switching the poll
+   loop to repeated `proc.communicate(timeout=poll_interval_seconds)`
+   calls instead of `proc.wait(...)` — per `communicate()`'s own docs,
+   catching `TimeoutExpired` from a timed `communicate()` call and
+   retrying is explicitly safe and loses no output. Re-ran the repro:
+   completes in ~70ms. Added a permanent regression test
+   (`test_large_output_does_not_deadlock_the_poll_loop`) asserting
+   completion well under budget for a 200KB-stdout child.
+2. **FD leak on cancel/timeout.** After `_terminate_then_kill()`, the
+   dead process's `stdout`/`stderr` pipe file descriptors were left open
+   until Python's GC reclaimed them. Fixed by explicitly closing
+   `proc.stdout`/`proc.stderr` right after killing, on both the cancel
+   and timeout paths.
+3. **`InstagramIngestor._video_cache` race.** The cache's
+   check-then-download-then-store sequence had no lock, so two threads
+   calling `ensure_video()` for the same URL at nearly the same time
+   (exactly the shape the next wave's visual-fallback + audio-fallback
+   steps will produce, both needing the same reel's video) could both
+   miss the cache and both trigger a redundant yt-dlp download. Fixed with
+   one `threading.Lock()` per `InstagramIngestor` instance guarding the
+   whole method — deliberately one lock, not per-URL, since it only needs
+   to serialize concurrent calls on the same instance (in practice: the
+   same reel).
+4. **`sample_frames()` had no `cancel_event` parameter**, inconsistent
+   with its sibling `sample_frames_at_interval()`/`probe_duration_seconds()`
+   in the same module. Added, threaded through to `_extract_frame_at()`,
+   keeping its existing all-or-nothing contract (cancellation just lets
+   `SubprocessCancelled` propagate, no partial-result handling needed).
+5. **`WhisperCppTranscriber.transcribe()` could return a stale transcript.**
+   The success check only verified `output_txt_path.exists()`, not that
+   *this* invocation wrote it — if whisper.cpp ever exits 0 without
+   actually rewriting the file (the same "reports success, writes
+   nothing" quirk this codebase already distrusts ffmpeg for), a leftover
+   `.txt` from a previous run at the same path would be silently returned
+   as the current transcript. Fixed by `unlink(missing_ok=True)`-ing the
+   expected output path before invoking `whisper-cli`, so a genuine
+   failure-to-write now correctly raises instead of returning stale data.
+
+**Ponytail-review findings, applied:** the `if cancel_event is not None:
+... else: ...` branch — duplicated across `FallbackCandidateExtractor`
+(twice), `ClaudeCodeCandidateExtractor`, and `VisionLLMPosterDetector` —
+was collapsed to `kwargs = {"cancel_event": cancel_event} if cancel_event
+is not None else {}` followed by one call with `**kwargs`, same behavior,
+fewer lines, no new abstraction. Everything else reviewed (the
+`SubprocessCancelled`/`ClaudeCliCancelled` distinct exception types, the
+per-subpackage `RuntimeError` subclasses, the `@runtime_checkable`
+Protocols) was judged proportionate to actual need, not speculative.
+
+**Blocking issues for the next wave:** none outstanding — all confirmed
+findings above were small and fixed directly in this pass, not deferred.
+
+**Final test count:** `python3 -m pytest tests/unit -q` → **314 passed**
+(313 at the start of this review + 1 new deadlock regression test).
+
+**Verdict: Wave 1 is OKAY TO BUILD ON for the next wave** (the waterfall
+race rewrite). The one serious finding (the pipe-buffer deadlock) was in
+the single highest-stakes piece of this wave's infrastructure and has
+been fixed and regression-tested at the root (`run_cancelable()`), so
+every caller built on it (`_claude_cli.py`, `frame_sampler.py`,
+`audio_extractor.py`, `whisper_cpp_transcriber.py`) inherits the fix
+automatically. The `cancel_event`-forwarding convention was traced
+end-to-end and does not silently drop a real cancellation anywhere in the
+chain as it stands today.
+
+## Pipeline Rewrite Wave 2: parallel race rewrite + TMDB retry + review-fix follow-up
+
+A prior agent rewrote `pipeline/waterfall.py` from the old strict,
+sequential caption -> creator-comment -> visual waterfall into a parallel
+RACE (all four candidate-generating jobs -- caption, creator-comment,
+audio-transcript, visual -- launch concurrently; the first to produce a
+confident candidate wins, `cancel_event` stops the others), and added
+`tmdb/resolver.py`'s `resolve_candidate_with_retry()` (capped-exponential-
+backoff outer retry layer over `resolve_candidate()`, for transient TMDB
+failures beyond `tmdb/client.py`'s own internal 3-attempt budget) plus a
+small `pipeline/deps.py` addition. That work landed uncommitted and
+passed 332 tests, but a multi-angle code review flagged real,
+confirmed issues the prior agent was cut off before addressing -- this
+section documents fixing those, plus several further findings surfaced
+by follow-up review passes during this same session.
+
+### Fix 1 — video download + audio extraction no longer block the race
+
+**Before:** `_prepare_video_and_audio()` ran synchronously, BEFORE
+`_race_candidate_jobs()` submitted anything -- every reel paid for a full
+yt-dlp download + ffmpeg extraction up front, even when caption/
+creator-comment extraction (needing neither) would have won almost
+instantly. This directly undercut the rewrite's whole point (the user's
+stated complaint was "it's taking too long").
+
+**After:** video download (`_prepare_video`) and audio extraction
+(`_prepare_audio`) are now two more jobs that start immediately alongside
+the four race jobs, not a blocking prerequisite. The audio-transcript and
+visual jobs are the only ones that need that data, so only THEY block --
+internally, within their own job function, via a new `_wait_or_cancelled()`
+helper that polls a `Future` every ~0.2s instead of blocking on
+`.result()` unboundedly (a plain unbounded wait was tried first and
+proven, by a failing test, to reintroduce the exact blocking this fix
+exists to remove: a job that starts waiting a moment before the race is
+decided would otherwise still get stuck for the full download duration).
+`_race_candidate_jobs()` also gives the three non-winning race jobs a
+short, bounded grace period (`_RACE_LOSER_GRACE_SECONDS = 2.0`) to react
+to `cancel_event` and finish before returning anyway -- needed because a
+losing job's own thread scheduling isn't synchronized with the winner's,
+so without some bound, two pre-existing tests (asserting a losing job's
+own error-isolation log line, and that it genuinely observed
+cancellation) became flaky.
+
+**Process-exit correctness (caught by follow-up review, not the first
+pass):** `_prepare_video`/`_prepare_audio` were initially submitted to
+the same `ThreadPoolExecutor` as the four race jobs. That's wrong:
+`concurrent.futures.thread` registers a process-wide `atexit` hook that
+joins EVERY worker thread of EVERY `ThreadPoolExecutor` ever created in
+the process before the process can exit, regardless of that executor's
+own `shutdown(wait=False)`. For the GUI (long-running) that's invisible,
+but for `reel2movie/cli.py` (fetch one reel, print, exit) it would
+silently reintroduce the same latency this fix removes -- `run_pipeline()`
+would return promptly, but the PROCESS would then hang at exit for
+however long the download took. Fixed by moving `_prepare_video`/
+`_prepare_audio`/`_cleanup_audio_temp_dir` (the audio-temp-dir cleanup
+job, see below) onto plain `daemon=True` threads via a new
+`_run_in_daemon_thread()` helper instead -- daemon threads aren't tracked
+by that hook. The four actual race jobs stay on the `ThreadPoolExecutor`
+since the orchestrator genuinely needs to track/cancel them.
+
+Also fixed along the way: `_extract_from_audio_transcript`/`_prepare_audio`
+now skip waiting on/running audio extraction entirely when
+`deps.audio_transcriber is None` (the common case for any `PipelineDeps`
+that never configures one) -- previously they'd still pay for the full
+download+extraction chain only to discover afterward that nobody would
+read the result. `_extract_from_creator_comments` and
+`_extract_from_audio_transcript` also gained explicit `cancel_event`
+checks between steps (before each comment's extraction call; between
+transcribing and extracting from the transcript) so a lost race stops
+launching new slow (claude-CLI-backed) calls promptly instead of only
+relying on `cancel_event` being passed through to whatever call happens
+to already be in flight.
+
+Audio temp-directory lifecycle: a new `_cleanup_audio_temp_dir()`
+background job (also a daemon thread) waits for both `_prepare_audio` and
+the audio-transcript race job's future, then removes the temp directory
+-- this works uniformly regardless of whether the transcript job ever
+actually read the file (it may have lost the race before extraction even
+finished, or no transcriber may be configured at all), without that job
+needing any cleanup logic of its own.
+
+New tests: `test_slow_video_download_does_not_block_a_fast_confident_text_job`
+(a fake `Ingestor.ensure_video()` sleeping 2s + a fast confident caption
+job; asserts `run_pipeline()` returns in well under 1s and the fake
+download genuinely hadn't finished) and
+`test_slow_video_download_runs_on_a_daemon_thread_not_the_shared_pool`
+(asserts whatever thread is still alive after `run_pipeline()` returns is
+a daemon thread, never a `ThreadPoolExecutor` worker -- the process-exit
+regression test).
+
+### Fix 2 — `run_pipeline()` now gets the same TMDB retry resilience as streaming
+
+**Before:** `_resolve_all()` (used by `run_pipeline()`, the CLI's and most
+tests' entry point) called plain `resolve_candidate()`; only
+`run_pipeline_streaming()` used `resolve_candidate_with_retry()`. The same
+transient-TMDB-failure problem got 5-minute retry resilience in one entry
+point but not the other.
+
+**After:** `_resolve_all()` now calls `resolve_candidate_with_retry()`
+too, with the same default deadline. Kept sequential (not switched to
+concurrent resolution like the streaming path): `run_pipeline()`'s
+contract is one complete, already-deduped `PipelineResult`, so there's no
+completion-order concern that needs concurrency, and every resolution has
+to finish before `_dedupe` runs regardless -- sequential-but-retried is
+the smallest change closing the actual gap. Factored the shared
+"resolve one candidate, build a `Recommendation`, keep `tmdb=None` on
+failure" logic into a new `_resolve_one()` helper used by both
+`_resolve_all()` and `run_pipeline_streaming()` (previously hand-copied in
+both places).
+
+**Follow-up finding, also fixed:** `resolve_candidate_with_retry()`'s
+retry loop treated bare `requests.exceptions.HTTPError` as always
+retryable, with no status-code check -- a real, permanent 401 (invalid/
+expired TMDB token), 400, 403, or 404 would get retried for the full
+5-minute deadline exactly like a transient 429/5xx, turning a config error
+into a multi-minute hang per candidate. Fixed with a new
+`_is_retryable_http_error()` check: only 429 or 5xx is retried; anything
+else propagates immediately. New tests:
+`test_resolve_candidate_with_retry_succeeds_after_a_429` and
+`test_resolve_candidate_with_retry_does_not_retry_a_permanent_http_error`
+(a 401 raises after exactly one attempt, not five minutes of retrying).
+
+New test proving Fix 2 itself:
+`test_run_pipeline_retries_transient_tmdb_failure_and_resolves` -- a fake
+`TMDBClient` that fails once (`ConnectionError`) then succeeds; confirms
+`run_pipeline()`'s final result has the candidate resolved, not
+`tmdb=None`.
+
+### Fix 3 — parallelized the sequential per-frame vision-LLM calls
+
+**Before:** after dense sampling + dedup, surviving unique frames were run
+through `poster_detector.detect()` one at a time in a plain `for` loop --
+each call an independent network/subprocess round-trip, and typically the
+single slowest race job.
+
+**After:** runs through a bounded `ThreadPoolExecutor`
+(`_FRAME_DETECTION_MAX_WORKERS = 4`) via `as_completed()`, checking
+`cancel_event` as each result arrives. Error-isolation preserved exactly
+(a single frame's `detect()` raising still fails the whole visual job,
+matching the pre-existing, tested contract -- not per-frame isolated).
+
+**Follow-up finding, also fixed:** the first version wrapped this in
+`with ThreadPoolExecutor(...) as frame_executor:`, but `Executor.__exit__`
+always calls `shutdown(wait=True)` regardless of why the block was
+exited -- so the `break` on cancellation gave none of the "stop promptly"
+benefit it claimed; the function still blocked until every submitted
+`detect()` call, including ones not yet even started, finished. Fixed by
+managing the executor manually and calling
+`shutdown(wait=False, cancel_futures=True)` on the cancelled/exception
+path instead, which drops not-yet-started frames immediately. A second
+follow-up finding caught that `cancel_futures=True` only drops
+NOT-YET-STARTED futures -- an already-running `detect()` call (reading
+the frame's JPEG, or a `claude` CLI subprocess with that file open) keeps
+running regardless, and the enclosing `finally`'s `shutil.rmtree(frames_dir)`
+could then delete a file out from under it. Fixed with a bounded
+`wait(frame_futures, timeout=_FRAME_DETECTION_ABANDON_GRACE_SECONDS)`
+(3.0s) right after the cancelled shutdown, before that rmtree runs.
+
+New test: `test_visual_fallback_runs_frame_detection_concurrently` -- 4
+frames each individually slow (0.3s); asserts total wall time is well
+under the ~1.2s a strictly sequential loop would take.
+
+### Fix 4 — consolidated the four race jobs' duplicated error-isolation boilerplate
+
+All four job functions (`_extract_from_caption`, `_extract_from_creator_comments`,
+`_extract_from_audio_transcript`, `_extract_from_visual`) used to
+hand-copy the identical try/except pattern. Factored into one shared
+`_run_job_safely(source, fn)` wrapper, called by all four via
+`_race_candidate_jobs`'s `executor.submit()` calls -- the job functions
+themselves no longer catch anything; they're free to just let an
+exception propagate, and `_run_job_safely` is the only place that decides
+what "cancelled" vs. "crashed" means.
+
+### Fix 5 — consolidated the duplicated `cancel_event` kwargs snippet
+
+The `kwargs = {"cancel_event": cancel_event} if cancel_event is not None
+else {}` one-liner was hand-copied in `text_extraction/claude_code_extractor.py`,
+`text_extraction/fallback_extractor.py`, and `visual/vision_llm_detector.py`.
+Factored into `core/protocols.cancel_kwargs()` -- placed there (not
+`_subprocess_util.py`) since it's a Protocol call-forwarding convention,
+not a subprocess concern, and `core/protocols.py` is where every
+Protocol defining `cancel_event` already lives.
+
+### Minor cleanups applied
+
+- `_race_candidate_jobs`: dropped the redundant `future_to_source` dict
+  tracking -- keys off `outcome.source` directly, which already carries
+  the same information; `as_completed()` now just takes a plain list of
+  the four race futures.
+- `_subprocess_util.py`: factored the identical terminate/close-fds
+  3-line sequence (duplicated across `run_cancelable`'s cancel and
+  timeout branches) into one `_terminate_kill_and_close()` helper.
+
+### Further findings from follow-up review passes, also fixed in this wave
+
+- `ClaudeCliCancelled` and `SubprocessCancelled` shared no common
+  ancestor beyond `Exception`, forcing `pipeline/waterfall.py`'s
+  `_CANCELLED_EXCEPTIONS` to hardcode a two-exception tuple.
+  `ClaudeCliCancelled` now also inherits from `SubprocessCancelled`
+  (multiple inheritance -- safe here since neither parent defines a
+  custom `__init__`), so a plain `except SubprocessCancelled` now covers
+  both, and any future cancellable component built on
+  `run_cancelable`/`SubprocessCancelled` is automatically covered without
+  that tuple needing to grow.
+- `_wait_or_cancelled`'s leading `if cancel_event.is_set(): return None,
+  True` guard was dead code (the `while not cancel_event.is_set():` loop
+  already produces the identical result by never running its body) --
+  deleted, with a one-line docstring note explaining why instead.
+
+### Review process
+
+Given this diff's size, review happened in several passes rather than
+one: a manual read of the full rewritten `waterfall.py` plus
+`tmdb/resolver.py`, `pipeline/deps.py`, `ingest/instagram.py`, and
+`_subprocess_util.py` against the task's 5 named findings first; then
+`/code-review --effort high` was launched (forked background execution,
+8 finder-angle agents) and `/ponytail:ponytail-review` was invoked
+alongside it. Several additional, genuine findings surfaced during this
+process (the process-exit/daemon-thread issue, the `frame_executor`
+`shutdown(wait=True)` issue and its `cancel_futures` follow-up, the
+HTTPError status-code gating, the `ClaudeCliCancelled` common-ancestor
+gap, the missing between-step `cancel_event` checks, and the wasted
+audio extraction when no transcriber is configured) -- all were verified
+against the actual code (not taken on faith), fixed directly, and
+re-tested. Each fix was re-run through `python3 -m pytest tests/unit -q`
+individually as it landed, not batched to the end.
+
+### Final test count
+
+`python3 -m pytest tests/unit -q` → **338 passed** (332 at the start of
+this pass + 6 new regression tests: one proving Fix 1's return-before-
+download-finishes behavior, one proving its daemon-thread/process-exit
+correctness, one proving Fix 2's retry-and-resolve behavior, two proving
+the HTTPError status-code gating fix, and one proving Fix 3's genuine
+per-frame concurrency). Re-ran 3-5x in a loop with no flakiness observed
+after the grace-period/polling fixes landed (an earlier iteration without
+polling WAS observed to be flaky/wrong under real thread-scheduling
+timing, which is exactly what led to the `_wait_or_cancelled` polling
+design instead of a simpler before/after check).
+
+### Verdict
+
+**OK to build on for the next wave** (GUI streaming wiring + disambiguation
+fixes). All 5 required fixes are in, re-tested individually as they
+landed; the minor cleanups were applied; several additional genuine
+correctness issues surfaced by follow-up review (process-exit via daemon
+threads, the frame-executor `shutdown(wait=True)`/`cancel_futures`
+in-flight-file-deletion race, HTTPError status-code gating, the
+`ClaudeCliCancelled` ancestor gap, missing between-step cancellation
+checks, and wasted audio extraction) were also fixed and tested rather
+than deferred. No known blocking issues remain. Two items remain
+explicitly OUT of scope per the task's own instructions, not overlooked:
+`ingest/instagram.py`'s `ensure_video()` lock (kept -- concurrent calls
+are now more plausible than before, not less, given this wave's
+restructuring) and `resolve_candidate_with_retry`'s blocking-sleep-ties-
+up-a-worker finding (low severity, conditional on candidate counts this
+project doesn't expect to hit).
+
+## Candidate noise filtering (Problem A) + "Don't Be Shy" reliability follow-up (Problem B)
+
+Two related-but-distinct fixes layered strictly additively on top of the
+parallel-race pipeline above. Neither touches `pipeline/waterfall.py`'s
+race/cancellation machinery itself -- only one new call is inserted
+between the race winner being determined and TMDB resolution starting.
+
+### Problem A — noise filtering across genuinely different candidate strings
+
+New module `reel2movie/text_extraction/candidate_disambiguation.py`:
+
+```python
+def select_primary_candidates(
+    candidates: list[Candidate],
+    source_text: str,
+    chat_client: TextChatClient,
+) -> list[Candidate]
+```
+
+This is a different problem from Problem B below: it picks among several
+DIFFERENT raw candidate title *strings* extracted from one piece of
+source text (some of which may be noise -- an unrelated quoted tagline, a
+line of dialogue, a hashtag fragment, an incidental/comparison mention),
+never among several TMDB *entries* sharing one title.
+
+- Skips the LLM call entirely for `len(candidates) <= 1`, returning
+  `candidates` unchanged -- mirrors `disambiguate_with_context()`'s
+  existing "only bother when there's genuine ambiguity" precedent.
+- Asks ONE model call for a PER-CANDIDATE keep/drop classification (not
+  "pick a winner") plus one overall `media_type_hint`
+  (`"movie"`/`"tv"`/`null`) for `source_text` as a whole. Per-candidate
+  classification is the single mechanism that keeps a genuine "ranked
+  list of 5 movies" caption's candidates all 5 intact (brainstorm.md's
+  explicitly-required hard case) while collapsing a 1-real+N-noise
+  caption down to just the 1 real candidate -- there is no separate
+  single-vs-multi branch to keep in sync.
+- Fail-safe, matching `disambiguate_with_context()`'s existing
+  philosophy: ANY chat-client exception, or a reply that isn't the EXACT
+  expected JSON shape (`_parse_reply`'s strict validation -- one
+  well-formed, uniquely-indexed decision per candidate index, 0 through
+  `len(candidates) - 1`), returns `candidates` UNCHANGED. A malformed
+  reply is never partially trusted/applied.
+- Surviving candidates get `media_type_hint` attached via
+  `dataclasses.replace` (`Candidate` is frozen).
+
+`reel2movie/core/models.py`: `Candidate` gained
+`media_type_hint: str | None = None` as the LAST field. Confirmed every
+existing `Candidate(...)` construction site in the codebase
+(`text_extraction/regex_extractor.py`, `_candidate_parsing.py`) uses
+keyword args, so this is non-breaking for keyword AND positional callers
+alike.
+
+### Problem B — "Don't Be Shy": strengthened unknown-detection + majority vote
+
+`reel2movie/tmdb/resolver.py`:
+
+1. `disambiguate_with_context()`'s prompt now has a prominent "IMPORTANT"
+   paragraph explicitly instructing the model that if NONE of the
+   candidates' overviews plausibly describe what the surrounding text is
+   about, it MUST reply `"unknown"` rather than guess -- naming the real,
+   observed risk (one of the real "Don't Be Shy" TMDB entries is
+   adult-themed) as the concrete reason guessing is worse than admitting
+   uncertainty. The original prompt never said this, and -- per this
+   file's earlier "Don't Be Shy" writeup -- the model never once replied
+   "unknown" across 8 real live trials even when no candidate plausibly
+   matched.
+2. New majority-vote reliability layer, scoped NARROWLY to this one
+   function (not every chat-client call in the codebase): a new named
+   constant `_DISAMBIGUATION_SAMPLE_COUNT = 3` independent chat-client
+   calls for the identical prompt (via new internal `_disambiguate_once()`
+   helper), requiring `_DISAMBIGUATION_MAJORITY_THRESHOLD = 2` of them to
+   agree on the same id before trusting it. No majority (3 different ids,
+   or a split with no 2+ agreement) is treated exactly like a single
+   honest "unknown": falls through to the existing `pick_best()`
+   rank-tiebreak fallback, unchanged. `disambiguate_with_context()`'s own
+   signature is UNCHANGED -- the sampling loop is an internal
+   implementation detail, so its one caller (`resolve_candidate()`)
+   needed no changes at all.
+   - **Real cost tradeoff, documented directly in the docstring**: 3x the
+     chat-client calls, but ONLY for this one tie-break scenario, which
+     fires when 2+ exact-title TMDB matches exist for a candidate -- a
+     comparatively rare case (most candidates resolve with 0-1 exact
+     matches and never reach this function at all), not every TMDB
+     resolution in the pipeline.
+3. `resolve_candidate()` and `resolve_candidate_with_retry()` both gained
+   an optional `media_type_hint: str | None = None` parameter (both
+   backward-compatible: `resolve_candidate_with_retry`'s existing params
+   are already keyword-only and this is forwarded straight through to
+   `resolve_candidate()`). When given, `client.search()`'s raw results are
+   filtered down to that `media_type` BEFORE `find_exact_matches()`/
+   `pick_best()`/disambiguation ever see them -- but if filtering would
+   eliminate every result, the unfiltered list is used instead, the same
+   fail-safe posture used throughout this module (an overzealous/wrong
+   hint must never turn a real set of candidates into zero).
+
+**Honest limitation, worth restating plainly** (already documented
+elsewhere in this file under the original "Don't Be Shy" writeup --
+repeated here because this follow-up does not, and cannot, change it):
+TMDB genuinely does not have the real Alia Bhatt / Amazon Prime
+"Don't Be Shy" rom-com in its database at all. This fix's achievable goal
+was never "find the correct entry" -- that is structurally impossible
+without the data existing in TMDB in the first place -- it is "never
+confidently resolve to a wrong/inappropriate entry when the real one
+isn't there." The majority vote directly targets the one observed failure
+mode (1/8 real trials landing on the adult-themed entry): requiring 2-of-3
+agreement makes a single unlucky sample far less likely to carry the
+final decision on its own, and the strengthened "when in doubt, say
+unknown" instruction gives the model actual explicit permission/incentive
+to abstain, which the original prompt never successfully exercised in 8/8
+real trials. Neither change makes TMDB's data more complete.
+
+### `pipeline/waterfall.py` wiring
+
+Two new functions, called once each from both `run_pipeline()` and
+`run_pipeline_streaming()`, right after `_pool_candidates_and_transcript`
+and before `_resolve_all`/the concurrent resolution loop:
+
+- `_primary_candidate_source_text(winner, result) -> str` — picks the
+  text that actually PRODUCED the winning outcome's candidates, per
+  `SourceTag`: `CAPTION` -> `result.caption`; `CREATOR_COMMENT` -> every
+  creator top-level comment's text joined together (the SAME comments
+  `_extract_from_creator_comments` reads); `AUDIO_TRANSCRIPT` -> the
+  winning outcome's `raw_text` (the transcript itself); `FRAME_VISUAL` (or
+  any other/future source) -> falls back to `result.caption` (no raw TEXT
+  signal exists for pixels). This is the piece that makes the fix actually
+  work for a non-caption winner -- always using `result.caption` would
+  have defeated the point for an audio/comment win.
+- `_apply_primary_candidate_filter(outcomes, candidates, result, deps) ->
+  list[Candidate]` — calls `select_primary_candidates` ONLY when there IS
+  a single race winner (`len(outcomes) == 1`); in the no-winner 4-outcome
+  pooled case, each of the four jobs independently contributed at most its
+  own handful of candidates and there is no single coherent `source_text`
+  to hand the model (caption/comment/transcript/visual are four unrelated
+  signals), so filtering is skipped there and every pooled candidate
+  resolves exactly as before this feature existed. Reuses
+  `deps.disambiguation_chat_client` directly -- no new `PipelineDeps`
+  field was needed; skipped entirely when that's `None` (same "feature
+  not available" posture the pre-existing disambiguation step already
+  takes for a missing chat client).
+- `_resolve_one()` now threads `candidate.media_type_hint` through to
+  `resolve_candidate_with_retry()`'s new param.
+
+### Tests
+
+New file `tests/unit/text_extraction/test_candidate_disambiguation.py` (9
+tests): skips the LLM for 0 and for 1 candidate; the 5-genuine-candidate
+ranked-list case keeps all 5 (with the shared `media_type_hint` attached);
+a 1-real+2-noise case drops the noise and keeps just the real one; a
+chat-client exception keeps candidates unchanged; a non-JSON garbage
+reply keeps candidates unchanged; a reply missing a decision for one
+index keeps candidates unchanged; `media_type_hint` attached on success;
+an invalid hint value (e.g. `"documentary"`) is coerced to `None`; and a
+prompt-content check (source text + every candidate string present).
+
+`tests/unit/tmdb/test_resolver.py`: 4 new majority-vote tests for
+`disambiguate_with_context` (unanimous 3-of-3 agreement; 2-of-3 majority
+with one dissenting sample; no majority via 3 different replies; no
+majority via a split with "unknown"s) -- each confirming via the fake
+chat client's `call_count` that it was actually invoked
+`_DISAMBIGUATION_SAMPLE_COUNT` (3) times, not once. 3 new
+`media_type_hint` filtering tests for `resolve_candidate` (hint matches
+some results -> filtered correctly; hint matches none -> falls back to
+the unfiltered list, never returns empty; no hint given -> byte-for-byte
+unchanged behavior). 4 PRE-EXISTING tests that hardcoded
+`chat_client.call_count == 1` / `len(chat_client.prompts) == 1` for
+`disambiguate_with_context` were updated to
+`_DISAMBIGUATION_SAMPLE_COUNT` -- a deliberate, expected behavior change
+from adding the majority vote, not a regression.
+
+`tests/unit/pipeline/test_waterfall.py`: 2 new end-to-end tests
+(`test_primary_candidate_filter_uses_caption_text_for_caption_win`,
+`test_primary_candidate_filter_uses_transcript_text_for_audio_win`)
+proving the right `source_text` reaches `select_primary_candidates` for
+two different winning-source cases via a real `run_pipeline()` call with
+fakes -- a caption win's filter prompt contains the caption's unique
+marker text, an audio-transcript win's filter prompt contains the
+transcript's unique marker text (and NOT the unrelated caption). 3
+pre-existing tests with the same `call_count`/prompts-length-1 assumption
+(all exercising `disambiguate_with_context` through a real `run_pipeline`
+call) were updated to 3 for the same majority-vote reason.
+
+### Test results
+
+`python3 -m pytest tests/unit -q`: **338 passed** (baseline, reconfirmed
+at the start of this wave) -> **357 passed** after this follow-up (19 new
+tests: 9 in the new `test_candidate_disambiguation.py`, 7 new in
+`test_resolver.py`, 2 new end-to-end in `test_waterfall.py`; zero
+regressions -- the 7 pre-existing tests whose assertions changed were
+updated for the DELIBERATE 3x-call-count behavior change, not broken by
+it). Re-ran the full suite 3 times total with no flakiness observed.
+
+### Review
+
+Manually reviewed the diff against the task's exact requirements
+(fail-safe posture on both new/changed functions, backward-compatible
+signatures for `resolve_candidate`/`resolve_candidate_with_retry`/
+`disambiguate_with_context`, the no-winner-pool skip, the per-`SourceTag`
+`source_text` selection, `Candidate`'s new field placement). Ran
+`ponytail:ponytail-review`, scoped manually to the files actually touched
+by this follow-up (the raw `git diff` also contains a prior, separately-
+reviewed wave's uncommitted race-pipeline rewrite -- out of scope for this
+review pass). Two minor simplifications found and fixed in
+`reel2movie/tmdb/resolver.py`: a manual vote-counting dict replaced with
+`collections.Counter`, and a duplicated "find `TMDBSearchResult` by id"
+linear-search loop (previously inlined separately in both
+`_disambiguate_once` and `disambiguate_with_context`) factored into one
+shared `_find_by_id()` helper. Also ran `/code-review --effort high` in
+the background; no additional confirmed correctness findings surfaced
+beyond what's listed above as of this writing -- re-ran the full test
+suite (357 passed) after the two ponytail simplifications landed.
+
+### Verdict
+
+**OK to build on.** Both required fixes are in, tested, and re-tested
+after the ponytail cleanups. `gui/` was not touched by this follow-up (its
+concurrent GUI-streaming changes, visible in `git status` during this
+session, belong to a different, parallel piece of work). The one
+explicitly-acknowledged limitation (TMDB not having the real "Don't Be
+Shy" film at all) is structural, not a bug in this fix, and is restated
+above rather than silently left implicit.
+
+## GUI streaming wiring (consuming `run_pipeline_streaming`)
+
+**Goal:** wire the desktop GUI (`gui/`) to the pipeline's new
+`run_pipeline_streaming()` generator (`reel2movie/pipeline/waterfall.py`,
+landed in the previous backend wave) so recommendation cards appear one
+at a time as each candidate resolves against TMDB, instead of the whole
+results list popping in at once at the end. Only `gui/` was touched;
+`reel2movie/` was read-only for this wave (its files showed as already
+modified in `git status` before this wave started, and again mid-session
+-- see below -- both from concurrent, unrelated backend work on
+candidate disambiguation, not from this change).
+
+### Changes
+
+**`gui/workers.py`** -- `PipelineRunner.run()` now calls
+`run_pipeline_streaming(url, deps)` instead of `run_pipeline(url, deps)`,
+iterating it and emitting a new `recommendation_ready = Signal(object)`
+for every raw `Recommendation` as it arrives. Exceptions raised by the
+iterator (including mid-stream, after some items already streamed) are
+caught the same way the old code caught `run_pipeline`'s exceptions and
+turned into `failed.emit(str(exc))`.
+
+Every yielded `Recommendation` is also accumulated into a plain list;
+once the stream ends cleanly, that list is passed through `_dedupe`
+(imported directly from `reel2movie.pipeline.waterfall` -- the exact same
+function `run_pipeline()` itself calls) and wrapped in a `PipelineResult`,
+emitted via the pre-existing `succeeded = Signal(object)`. **Dedup
+decision:** reuse `_dedupe` rather than write a simpler GUI-side "merge by
+`tmdb.id`" pass, even though it's module-private (leading underscore) in
+`waterfall.py` -- `tests/unit/pipeline/test_waterfall.py` already imports
+it directly rather than re-deriving its behavior, so treating it as
+reusable within this codebase is consistent with existing practice. The
+alternative (a second, GUI-only dedupe rule) risks silently drifting from
+`_dedupe`'s actual merge semantics (same-tmdb-id-keep-highest-confidence,
+same-query unresolved/resolved collapsing, confidence sort) over time;
+reusing it means the GUI's final result is byte-for-byte what
+`run_pipeline()` would have produced for the same reel. This also means
+every existing caller of `succeeded` (`MainWindow._on_pipeline_succeeded`)
+needed zero changes to its contract.
+
+**`gui/widgets.py`** -- `ResultsPanel` had no incremental-add method
+before this wave (confirmed by reading; only `set_recommendations()` full
+-replace and `clear()` existed). Added `add_recommendation(card_data:
+dict) -> None`: clears the "no recommendations found" empty-state label
+first if it's currently showing, builds one `RecommendationCard` exactly
+as `set_recommendations()` does (same constructor call, same `parent`),
+and inserts it before the trailing stretch -- using
+`self._content_layout.count() == 0` to tell whether that stretch exists
+yet (no separate boolean flag needed; this was simplified down from an
+initial `_has_cards` field during the ponytail-review pass below).
+`clear()`'s docstring was updated to mention the new caller.
+
+**`gui/main_window.py`** -- `_launch_pipeline()` now calls
+`self.results_panel.clear()` right before starting a new
+`PipelineRunner`, so a second Run click starts the incremental trickle
+into a clean panel instead of appending onto whatever an earlier run left
+behind (the panel is long-lived across runs, not recreated). Connects the
+new `recommendation_ready` signal to a new handler,
+`_on_recommendation_ready(rec: object) -> None`, which reuses the
+existing `_recommendation_to_card_data()` static helper (no duplicated
+mapping logic), calls `results_panel.add_recommendation(...)`, and
+switches to the results page if not already showing it -- which happens
+on the first call, satisfying "show results on the first item, not after
+all of them" without redundantly calling `setCurrentWidget` on every
+subsequent item. `_on_pipeline_succeeded()` (the `succeeded` handler) is
+unchanged: it still does one full `set_recommendations()` re-render at
+the end, which naturally corrects the trickled-in cards to the final
+deduped/sorted set.
+
+### Testing
+
+**Mocked/integration (`PipelineRunner` + `MainWindow`, offscreen Qt,
+script in the session's scratchpad, not committed):**
+
+- Staggered-delay fake generator (3 items, 0.15s apart): confirmed
+  `recommendation_ready` fired exactly 3 times with correct payloads,
+  `succeeded` fired exactly once at the end with all 3 recommendations
+  deduped, `failed` never fired.
+- Exploding generator (yields 2 items, then raises `ValueError` mid
+  -stream): confirmed `recommendation_ready` fired for the 2 items before
+  the raise, `failed` fired exactly once with a readable message
+  containing the real exception text, `succeeded` never fired, no crash
+  or hang.
+- Direct `MainWindow._on_recommendation_ready()` calls: confirmed the
+  results page becomes the current `stacked_widget` page on the very
+  FIRST call (not after all items), each call appends exactly one card
+  (`content_layout.count()` grows by 1 per call, plus the lazily-added
+  trailing stretch), and a subsequent `_on_pipeline_succeeded()` call
+  re-renders the authoritative final set.
+- `results_panel.clear()` immediately followed by one
+  `add_recommendation()` call: confirmed no leftover cards from a
+  simulated previous run.
+
+All of the above: **PASS**.
+
+**Live end-to-end** (`python3 -m gui.main`-equivalent, driven
+programmatically under `QT_QPA_PLATFORM=offscreen` since this session has
+no real display -- `MainWindow` constructed for real, `url_input` set to
+`https://www.instagram.com/reel/DU7OQACiDtk/` (a sample reel already
+cached as a local .mp4 in the repo root), `_on_run_clicked()` invoked for
+real, polling `results_panel`'s actual layout state every 500ms): ran
+against the real pipeline (`TMDB_API_KEY` from `.env`, real local `claude`
+CLI) with a 150s hard observation budget.
+
+Observed timeline (actual, not simulated):
+
+```
+t=  0.53s  page=running   content_layout.count()=0
+t= 70.87s  page=RESULTS   content_layout.count()=2   <- first card, page switched immediately
+t= 71.35s  page=RESULTS   content_layout.count()=9
+t= 73.72s  page=RESULTS   content_layout.count()=10
+t= 85.72s  page=RESULTS   content_layout.count()=11
+t= 87.72s  page=RESULTS   content_layout.count()=12
+t= 88.72s  page=RESULTS   content_layout.count()=13
+t= 90.22s  page=RESULTS   content_layout.count()=14
+t= 91.22s  page=RESULTS   content_layout.count()=15
+t= 92.22s  page=RESULTS   content_layout.count()=16
+t= 93.72s  page=RESULTS   content_layout.count()=18
+t= 94.72s  page=RESULTS   content_layout.count()=13  <- succeeded's final re-render (dedup collapsed 17->12 cards)
+(no further change through t=150s)
+```
+
+This confirms, with real network/TMDB/claude-CLI calls, both: (b) the
+results page appears on the very first streamed item (t=70.87s), well
+before the run actually finishes (t=94.72s); and the final `succeeded`
+re-render visibly shrinks the card count (18->13, i.e. 17->12 cards) as
+`_dedupe` collapses duplicate TMDB matches found by multiple
+candidates/frames -- a real, visible "correction" effect, not just a
+theoretical one. (Separately, this run's audio-transcript race job threw
+`WHISPER_CPP_MODEL_PATH is not set` -- a pre-existing local-env
+configuration gap, correctly error-isolated by `_run_job_safely` into an
+empty outcome rather than crashing the pipeline; unrelated to this wave's
+changes.)
+
+### Review
+
+Ran `/code-review --effort medium` and `/ponytail:ponytail-review` on the
+full `gui/` diff. Findings and dispositions:
+
+- **Fixed:** `ResultsPanel` tracked a separate `_has_cards` boolean just
+  to know whether the trailing stretch already existed. Removed it --
+  `self._content_layout.count() == 0` (checked right after the
+  empty-state-label `clear()`, so it only reads "no stretch yet" in that
+  state) tells the same thing with one less field to keep in sync across
+  `set_recommendations`/`add_recommendation`/`clear`.
+- **Fixed:** `_on_recommendation_ready()`'s docstring said the page switch
+  happens "on the very first" item, but the code called `_show_results()`
+  unconditionally on every call (harmless -- `setCurrentWidget` on an
+  already-current widget is a no-op -- but not what the docstring
+  claimed). Added a one-line guard (`if ... is not self.results_panel:`)
+  so the code matches the documented intent exactly.
+- **Accepted, not fixed:** streaming cards in non-deduped, completion
+  -order means a transient visual state is possible where an unresolved
+  card (`tmdb=None`) and a resolved card for the same underlying movie
+  both appear briefly, until `succeeded`'s final re-render corrects it.
+  This is the explicit, documented trade-off of this design (per the
+  task's own instructions to keep the incremental path simple and let the
+  final re-render be the one authoritative correction) -- the live test
+  above confirms the correction does visibly happen (18->13), and adding
+  incremental merge/dedup logic to `add_recommendation` would meaningfully
+  expand this wave's scope for a cosmetic, self-correcting flicker.
+- **Accepted, not fixed:** `PipelineRunner.run()`'s final
+  `_dedupe(...)` + `PipelineResult(...)` pair duplicates (as a 2-line
+  pattern, not duplicated logic) what `run_pipeline()` itself does
+  internally in `waterfall.py`. Fixing this properly would mean factoring
+  a shared helper *inside* `waterfall.py` -- out of scope for this wave,
+  which was restricted to `gui/` only.
+
+Re-ran both the mocked integration script and `python3 -m pytest
+tests/unit -q` after applying the two fixes above -- all still pass (see
+below).
+
+### Test counts
+
+`python3 -m pytest tests/unit -q` → **357 passed** at the time this wave
+finished (the 338-passed baseline recorded at the start of this session
+had already grown to 357 mid-session from a concurrent, unrelated
+backend wave touching candidate disambiguation -- visible via `git
+status` showing `reel2movie/core/models.py` newly modified and a new
+`reel2movie/text_extraction/candidate_disambiguation.py` file appearing
+partway through this session, neither of which this wave touched or
+needed to: the only field that wave added, `Candidate.media_type_hint`,
+is on `Candidate`, not on `Recommendation`/`ResolvedMovie`/
+`PipelineResult`, so it has zero effect on anything the GUI consumes).
+Confirmed via `git status --short gui/` and `git status --short
+reel2movie/` that this wave's own diff is contained entirely to
+`gui/main_window.py`, `gui/widgets.py`, and `gui/workers.py`.
+
+### Verdict
+
+**OK to build on.** All required behaviors ((a)-(d) from the mocked
+tests, plus a real end-to-end run confirming (b) and the dedup-correction
+effect with real network/TMDB/claude-CLI calls) are verified. No changes
+were made under `reel2movie/`. Not committed to git per this wave's
+instructions.
+
+## Review-driven fixup wave: deps/race-pool/resolver/GUI findings
+
+A separate, independent code-review pass against the previous two waves
+(the waterfall race rewrite + TMDB retry, and candidate disambiguation +
+GUI streaming) surfaced real findings the original agents hadn't caught.
+This wave verified each claim by reading the actual current code first,
+then fixed the confirmed issues, re-testing after each fix. Two more
+findings were sent mid-session by the coordinator after their own
+analysis, plus one further finding surfaced by running `/code-review` on
+this wave's own diff, plus one final finding sent by the coordinator
+after that. All eight+ items below were fixed and tested.
+
+### Fix 1 (HIGH) — unconditional whisper.cpp wiring caused ERROR-log spam on every default run
+
+**Confirmed.** `reel2movie/pipeline/deps.py`'s `build_default_pipeline_deps()`
+constructed a `_LazyWhisperCppTranscriber()` unconditionally, regardless
+of whether `WHISPER_CPP_MODEL_PATH` was actually set. Since whisper.cpp
+is a brand-new optional subpackage most environments (including this
+dev machine) don't have configured, every `run_pipeline`/
+`run_pipeline_streaming` call triggered a wasted background ffmpeg audio
+extraction AND `_extract_from_audio_transcript`'s
+`deps.audio_transcriber.transcribe(...)` call raised `RuntimeError` (from
+`config.get_whisper_cpp_model_path()`), logged via `logger.exception` at
+ERROR with a full traceback on every single run.
+
+**Fix:** `build_default_pipeline_deps()` now only constructs
+`_LazyWhisperCppTranscriber()` when `os.environ.get("WHISPER_CPP_MODEL_PATH")`
+is truthy (mirroring the same cheap-env-check pattern used elsewhere in
+this function); otherwise `audio_transcriber` stays `None` -- the same
+"capability not available" signal `disambiguation_chat_client` already
+uses. Verified `_prepare_audio`/`_extract_from_audio_transcript` already
+correctly skip all audio work when `audio_transcriber is None` (no
+`waterfall.py` changes needed for this fix specifically). Replaced
+`test_audio_transcriber_is_wired_without_requiring_whisper_cpp_model_path_env_var`
+(which asserted the old, now-wrong behavior) with
+`test_audio_transcriber_is_none_when_whisper_cpp_model_path_unset` and
+`test_audio_transcriber_is_wired_when_whisper_cpp_model_path_set`.
+
+### Fix 2 (MEDIUM-HIGH) — uncancellable Anthropic HTTP calls can still hang CLI process exit
+
+**Confirmed.** `AnthropicVisionChatClient.chat()` (the non-default
+`VISION_BACKEND=anthropic_api` backend) can't honor `cancel_event` (a
+blocking HTTP call, no local process to kill). The PRIOR wave's Fix 1
+moved `_prepare_video`/`_prepare_audio`/`_cleanup_audio_temp_dir` off
+`ThreadPoolExecutor` onto plain daemon threads (`_run_in_daemon_thread`)
+specifically to stop `concurrent.futures.thread`'s process-wide `atexit`
+hook (which joins every worker thread of every `ThreadPoolExecutor` ever
+created, regardless of `shutdown(wait=False)`) from hanging a
+short-lived caller's process exit. But the four actual race jobs in
+`_race_candidate_jobs` still ran on a real `ThreadPoolExecutor`, and the
+visual job's own nested per-frame `frame_executor` pool was ALSO a real
+`ThreadPoolExecutor` -- so an in-flight Anthropic HTTP call could still
+hang process exit via either of those two pools, the same bug class via
+a different path.
+
+**Decision: partially converted, partially documented as an accepted
+limitation** (per the task's own explicit escape valve):
+
+- **Converted (done):** the outer 4-job race pool in `_race_candidate_jobs`
+  is now `_run_in_daemon_thread`-backed, like the prep jobs. This was a
+  genuinely mechanical substitution -- `_run_in_daemon_thread` already
+  returns a plain `concurrent.futures.Future` that `as_completed()`/
+  `wait()` consume identically regardless of what created it, and the
+  pool only ever hosted exactly 4 jobs for exactly 4 workers (no real
+  queueing/concurrency-limiting behavior to preserve). Removed the now-
+  dead `_RACE_POOL_MAX_WORKERS` constant and the `executor`/`finally:
+  shutdown(wait=False)` wrapper entirely.
+- **NOT converted (documented as a known, accepted limitation):**
+  `_extract_from_visual`'s nested per-frame `frame_executor` stays a real
+  `ThreadPoolExecutor`. Unlike the outer pool, this one enforces a
+  genuine bounded concurrency limit (`_FRAME_DETECTION_MAX_WORKERS`) over
+  a variable, unbounded number of frames, plus tested
+  `cancel_futures=True` drop-vs-already-running semantics and a bounded
+  abandon-grace wait. Reproducing that correctly with raw daemon threads
+  (e.g. a semaphore-gated spawner) would mean rewriting already
+  load-bearing, tested cancellation logic for a benefit that only
+  matters under the non-default `anthropic_api` backend -- judged too
+  risky for this pass. Documented in the module docstring (new "Fix 2"
+  note), `_extract_from_visual`'s own docstring, and a new test,
+  `test_frame_detection_pool_threads_are_real_threadpool_workers_known_limitation`,
+  that explicitly asserts the CURRENT (limitation-exists) state so a
+  future fix converting `frame_executor` away from a real
+  `ThreadPoolExecutor` makes this test fail loudly instead of the gap
+  silently persisting unnoticed.
+
+### Fix 3 (MEDIUM) — stale `_CANCELLED_EXCEPTIONS` tuple
+
+**Confirmed.** `reel2movie/_claude_cli.py` already has `ClaudeCliCancelled(ClaudeCliError, SubprocessCancelled)`
+(multiple inheritance, added in an earlier wave) -- so `waterfall.py`'s
+`_CANCELLED_EXCEPTIONS = (ClaudeCliCancelled, SubprocessCancelled)` tuple
+and its "unrelated class hierarchies" comment were stale. Simplified
+`_run_job_safely`'s `except _CANCELLED_EXCEPTIONS:` to
+`except SubprocessCancelled:` alone, removed the tuple and the stale
+comment, and fixed the module docstring's error-isolation-policy section
+to explain the inheritance instead. Updated
+`test_claude_cli_cancelled_from_a_job_is_also_treated_as_lost_not_crashed`'s
+docstring to describe the single `except` clause rather than two
+separately-handled types (the test body itself needed no change -- it
+already only asserted the observable behavior, not the internal tuple).
+
+### Fix 4 (MEDIUM) — disambiguation's 3-sample majority vote ran sequentially
+
+**Confirmed.** `tmdb/resolver.py`'s `disambiguate_with_context()` called
+`_disambiguate_once()` 3 times via a plain sequential list comprehension,
+tripling wall-clock latency for every tie-break scenario for no reason --
+each call is an independent, data-independent blocking chat-client
+round-trip. Fixed via `ThreadPoolExecutor(max_workers=_DISAMBIGUATION_SAMPLE_COUNT).map(...)`,
+collecting all 3 results before the unchanged majority-vote counting
+logic. `tests/unit/tmdb/test_resolver.py`'s `FakeChatClient` (which
+indexes into a configured `replies` list via `self.call_count`, relying
+on each call consuming a distinct, sequential reply) needed a
+`threading.Lock` added around its read-then-increment to stay correct
+now that 3 threads can call `chat()` concurrently -- without it, the
+read-then-increment race could have two threads both consume the same
+reply index, corrupting the majority-vote test fixtures' intended
+reply distribution. Verified stable across 5 repeated runs of
+`test_resolver.py` after the fix (no flakiness from the new concurrency).
+
+### Fix 5 (MEDIUM) — `_dedupe` promoted to a public API
+
+**Confirmed.** `gui/workers.py` imported and called
+`reel2movie.pipeline.waterfall._dedupe` directly across a package
+boundary (module-private, leading underscore), justified only by "an
+existing test already does this." Renamed to a public
+`dedupe_recommendations` in `waterfall.py`, updated its one internal
+caller (`run_pipeline`), updated `gui/workers.py`'s import and both call
+sites, and updated `tests/unit/pipeline/test_waterfall.py`'s import and
+three direct calls. `_resolve_one` was checked and left private -- it's
+only used internally within `waterfall.py` (`_resolve_all` and
+`run_pipeline_streaming`), never imported elsewhere. Pure rename/
+visibility change; behavior and parameters unchanged.
+
+### Fix 6 (LOW) — duplicated "creator top-level comments" filter
+
+**Confirmed and fixed** (cheap, not entangled with other logic as
+feared). Factored the `comment.author_id == result.creator_account_id
+and not comment.is_reply` predicate -- written out identically in both
+`_extract_from_creator_comments` and `_primary_candidate_source_text` --
+into one shared `_creator_top_level_comments(result) -> list[Comment]`
+helper, used by both (the second call site maps `.text` over the
+result).
+
+### Follow-up finding A (sent mid-session) — prompt-corruption bug via chained `.replace()`
+
+**Confirmed.** `reel2movie/text_extraction/candidate_disambiguation.py`'s
+`select_primary_candidates()` built its prompt via chained `.replace()`
+calls on the growing string. Each `.replace()` rescans the WHOLE string
+including already-substituted content, so an untrusted `source_text`
+(caption/comment/transcript) containing a literal `"{candidates}"` or
+`"{max_index}"` substring got corrupted by a LATER `.replace()` call
+matching inside the just-inserted text. Fixed by switching to
+`str.format()` (one-pass substitution against the ORIGINAL template, like
+`tmdb/resolver.py`'s own `_DISAMBIGUATION_PROMPT_TEMPLATE.format(...)`,
+which was never affected by this bug) -- required escaping the prompt's
+literal JSON-shape example braces (`{{`/`}}`) since `.format()` would
+otherwise try to substitute them too. Added
+`test_source_text_containing_literal_placeholder_substrings_passes_through_unmangled`,
+confirming a `source_text` containing both literal substrings survives
+intact in the final prompt.
+
+### Follow-up finding B (sent mid-session) — `_prepare_audio`'s cancellation miscategorized as an error
+
+**Confirmed.** `_prepare_audio()` caught `extract_audio()`'s failures
+with a bare `except Exception:` that unconditionally called
+`logger.exception(...)` (ERROR, full traceback) -- but `extract_audio()`
+raises `SubprocessCancelled` on the NORMAL, expected "lost the race"
+case (whenever a fast text job wins while audio extraction is still in
+flight -- the common case for most successful runs once an
+`AudioTranscriber` is configured), contradicting this module's own
+documented error-isolation policy (cancellation -> INFO, genuine failure
+-> ERROR) that `_run_job_safely` already correctly implements for the
+four actual race jobs. Fixed by catching `SubprocessCancelled` separately,
+logged at INFO. Added
+`test_prepare_audio_cancellation_is_logged_at_info_not_error`, a
+caplog-based test mirroring the existing
+`test_cancelled_exception_from_a_job_is_treated_as_lost_not_crashed`
+pattern, confirming no ERROR record is emitted when `extract_audio` is
+cancelled.
+
+### Review-pass finding (surfaced by running `/code-review` on this wave's own diff) — `_prepare_audio`'s `mkdtemp()` call could violate its own "never raises" contract
+
+**Confirmed, fixed.** `tempfile.mkdtemp(prefix="reel2movie_audio_")` sat
+outside `_prepare_audio`'s try/except, so a rare but real `OSError`
+(disk full, unwritable temp dir) would propagate out of the function
+despite its own docstring's explicit "Never raises" contract -- and
+`_cleanup_audio_temp_dir()`, the only consumer that would ever observe
+it via `audio_future.result()`, has no exception handling of its own, so
+the failure would vanish with zero log output from inside its own
+never-read daemon-thread `Future`. Wrapped the `mkdtemp()` call in its
+own `try/except OSError`, logged via `logger.exception` and returning
+`None` -- consistent with every other failure path in this function.
+
+### Final finding (sent after the fixup round above) — unbounded wait on `video_future` could leak 2-3 daemon threads per hung download
+
+**Confirmed.** `_prepare_audio()` called `video_future.result()`
+unboundedly (no timeout, no `cancel_event` check). `InstagramIngestor
+.ensure_video()` (the yt-dlp download `_prepare_video` blocks on) has no
+cancellation/timeout support of its own at all. Since `ensure_video()`
+now runs unconditionally on every pipeline run (not just the old
+last-resort fallback), a single reel where yt-dlp's network call
+genuinely hangs forever (sustained throttling, a dropped connection
+yt-dlp's own retries never recover from) leaves `_prepare_video`'s daemon
+thread blocked forever -- and the unbounded wait in `_prepare_audio`
+leaked a SECOND permanently-blocked daemon thread on top of that, with
+`_cleanup_audio_temp_dir` leaking a THIRD waiting on `_prepare_audio`'s
+own future in turn. In a long-lived caller (the GUI), this would
+accumulate 2-3 leaked threads per problem reel for the life of the
+process.
+
+**Fix:** added a new module constant, `_VIDEO_DOWNLOAD_WAIT_TIMEOUT_SECONDS`
+(300.0s, mirroring `resolve_candidate_with_retry()`'s own "a few minutes
+is a reasonable worst case for one reel" `deadline_seconds` default), and
+gave `video_future.result(timeout=...)` that bound in `_prepare_audio`.
+On `TimeoutError`, logs at WARNING (not ERROR -- it's not a crash) and
+returns `None`, the same "nothing to work with" outcome every other
+early-return in this function already produces -- never propagating.
+This does NOT fix `_prepare_video`'s own thread leaking if `ensure_video()`
+truly never returns (that needs yt-dlp's own cancellation support, out of
+scope); it only stops the leak from cascading into 2-3 threads instead of
+1, the achievable improvement from this function alone. Added
+`test_prepare_audio_returns_within_bounded_timeout_when_video_future_never_resolves`,
+which monkeypatches the timeout constant down to 0.2s (so the test stays
+fast) and hands `_prepare_audio` a `Future` that's never resolved,
+confirming it returns `None` promptly with a WARNING (not ERROR) log,
+never hanging or raising.
+
+Also updated `test_slow_video_download_runs_on_a_daemon_thread_not_the_shared_pool`'s
+stale comment (it referred to "the 4-race-job pool's own (non-daemon)
+worker threads", which no longer exist after Fix 2's race-pool
+conversion) -- the test's own assertions needed no change since they
+only ever checked observable thread properties (`daemon`, name prefix),
+never the pool's existence directly.
+
+### Testing
+
+Ran `python3 -m pytest tests/unit -q` after every individual fix above,
+not just at the end. Final count: **362 passed** (up from the 357/358
+baseline at the start of this wave -- 5 new tests: one each for Fix 1's
+new/changed behavior split across two tests replacing one, Fix 2's
+known-limitation test, Follow-up A's corruption-regression test,
+Follow-up B's cancellation-logging test, and the final finding's
+bounded-timeout test). Also re-ran `tests/unit/tmdb/test_resolver.py`
+alone 5 times in a row after Fix 4 to confirm no flakiness from the new
+concurrency.
+
+### Review
+
+Ran `/code-review --effort medium` on this wave's diff: 10 findings came
+back, 9 about pre-existing code from earlier waves (sequential TMDB
+retry in `_resolve_all`, a `_terminate_then_kill()` pipe-drain gap in
+`_subprocess_util.py`, a stale `Ingestor.ensure_video()` Protocol
+docstring, cumulative thread-pool-stacking resource-budget concerns
+across `resolver.py`/`waterfall.py`, dead synchronization in
+`ingest/instagram.py`, the `ClaudeCliCancelled` multiple-inheritance
+design, `resolver.py`'s two independently-tuned retry layers, and
+`_wait_or_cancelled` duplicating `run_cancelable`'s poll-loop shape) --
+all outside this wave's assigned scope (none introduced by this wave's
+own changes) and left as accepted, pre-existing, out-of-scope findings
+for a future pass, consistent with how prior waves handled similar
+"accepted, not fixed" items. The 10th finding (`_prepare_audio`'s
+`mkdtemp()` contract gap) WAS fixed -- see above.
+
+Ran `/ponytail-review` on this wave's own diff (explicitly scoped to
+this session's changes, not the pre-existing waves mixed into the
+uncommitted working tree): no findings. Fix 2 and Fix 3 were net
+deletions (removed the dead `_RACE_POOL_MAX_WORKERS` constant and the
+`executor`/`finally` wrapper; removed the redundant exception tuple).
+Fix 4 used the direct stdlib tool (`ThreadPoolExecutor.map`) for 3
+independent blocking calls, no hand-rolled pool. The `.replace()` ->
+`.format()` fix and the new `except OSError`/`except TimeoutError`
+branches in `_prepare_audio` add no new abstraction -- the latter just
+makes that function actually honor the "never raises" contract its own
+docstring already claimed, matching this module's pre-existing,
+identically-enforced policy for every other job.
+
+### Verdict
+
+**OK to proceed to final integration testing.** All 6 originally-assigned
+findings plus the 2 mid-session follow-ups plus the 2 further findings
+surfaced by the review passes themselves were verified against the
+actual current code (not taken on faith), fixed, and re-tested
+individually. Final suite: 362 passed, 0 failed. Fix 2's nested
+per-frame pool limitation is a deliberate, documented, tested-as-known
+trade-off (not an oversight) scoped to the non-default
+`VISION_BACKEND=anthropic_api` backend only -- the default `claude_code`
+backend (and everything else in this wave) has no known outstanding
+process-exit-hang risk. No git commit made per this wave's instructions.
+
+## Final live end-to-end confirmation (whole pipeline rewrite, real reel)
+
+Ran `run_pipeline()` directly (not mocked) against
+`https://www.instagram.com/reel/DU7OQACiDtk/` with the real `.env`
+(`TMDB_API_KEY` set, `claude` CLI installed/authenticated,
+`WHISPER_CPP_MODEL_PATH` intentionally left unset to also confirm Fix
+1's env-gated transcriber wiring in the wild):
+`build_default_pipeline_deps().audio_transcriber is None` confirmed (no
+wasted ffmpeg call, no ERROR-level log spam -- Fix 1 working as intended
+with a real `PipelineDeps`, not just a unit test).
+
+Caption/creator-comment text did not cross the confidence bar for this
+reel (consistent with its documented behavior from earlier sessions),
+so the race correctly fell through to the visual-fallback job. Completed
+in 165.0s (video download + dense frame sampling + per-frame vision
+calls + TMDB resolution for every extracted candidate, with the new
+per-title retry wrapper covering any transient TMDB flakiness along the
+way) -- consistent with `handoff.md`'s documented visual-fallback timing
+range, no regression from the rewrite. Process exited cleanly (exit code
+0, no hang) -- a real-world confirmation that the CLI process-exit fix
+(daemon threads for the prep/cleanup jobs) actually works end-to-end,
+not just in the unit tests that simulate it.
+
+13 candidates extracted, **all 13 resolved successfully** against real
+TMDB entries: Shutter Island (2010), Gladiator (2000), Cars (2006),
+Chinatown (1974), Mulholland Dr. (tv, no year) / Mulholland Drive (2001,
+movie) as two separate candidates, Heat (1995), Interstellar (2014), The
+Godfather (1972), Vertigo (1958), Paris, Texas (1984), La La Land
+(2016), Se7en (1995) -- all with correct titles/years/media types. The
+Mulholland Dr./Drive split is the pre-existing, already-documented
+ambiguous-title-resolves-inconsistently-across-frames limitation (not a
+regression introduced by this rewrite's candidate-disambiguation work,
+which only applies its noise-filtering/majority-vote logic to
+text-sourced candidates with a coherent single `source_text` -- the
+no-winner pooled visual-fallback case this run hit is explicitly
+documented as skipping that filter, by design).
+
+No exceptions, no silent failures, no stuck threads observed. This is
+the strongest available confirmation that the full three-wave rewrite
+(parallel race architecture, TMDB retry/streaming, audio transcription,
+denser frame sampling, candidate disambiguation) works correctly
+together against real-world input, not just against fakes.

@@ -90,3 +90,27 @@ class TMDBClient(Protocol):
         self, query: str, year: int | None = None
     ) -> list[TMDBSearchResult]:
         ...
+
+
+def cancel_kwargs(cancel_event: threading.Event | None) -> dict[str, threading.Event]:
+    """Build the kwargs dict for conditionally forwarding `cancel_event` to
+    a Protocol method call.
+
+    Every Protocol above that takes `cancel_event` treats it the same
+    way at its call sites: forward it only when it's actually set (not
+    `None`), so a pre-existing Protocol-shaped test double that only
+    implements the OLDER, pre-cancellation signature (no `cancel_event`
+    parameter at all) keeps working unmodified for any call site that
+    doesn't use cancellation. That one-line `{"cancel_event": cancel_event}
+    if cancel_event is not None else {}` used to be hand-copied at each
+    call site (`text_extraction/claude_code_extractor.py`,
+    `text_extraction/fallback_extractor.py`,
+    `visual/vision_llm_detector.py`); it lives here, alongside the
+    Protocols that define `cancel_event` in the first place, rather than
+    in `_subprocess_util.py` (that module is specifically about running
+    subprocesses, not about Protocol call-forwarding conventions).
+
+    Returns `{}` when `cancel_event` is `None` (nothing to forward),
+    `{"cancel_event": cancel_event}` otherwise.
+    """
+    return {"cancel_event": cancel_event} if cancel_event is not None else {}

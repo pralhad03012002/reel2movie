@@ -46,6 +46,7 @@ import anthropic
 from reel2movie._candidate_parsing import parse_movie_candidates
 from reel2movie._claude_cli import ClaudeCliError, run_claude_cli
 from reel2movie.core.models import Candidate, FrameSample, SourceTag
+from reel2movie.core.protocols import cancel_kwargs
 
 
 @runtime_checkable
@@ -321,12 +322,9 @@ class VisionLLMPosterDetector:
         pipeline, so any parsing failure is logged and `[]` is returned
         instead.
         """
-        if cancel_event is not None:
-            raw_response = self._chat_client.chat(
-                frame.path, _PROMPT, cancel_event=cancel_event
-            )
-        else:
-            raw_response = self._chat_client.chat(frame.path, _PROMPT)
+        raw_response = self._chat_client.chat(
+            frame.path, _PROMPT, **cancel_kwargs(cancel_event)
+        )
 
         return parse_movie_candidates(
             raw_response,

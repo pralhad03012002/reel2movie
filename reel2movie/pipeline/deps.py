@@ -11,10 +11,15 @@ structurally.
 
 from __future__ import annotations
 
+import os
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 from reel2movie import config
+from reel2movie.audio.whisper_cpp_transcriber import WhisperCppTranscriber
 from reel2movie.core.protocols import (
+    AudioTranscriber,
     CandidateExtractor,
     Ingestor,
     PosterDetector,
@@ -93,6 +98,42 @@ class PipelineDeps:
     # chat_client as "disambiguation not available" and falls through to
     # its pre-existing rank/year tiebreak.
     disambiguation_chat_client: TextChatClient | None = None
+    # Optional: an `AudioTranscriber` (see `core.protocols.AudioTranscriber`)
+    # for `pipeline/waterfall.py`'s audio-transcript race job. Defaults to
+    # `None` so any `PipelineDeps` built without one (e.g. every existing
+    # test predating the audio-transcript job) behaves as "no
+    # audio-transcript capability available" -- that race job just
+    # contributes an empty outcome rather than erroring. `None` is also
+    # the correct value for a run that never reaches the audio-transcript
+    # job for any other reason (e.g. `extract_audio` itself failed
+    # upfront) -- see `pipeline/waterfall.py`'s `_extract_from_audio_transcript`.
+    audio_transcriber: AudioTranscriber | None = None
+
+
+class _LazyWhisperCppTranscriber:
+    """`AudioTranscriber` that defers reading `WHISPER_CPP_MODEL_PATH` (and
+    constructing the real `WhisperCppTranscriber`) until `transcribe()` is
+    actually called.
+
+    `config.get_whisper_cpp_model_path()` deliberately raises if that env
+    var is unset (see its docstring: "only required when the pipeline
+    actually reaches the audio-transcript fallback step -- never eagerly
+    at import time"). Not every `build_default_pipeline_deps()` caller's
+    pipeline run will reach the audio-transcript race job (and today's
+    existing tests construct deps without setting that env var at all),
+    so reading it eagerly here -- at construction time -- would wrongly
+    make every run require it. Deferring the read to first actual use
+    satisfies that contract exactly.
+    """
+
+    def transcribe(
+        self, audio_path: Path, *, cancel_event: threading.Event | None = None
+    ) -> str:
+        transcriber = WhisperCppTranscriber(
+            config.get_whisper_cpp_model_path(),
+            whisper_binary=config.get_whisper_cpp_binary(),
+        )
+        return transcriber.transcribe(audio_path, cancel_event=cancel_event)
 
 
 def build_default_pipeline_deps() -> PipelineDeps:
@@ -125,6 +166,32 @@ def build_default_pipeline_deps() -> PipelineDeps:
       for text" client. Threaded through `pipeline/waterfall.py` into
       `tmdb.resolver.resolve_candidate()`'s caption-context
       disambiguation step.
+    - `audio_transcriber` -- a `_LazyWhisperCppTranscriber` (see its own
+      docstring), but ONLY when `WHISPER_CPP_MODEL_PATH` is actually set
+      (a cheap, direct `os.environ.get(...)` truthiness check -- mirrors
+      how the `VISION_BACKEND` branch above decides which concrete
+      `VisionChatClient` to wire). When that env var is unset/empty,
+      `audio_transcriber` is left `None` instead -- "no AudioTranscriber
+      capability available" (see `PipelineDeps.audio_transcriber`'s
+      docstring), exactly like `disambiguation_chat_client` is left unset
+      by callers that don't want that capability. This matters because
+      whisper.cpp is an optional, brand-new subpackage most environments
+      won't have configured: wiring a real transcriber unconditionally
+      would make every run's audio-transcript race job attempt a
+      `transcribe()` call that immediately raises `RuntimeError` (from
+      `config.get_whisper_cpp_model_path()`) -- logged at ERROR with a
+      full traceback by `_run_job_safely` on every single run, since a
+      missing-config `RuntimeError` isn't a cancelled-exception. Leaving
+      `audio_transcriber` as `None` here instead makes
+      `pipeline/waterfall.py`'s `_prepare_audio`/
+      `_extract_from_audio_transcript` skip the audio-extract/transcribe
+      work entirely (they already check for `None`), eliminating both the
+      wasted ffmpeg work and the log spam for the common unconfigured
+      case -- with no changes needed in `waterfall.py` itself. When the
+      env var IS set, the lazy wrapper is used (rather than eagerly
+      constructing `WhisperCppTranscriber` here) purely to defer reading
+      `WHISPER_CPP_BINARY` and doing the real construction until
+      `transcribe()` is actually called -- see its own docstring.
 
     Raises whatever `config.get_tmdb_token()` raises (a clear
     `RuntimeError` naming the missing env var) if that required credential
@@ -164,10 +231,23 @@ def build_default_pipeline_deps() -> PipelineDeps:
 
     tmdb_client = TMDBHttpClient(config.get_tmdb_token())
 
+    # Only wire a real (lazy) transcriber when whisper.cpp is actually
+    # configured -- see this function's docstring for why an unconditional
+    # `_LazyWhisperCppTranscriber()` here would be wrong. Checked directly
+    # via `os.environ` (cheap, no subprocess/import work) rather than
+    # calling `config.get_whisper_cpp_model_path()` itself, since that
+    # raises on an unset var instead of returning a falsy value.
+    audio_transcriber = (
+        _LazyWhisperCppTranscriber()
+        if os.environ.get("WHISPER_CPP_MODEL_PATH")
+        else None
+    )
+
     return PipelineDeps(
         ingestor=ingestor,
         text_extractor=text_extractor,
         poster_detector=poster_detector,
         tmdb_client=tmdb_client,
         disambiguation_chat_client=claude_text_chat_client,
+        audio_transcriber=audio_transcriber,
     )

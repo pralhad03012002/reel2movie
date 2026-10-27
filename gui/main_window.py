@@ -246,13 +246,35 @@ class MainWindow(QMainWindow):
             self._show_error(error)
             return
 
+        # Reset the results panel before this run's first streamed result
+        # arrives, so `_on_recommendation_ready` always starts trickling
+        # cards into a clean panel rather than appending onto whatever an
+        # earlier run left behind (the panel itself is long-lived across
+        # Run clicks, not recreated per run).
+        self.results_panel.clear()
+
         self.run_button.setEnabled(False)
         self._show_running(_PIPELINE_RUNNING_TEXT)
 
         self._pipeline_runner = PipelineRunner(url, deps)
+        self._pipeline_runner.recommendation_ready.connect(self._on_recommendation_ready)
         self._pipeline_runner.succeeded.connect(self._on_pipeline_succeeded)
         self._pipeline_runner.failed.connect(self._on_pipeline_failed)
         self._pipeline_runner.start()
+
+    def _on_recommendation_ready(self, rec: object) -> None:
+        """One `Recommendation` streamed in early, ahead of the run's final
+        `succeeded` signal -- trickle it into the results panel immediately
+        and switch to the results page right away (on the very FIRST one),
+        rather than waiting for the whole pipeline to finish. `succeeded`'s
+        existing handler still does one full, authoritative re-render at
+        the end, which naturally corrects/replaces these incrementally
+        trickled-in cards with the final deduped set.
+        """
+        card_data = self._recommendation_to_card_data(rec)
+        self.results_panel.add_recommendation(card_data)
+        if self.stacked_widget.currentWidget() is not self.results_panel:
+            self._show_results()
 
     def _on_pipeline_succeeded(self, result: object) -> None:
         cards_data = [

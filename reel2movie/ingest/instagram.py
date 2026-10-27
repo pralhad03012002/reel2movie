@@ -10,6 +10,7 @@ token.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,18 @@ class InstagramIngestor:
         # a cached failure. Process-local only: no TTL/eviction, no disk
         # persistence.
         self._video_cache: dict[str, Path] = {}
+        # Guards `_video_cache`'s check-then-download-then-store sequence
+        # in `ensure_video()` below. Without this, two threads calling
+        # `ensure_video()` for the same URL at nearly the same time (e.g.
+        # the planned parallel-race architecture's visual-fallback and
+        # audio-fallback steps both needing the same reel's video) could
+        # both miss the cache and both trigger a redundant yt-dlp download.
+        # One lock per instance (not per-URL) is deliberately simple: this
+        # only serializes concurrent `ensure_video()` calls on the SAME
+        # `InstagramIngestor` instance, which in practice means "the same
+        # reel" (one instance per pipeline run) -- not a cross-reel
+        # bottleneck.
+        self._video_cache_lock = threading.Lock()
 
     def fetch_metadata(self, url: str) -> IngestResult:
         """Fetch caption/comments/duration/creator id without downloading video."""
@@ -117,26 +130,35 @@ class InstagramIngestor:
         Idempotent within this instance's lifetime: a second call for a
         URL that was already downloaded successfully returns the cached
         path without re-invoking yt-dlp (see ``self._video_cache``).
+
+        Thread-safe: the whole check-then-download-then-store sequence
+        runs under ``self._video_cache_lock``, so two threads calling this
+        concurrently for the same URL (e.g. a parallel-race visual-fallback
+        step and audio-fallback step both needing the same reel's video)
+        can't both miss the cache and both trigger a yt-dlp download -- the
+        second caller blocks until the first finishes, then gets the
+        now-cached path instead of re-downloading.
         """
-        cached = self._video_cache.get(result.url)
-        if cached is not None:
-            return cached
+        with self._video_cache_lock:
+            cached = self._video_cache.get(result.url)
+            if cached is not None:
+                return cached
 
-        info = self._client.extract_info(
-            result.url, cookies_file=self._cookies_file, download=True
-        )
+            info = self._client.extract_info(
+                result.url, cookies_file=self._cookies_file, download=True
+            )
 
-        requested = info.get("requested_downloads") or []
-        filepath = (requested[0].get("filepath") if requested else None) or info.get(
-            "_filename"
-        )
-        if filepath:
-            path = Path(filepath)
-            self._video_cache[result.url] = path
-            return path
+            requested = info.get("requested_downloads") or []
+            filepath = (
+                requested[0].get("filepath") if requested else None
+            ) or info.get("_filename")
+            if filepath:
+                path = Path(filepath)
+                self._video_cache[result.url] = path
+                return path
 
-        raise IngestError(
-            f"yt-dlp download response for {result.url!r} did not include "
-            "'requested_downloads[0].filepath' or '_filename'; cannot "
-            "determine the downloaded video's local path."
+            raise IngestError(
+                f"yt-dlp download response for {result.url!r} did not include "
+                "'requested_downloads[0].filepath' or '_filename'; cannot "
+                "determine the downloaded video's local path."
         )
