@@ -1,0 +1,45 @@
+rules_version = '2';
+
+// Enforces PLAN.md section 4 for clients. The worker uses the Admin SDK, which bypasses these rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{uid} {
+      function isOwner() {
+        return request.auth != null && request.auth.uid == uid;
+      }
+
+      // Settings: { region, services, localStt }
+      allow read: if isOwner();
+      allow create, update: if isOwner()
+        && request.resource.data.keys().hasOnly(['region', 'services', 'localStt'])
+        && (!('localStt' in request.resource.data) || request.resource.data.localStt is bool)
+        && (!('region' in request.resource.data)
+            || (request.resource.data.region is string && request.resource.data.region.matches('^[A-Z]{2}$')))
+        // Rules cannot loop over list items; entry types are not checked, only the count.
+        && (!('services' in request.resource.data)
+            || (request.resource.data.services is list && request.resource.data.services.size() <= 100));
+
+      match /processingPosts/{postId} {
+        allow read, delete: if isOwner();
+        allow create: if isOwner()
+          && request.resource.data.keys().hasOnly(['url', 'source', 'status', 'createdAt'])
+          && request.resource.data.keys().hasAll(['url', 'source', 'status', 'createdAt'])
+          && request.resource.data.url is string
+          && request.resource.data.url.size() <= 500
+          && request.resource.data.url.matches('^https://.*')
+          && request.resource.data.source in ['share_target', 'paste']
+          && request.resource.data.status == 'queued'
+          && request.resource.data.createdAt == request.time;
+        // no client update
+      }
+
+      match /movies/{movieId} {
+        allow read, delete: if isOwner();
+        allow update: if isOwner()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['watched'])
+          && request.resource.data.watched is bool;
+        // no client create
+      }
+    }
+  }
+}
