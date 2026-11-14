@@ -3,7 +3,7 @@
 Share a reel from your phone; the movies and series it recommends appear in your account, on phone
 and desktop, each with buttons that open the streaming service that has it.
 
-- `web/` — the installable web app (static files, hosted on Firebase Hosting).
+- `app/` — the installable web app (React + Vite, built to `app/dist` and hosted on Firebase Hosting).
 - `worker/` — a Node program that runs on your Mac and does the extraction.
 - `PLAN.md` — design, data contract, and what was taken from SaveToList.
 
@@ -26,7 +26,7 @@ In the [Firebase console](https://console.firebase.google.com):
 2. **Authentication → Sign-in method → Google → Enable.**
 3. **Firestore → Create database** (production mode).
 4. **Project Overview → Add app → Web.** Copy the `firebaseConfig` values into
-   `web/firebase-config.js`.
+   `app/src/firebase-config.js`.
 5. **Settings → Project settings → Service accounts → Generate new private key.** Save the file as
    `worker/service-account.json`. It grants full access to the project: never share or commit it.
 
@@ -70,6 +70,8 @@ Audio longer than 3 minutes is rejected on this path.
 From the project root, replacing `YOUR_PROJECT_ID`:
 
 ```sh
+npm --prefix app install
+npm --prefix app run build
 npx firebase-tools login
 npx firebase-tools deploy --project YOUR_PROJECT_ID
 ```
@@ -100,7 +102,7 @@ installed app; on desktop, the website.
 From the project root:
 
 ```sh
-node --test web/lib.test.js
+npm --prefix app test
 npm --prefix worker test
 ```
 
@@ -112,6 +114,8 @@ npm --prefix worker test
   your ElevenLabs and Gemini quota. Keep the address private, or restrict `isOwner()` in
   `firestore.rules` to specific emails.
 - Streaming availability comes from TMDB (JustWatch data) and can lag behind the services.
-- `web/lib.js` carries a copy of the worker's link rules (`LINKS` in `worker/pipeline.js`); change
+- `app/src/lib.js` carries a copy of the worker's link rules (`LINKS` in `worker/pipeline.js`); change
   both together.
 - To update yt-dlp when downloads start failing, run `./setup.sh` again.
+- Movies saved before the redesign lack cast, director and backdrop. Run `npm run backfill` in `worker/`
+  once to add them (new reels get them automatically).

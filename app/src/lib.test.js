@@ -1,4 +1,4 @@
-// Run: node --test web/lib.test.js
+// Run: npm --prefix app test
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { extractUrl, httpsUrl, isReelUrl, providerSearchUrl } from './lib.js';

@@ -153,3 +153,9 @@ review comes back clean. A and B run in parallel; C after both.
 
 1. TMDB API key  2. ElevenLabs API key  3. Gemini API key (free, Google AI Studio)
 4. Firebase project: web config object + service-account JSON
+
+## Update: redesigned web app
+
+The web app now lives in `app/` (React + Vite, built to `app/dist`) and replaces the plain `web/` pages
+planned in Subtask B. The worker also saves cast, director, backdrop, runtime and tagline per movie, and
+each source carries the date (`at`) it was recommended. See README.md for build and deploy.

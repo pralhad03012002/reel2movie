@@ -104,6 +104,12 @@ test("toMovieDoc merges and de-duplicates providers and follows the contract", (
     rating: 7.8,
     genres: ["Science Fiction", "Adventure"],
     trailerUrl: "https://www.youtube.com/watch?v=official1",
+    backdropUrl: null,
+    tagline: null,
+    runtimeMin: null,
+    seasons: null,
+    director: null,
+    cast: [],
     providers: {
       IN: {
         stream: [{ id: 8, name: "Netflix" }, { id: 119, name: "Amazon Prime Video" }, { id: 73, name: "Tubi TV" }],
@@ -205,7 +211,8 @@ test("processReel: download -> transcribe -> extract -> match -> docs", async ()
   assert.deepEqual(stages, ["transcribing", "extracting", "matching"]); // "downloading" is set by the claim
   assert.equal(out.creatorHandle, "filmfan");
   assert.deepEqual(out.movies.map((m) => `${m.mediaType}_${m.tmdbId}`), ["movie_438631", "tv_1396"]);
-  assert.deepEqual(out.movies[0].sources, [{ postUrl: "https://www.instagram.com/reel/abc/", creatorHandle: "filmfan", evidence: "watch Dune" }]);
+  assert.deepEqual(out.movies[0].sources, [{ postUrl: "https://www.instagram.com/reel/abc/", creatorHandle: "filmfan", evidence: "watch Dune", at: out.movies[0].sources[0].at }]);
+  assert.match(out.movies[0].sources[0].at, /^\d{4}-\d\d-\d\dT/);
   assert.equal(out.movies[1].year, 2008);
 
   // ElevenLabs request shape
@@ -232,7 +239,7 @@ test("processReel: download -> transcribe -> extract -> match -> docs", async ()
   assert.ok(tm.every((c) => c.u.searchParams.get("api_key") === "tmdbkey"));
   assert.equal(tm[0].u.searchParams.get("year"), "2021");
   assert.equal(tm.filter((c) => c.u.pathname === "/3/search/tv" && c.u.searchParams.get("query") === "Breaking Bad").length, 2);
-  assert.equal(tm.find((c) => c.u.pathname === "/3/movie/438631").u.searchParams.get("append_to_response"), "watch/providers,videos");
+  assert.equal(tm.find((c) => c.u.pathname === "/3/movie/438631").u.searchParams.get("append_to_response"), "watch/providers,videos,credits");
   assert.equal(tm.filter((c) => c.u.pathname === "/3/movie/438631").length, 1); // de-duplicated before details
 });
 
@@ -350,4 +357,13 @@ test("processReel: rejects a bad URL before downloading anything", async () => {
   let downloaded = false;
   await assert.rejects(processReel("https://evil.com/x", { fetch: stubFetch([]), env, downloadFn: async () => (downloaded = true) }));
   assert.equal(downloaded, false);
+});
+
+test("toMovieDoc reads credits, backdrop, runtime and seasons", () => {
+  const movie = toMovieDoc({ id: 1, title: "X", backdrop_path: "/b.jpg", tagline: "Hi", runtime: 120,
+    credits: { cast: Array.from({ length: 8 }, (_, i) => ({ name: `A${i}`, character: `C${i}` })), crew: [{ job: "Writer", name: "W" }, { job: "Director", name: "D" }] } }, "movie", source);
+  assert.deepEqual([movie.backdropUrl, movie.tagline, movie.runtimeMin, movie.director, movie.cast.length, movie.seasons],
+    ["https://image.tmdb.org/t/p/w1280/b.jpg", "Hi", 120, "D", 6, null]);
+  const tv = toMovieDoc({ id: 2, name: "Y", episode_run_time: [47], number_of_seasons: 5, created_by: [{ name: "Vince" }] }, "tv", source);
+  assert.deepEqual([tv.runtimeMin, tv.seasons, tv.director], [47, 5, "Vince"]);
 });

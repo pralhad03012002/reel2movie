@@ -5,6 +5,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "start": "node --env-file=.env index.js",
+    "backfill": "node --env-file=.env backfill.js",
     "test": "node --test"
   },
   "dependencies": {

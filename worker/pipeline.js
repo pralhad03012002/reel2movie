@@ -273,11 +273,13 @@ export async function matchTmdb(titles, ctx) {
     const [mediaType, hit] = best([...dated, ...(close.length ? close : named)]) ?? top ?? [];
     const id = `${mediaType}_${hit?.id}`;
     if (!hit || out.has(id)) continue;
-    const details = await tmdb(`${mediaType}/${hit.id}`, { append_to_response: "watch/providers,videos" }, ctx);
+    const details = await tmdb(`${mediaType}/${hit.id}`, { append_to_response: DETAILS_APPEND }, ctx);
     out.set(id, { mediaType, details, evidence });
   }
   return [...out.values()];
 }
+
+export const DETAILS_APPEND = "watch/providers,videos,credits"; // what toMovieDoc reads; backfill.js asks for the same
 
 // --- 6. shape per PLAN.md §4 (createdAt/updatedAt are added by index.js) ---
 
@@ -304,6 +306,12 @@ export function toMovieDoc(details, mediaType, source) {
     rating: details.vote_average ?? 0,
     genres: (details.genres ?? []).map((g) => g.name),
     trailerUrl: trailer ? `https://www.youtube.com/watch?v=${encodeURIComponent(trailer.key)}` : null,
+    backdropUrl: details.backdrop_path ? `https://image.tmdb.org/t/p/w1280${details.backdrop_path}` : null,
+    tagline: details.tagline || null,
+    runtimeMin: (mediaType === "tv" ? details.episode_run_time?.[0] ?? details.last_episode_to_air?.runtime : details.runtime) || null,
+    seasons: mediaType === "tv" ? details.number_of_seasons ?? null : null,
+    director: (mediaType === "tv" ? details.created_by?.[0]?.name : details.credits?.crew?.find((c) => c.job === "Director")?.name) ?? null,
+    cast: (details.credits?.cast ?? []).slice(0, 6).map((c) => ({ name: c.name, character: c.character ?? "" })),
     providers,
     sources: [source],
     watched: false,
@@ -338,6 +346,6 @@ export async function processReel(rawUrl, { fetch, env, onStage = () => {}, down
   // Nothing found from the caption alone: the missing transcript is the real failure (and may be retryable).
   if (sttError && !matches.length) throw sttError;
   const movies = matches.map(({ mediaType, details, evidence }) =>
-    toMovieDoc(details, mediaType, { postUrl: url, creatorHandle, evidence }));
+    toMovieDoc(details, mediaType, { postUrl: url, creatorHandle, evidence, at: new Date().toISOString() }));
   return { creatorHandle, movies };
 }

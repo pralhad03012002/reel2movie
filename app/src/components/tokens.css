@@ -1,0 +1,31 @@
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..600&family=Instrument+Sans:wght@400..700&display=swap');
+
+.rp {
+  --rp-bg: #0a0a0c;
+  --rp-surface: #131316;
+  --rp-raised: #1b1b20;
+  --rp-line: rgb(255 255 255 / 0.08);
+  --rp-line-strong: rgb(255 255 255 / 0.16);
+  --rp-text: #f5f2ea;
+  --rp-muted: #a29e94;
+  --rp-faint: #6d6a63;
+  --rp-accent: #ffb347;
+  --rp-accent-ink: #1a1204;
+  --rp-danger: #ff6b5e;
+  --rp-ease: cubic-bezier(0.23, 1, 0.32, 1); /* strong ease-out: entrances, hovers */
+  --rp-ease-io: cubic-bezier(0.77, 0, 0.175, 1); /* on-screen movement */
+  --rp-font-ui: 'Instrument Sans', system-ui, sans-serif;
+  --rp-font-display: 'Fraunces', Georgia, serif;
+  font-family: var(--rp-font-ui);
+  background: var(--rp-bg);
+  color: var(--rp-text);
+  -webkit-font-smoothing: antialiased;
+}
+.rp-display { font-family: var(--rp-font-display); font-optical-sizing: auto; letter-spacing: -0.02em; }
+.rp-hide-scroll { scrollbar-width: none; }
+.rp-hide-scroll::-webkit-scrollbar { display: none; }
+@layer base { .rp button { font: inherit; color: inherit; } } /* in the base layer so Tailwind utilities on buttons win */
+.rp :focus-visible { outline: 2px solid var(--rp-accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .rp *, .rp *::before, .rp *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}
