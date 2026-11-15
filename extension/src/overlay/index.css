@@ -1,0 +1,73 @@
+@import 'tailwindcss';
+@source '../../../app/src'; /* the shared components' class names live outside this package */
+
+html, body { margin: 0; background: #17171a; }
+
+/* Neutral look: dark grey panels, white text, translucent white for hover/selected. No amber anywhere. */
+.rp.ext { --rp-bg: #17171a; --rp-surface: #1e1e22; --rp-raised: #28282d; --rp-accent: #f5f2ea; --rp-accent-ink: #0a0a0c; --rp-line: rgb(255 255 255 / .09); }
+.ext .bs-close { margin: 0 -6px 0 0; width: 36px; justify-content: center; }
+.ext .bs-word { display: none; }
+@media (min-width: 900px) { .ext .bs-word { display: block; } }
+.ext .bs-word em { color: inherit; opacity: .6; }
+.ext .bs-pop { background: #1c1c1f; border-color: rgb(255 255 255 / .1); }
+.ext .bs-chip input:checked + span { color: #fff; background: rgb(255 255 255 / .12); }
+.ext .bs-tabs-pill .bs-ind { background: rgb(255 255 255 / .1); box-shadow: inset 0 0 0 1px rgb(255 255 255 / .12); }
+.ext .bs-mark, .ext .bs-sub svg { color: #fff; }
+.ext .bs-quick:hover, .ext .bs-quick.is-busy { background: #f5f2ea; color: #0a0a0c; }
+
+/* "On <site>" strip */
+.ext-strip { display: contents; } /* chips sit in the shared tabs bar */
+.ext-solo { display: flex; gap: 8px; padding: 16px 20px 0; }
+.ext-chip { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 13px; border-radius: 999px; border: 1px solid var(--rp-line); background: transparent; color: rgb(255 255 255 / .7); font-size: 13px; cursor: pointer;
+  transition: background 150ms, color 150ms, border-color 150ms, transform 120ms var(--rp-ease); }
+.ext-chip small { font-size: 11px; font-variant-numeric: tabular-nums; color: rgb(255 255 255 / .45); }
+.ext-chip:hover { color: #fff; background: rgb(255 255 255 / .06); }
+.ext-chip[aria-pressed='true'] { color: #fff; background: rgb(255 255 255 / .12); border-color: rgb(255 255 255 / .2); }
+.ext-chip:active, .ext-icon:active { transform: scale(.97); }
+.ext-icon { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 50%; border: 0; background: none; color: rgb(255 255 255 / .6); cursor: pointer; transition: background 150ms, color 150ms, transform 120ms var(--rp-ease); }
+.ext-icon:hover { color: #fff; background: rgb(255 255 255 / .08); }
+.ext-spin svg { animation: ext-spin 800ms linear infinite; }
+@keyframes ext-spin { to { transform: rotate(360deg); } }
+
+.ext-div { width: 1px; height: 20px; margin: 0 4px; background: rgb(255 255 255 / .16); }
+.ext-solo .ext-div { display: none; }
+
+/* hit areas: the look stays, the clickable box grows to 40px (mouse) or 44px (touch) */
+.ext-chip, .ext-icon, .ext-acct, .ext .bs-trigger, .ext .bs-close:not(.ext-close) { position: relative; }
+.ext-chip, .ext-icon { --pad: 4px; } .ext-acct, .ext .bs-close { --pad: 2px; } .ext .bs-trigger { --pad: 1px; }
+.ext-chip::before, .ext-icon::before, .ext-acct::before, .ext .bs-trigger::before, .ext .bs-close::before { content: ''; position: absolute; inset: calc(var(--pad) * -1) -2px; }
+@media (pointer: coarse) {
+  .ext-chip, .ext-icon { --pad: 6px; } .ext-acct, .ext .bs-close { --pad: 4px; } .ext .bs-trigger { --pad: 3px; }
+}
+
+/* skeleton */
+.ext-skel { border-radius: 10px; background: linear-gradient(100deg, rgb(255 255 255 / .05) 30%, rgb(255 255 255 / .11) 50%, rgb(255 255 255 / .05) 70%) 0 0 / 300% 100%; animation: ext-shimmer 1.4s linear infinite; }
+@keyframes ext-shimmer { to { background-position: -300% 0; } }
+
+/* message panels (loading failed, not connected, ...) */
+.ext-msg { min-height: 100dvh; display: grid; place-items: center; padding: 32px 20px; text-align: center; }
+.ext-msg > div { max-width: 380px; animation: ext-in 240ms var(--rp-ease) both; }
+@keyframes ext-in { from { opacity: 0; transform: translateY(8px); } }
+.ext-btn { display: inline-flex; align-items: center; justify-content: center; height: 42px; padding: 0 20px; border-radius: 999px; border: 0; background: #f5f2ea; color: #0a0a0c; font-weight: 600; font-size: 14px; cursor: pointer; text-decoration: none; transition: transform 120ms var(--rp-ease), filter 150ms; }
+.ext-btn:hover { filter: brightness(.94); }
+.ext-btn:active { transform: scale(.97); }
+.ext-btn.ghost { background: rgb(255 255 255 / .08); color: #fff; }
+.ext-btn.ghost:hover { background: rgb(255 255 255 / .13); filter: none; }
+.ext-close { position: fixed; top: 14px; right: 14px; z-index: 5; }
+
+/* popup-sized (about 700x500): tighter gutters and posters than the web app */
+.ext .bs-root { --bs-gutter: 20px; --bs-card: 128px; }
+.ext .bs-head { padding: 10px var(--bs-gutter) 2px; }
+.ext .bs-bar { padding: 4px var(--bs-gutter) 10px; gap: 6px 8px; }
+.ext .bs-gtitle { display: none; } /* the popup is short: the shelf titles name the genre */
+.ext .bs-shelf-h { font-size: 18px; }
+.ext .bs-main { min-height: 0; padding-bottom: 32px; }
+.ext .bs-search { max-width: 260px; }
+.ext .bs-sortwrap:last-child .bs-trigger-label { display: none; } /* icon-only sort button keeps the bar on one row */
+.ext .bs-trigger { padding: 0 12px; }
+
+/* short or narrow popup: smaller posters so the first shelf (poster and title) fits, tighter chips so the bar wraps less */
+@media (max-height: 420px) { .ext .bs-root { --bs-card: 108px; } .ext .bs-shelf { margin-top: 6px; } .ext .bs-shelf-h { margin-bottom: 6px; } .ext .bs-row { padding-bottom: 8px; } }
+@media (max-width: 520px) { .ext-chip { padding: 0 10px; gap: 4px; } .ext-div { margin: 0 2px; } .ext .bs-search { max-width: 200px; } }
+body::after { content: ''; position: fixed; inset: auto 0 0; height: 28px; pointer-events: none; z-index: 1; background: linear-gradient(transparent, #17171a); } /* content fades out at the bottom edge instead of being sliced */
+@media (max-width: 400px) { .ext-div { display: none; } }

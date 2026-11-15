@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import { X } from 'lucide-react';
 import './tokens.css';
@@ -10,14 +10,19 @@ import { GenreScreen } from './GenreScreen';
 import { BrowseScreen } from './BrowseScreen';
 import { MovieOverlay } from './MovieOverlay';
 import { AccountMenu, PasteForm } from './AccountMenu';
+import { ConnectExtension, connectPending } from './ConnectExtension';
 
 export const ReelPicks = () => {
   const reduce = useReducedMotion();
   const rp = useReelPicks();
   const [browsing, setBrowsing] = useState(false);
   const [genre, setGenre] = useState(ALL_GENRES);
+  const [connecting, setConnecting] = useState(connectPending);
+  const prevUser = useRef(rp.user);
+  useEffect(() => { if (prevUser.current && !rp.user) setConnecting(false); prevUser.current = rp.user; }, [rp.user]); // signed out: drop a pending connect
   const [openId, setOpenId] = useState<string | null>(null);
   const open = rp.movies.find((m) => m.id === openId) ?? null;
+  const closeConnect = useCallback(() => setConnecting(false), []);
   const genres = buildGenres(rp.movies);
 
   const go = (g?: string) => { if (g) setGenre(g); setBrowsing(!!g); };
@@ -76,6 +81,7 @@ export const ReelPicks = () => {
           <MovieOverlay key={open.id} movie={open} myServices={rp.settings.services} onClose={() => setOpenId(null)} onToggleWatched={rp.toggleWatched} onRemove={rp.removeMovie} />
         )}
       </AnimatePresence>
+      {connecting && rp.user && <ConnectExtension user={rp.user} onClose={closeConnect} />}
       {rp.message && screen !== 'login' && (
         <div role="status" className="fixed bottom-4 left-1/2 z-[60] flex w-[min(30rem,calc(100vw-32px))] -translate-x-1/2 items-start gap-3 rounded-xl border border-[var(--rp-line-strong)] bg-[#1c1c1f] py-3 pl-4 pr-2 text-[13.5px] shadow-[0_16px_40px_-8px_rgb(0_0_0/0.7)]">
           <p className="flex-1 pt-1 leading-snug">{rp.message}</p>

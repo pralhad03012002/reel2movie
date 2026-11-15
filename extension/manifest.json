@@ -1,0 +1,84 @@
+{
+  "manifest_version": 3,
+  "name": "ReelPicks",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtzV1yDTym1WbcF/HOEu0jWhV6AGKrPFeBajOwizstFtA0xkj8Yo5vtaiaweeQko4GHEygqWGNEWTPeMJfY+WGoFv1Nwzf0l9EdU9Swy1CwO7jHWGivSB7dnKHXEfno8GLHDzDwJzA9obelq7vWbd/JEePVwUAqUKS14B8VaywZh6/B2fgqNBn9bStAA3Ta2cnsJ0w8bl79GF7NLRkR/DomE5GeR+yrdafdPSwz1TWT+3pOAyn6Puwu8FjYy/U5xU/Xc7IAn7IwneFpEcfGexfZh5je/TRj6qCfquQhCoHgdPtzPcMy7qF8IOTxeOATb9LEVxgp1f6eOcmksciVzflwIDAQAB",
+  "description": "Your ReelPicks list on top of the streaming site you are on.",
+  "icons": {
+    "192": "icon-192.png",
+    "512": "icon-512.png"
+  },
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://firestore.googleapis.com/*",
+    "https://securetoken.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.netflix.com/*",
+        "https://*.primevideo.com/*",
+        "https://www.amazon.in/gp/video/*",
+        "https://www.amazon.in/Prime-Video/*",
+        "https://www.amazon.com/gp/video/*",
+        "https://www.amazon.com/Prime-Video/*",
+        "https://*.hotstar.com/*",
+        "https://*.zee5.com/*",
+        "https://*.sonyliv.com/*",
+        "https://tv.apple.com/*",
+        "https://*.disneyplus.com/*",
+        "https://*.mubi.com/*",
+        "https://*.max.com/*",
+        "https://*.hbomax.com/*",
+        "https://*.hulu.com/*",
+        "https://*.crunchyroll.com/*",
+        "https://*.sunnxt.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "externally_connectable": {
+    "matches": [
+      "https://reelpicks-32e42.web.app/*"
+    ]
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "overlay.html",
+        "assets/*"
+      ],
+      "matches": [
+        "https://*.netflix.com/*",
+        "https://*.primevideo.com/*",
+        "https://www.amazon.in/*",
+        "https://www.amazon.com/*",
+        "https://*.hotstar.com/*",
+        "https://*.zee5.com/*",
+        "https://*.sonyliv.com/*",
+        "https://tv.apple.com/*",
+        "https://*.disneyplus.com/*",
+        "https://*.mubi.com/*",
+        "https://*.max.com/*",
+        "https://*.hbomax.com/*",
+        "https://*.hulu.com/*",
+        "https://*.crunchyroll.com/*",
+        "https://*.sunnxt.com/*"
+      ]
+    }
+  ],
+  "options_ui": {
+    "page": "connect.html",
+    "open_in_tab": true
+  }
+}

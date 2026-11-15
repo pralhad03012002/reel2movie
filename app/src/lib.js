@@ -65,3 +65,17 @@ export function providerSearchUrl(name, title) {
     ? hit[1] + encodeURIComponent(title)
     : 'https://www.google.com/search?q=' + encodeURIComponent(`watch ${title} on ${name}`);
 }
+
+/**
+ * The official extension id. It is derived from the `key` field in extension/manifest.json
+ * (first 32 hex of SHA-256 of the public key DER, 0-f mapped to a-p), so an unpacked build has this
+ * id everywhere. A Chrome Web Store build gets a different id: replace this value with it then.
+ * extension/test/extension-id.test.ts keeps the two in sync.
+ */
+export const EXTENSION_ID = 'ckmhjoignkokcghphackjbklieekdpmm';
+
+/** `?connect=<extensionId>` -> the id only if it is exactly EXTENSION_ID, else ''. */
+export const parseConnectParam = (search) => {
+  const id = new URLSearchParams(search).get('connect') ?? '';
+  return id === EXTENSION_ID ? id : '';
+};

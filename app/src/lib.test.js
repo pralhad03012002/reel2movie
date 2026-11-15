@@ -1,7 +1,7 @@
 // Run: npm --prefix app test
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractUrl, httpsUrl, isReelUrl, providerSearchUrl } from './lib.js';
+import { EXTENSION_ID, extractUrl, httpsUrl, isReelUrl, parseConnectParam, providerSearchUrl } from './lib.js';
 
 test('extractUrl', () => {
   const reel = 'https://www.instagram.com/reel/Cabc123/?igsh=xyz';
@@ -83,4 +83,15 @@ test('providerSearchUrl', () => {
     providerSearchUrl('Some New Service', 'Up?'),
     'https://www.google.com/search?q=watch%20Up%3F%20on%20Some%20New%20Service',
   );
+});
+
+test('parseConnectParam accepts only the pinned extension id', () => {
+  const id = EXTENSION_ID;
+  assert.match(id, /^[a-p]{32}$/);
+  assert.equal(parseConnectParam(`?x=1&connect=${id}`), id);
+  assert.equal(parseConnectParam('?connect=' + 'a'.repeat(32)), ''); // well-formed but not ours
+  assert.equal(parseConnectParam(`?connect=${id}a`), '');
+  assert.equal(parseConnectParam(`?connect=${id.slice(0, 31)}`), '');
+  assert.equal(parseConnectParam(`?connect=${id.slice(0, 31)}q`), '');
+  assert.equal(parseConnectParam('?x=1'), '');
 });

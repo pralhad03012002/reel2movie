@@ -29,3 +29,9 @@
 @media (prefers-reduced-motion: reduce) {
   .rp *, .rp *::before, .rp *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
 }
+
+/* hero fade into the panel: plain colours for browsers without color-mix, token-driven where supported */
+.rp-hero-fade { background: linear-gradient(to top, #131316 0%, rgb(19 19 22 / .8) 16%, rgb(19 19 22 / 0) 40%); }
+@supports (background: color-mix(in srgb, red, blue)) {
+  .rp-hero-fade { background: linear-gradient(to top, var(--rp-surface) 0%, color-mix(in srgb, var(--rp-surface) 80%, transparent) 16%, transparent 40%); }
+}

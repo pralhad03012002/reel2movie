@@ -186,7 +186,7 @@ const SortMenu: FC<{ sort: SortKey; setSort: (s: SortKey) => void; filters: Filt
 
   return (
     <div ref={wrap} className="bs-sortwrap" onBlur={onBlur}>
-      <button ref={trigger} type="button" className="bs-trigger" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+      <button ref={trigger} type="button" className="bs-trigger" aria-haspopup="dialog" aria-expanded={open} aria-label={`Sort and filter, ${SORT_LABELS[sort]}${n ? `, ${n} filter${n > 1 ? 's' : ''} active` : ''}`} onClick={() => setOpen((o) => !o)}>
         <SlidersHorizontal size={16} aria-hidden />
         <span className="bs-trigger-label">{SORT_LABELS[sort]}</span>
         {n > 0 && <span className="bs-badge" aria-label={`${n} filter${n > 1 ? 's' : ''} active`}>{n}</span>}
@@ -337,8 +337,10 @@ const Shelf: FC<{ title: string; count: number; children: ReactNode }> = ({ titl
 interface BrowseProps {
   movies: Movie[]; genres: GenreSummary[]; initialGenre: string; myServices: string[]; account: ReactNode;
   onOpen: (m: Movie) => void; onBack: () => void; onToggleWatched: (id: string) => void;
+  backIcon?: 'back' | 'close'; // 'close' (extension): an X after the account slot instead of the back chevron
+  strip?: ReactNode; // optional extra controls in the tabs bar, before the sort menu (extension: the "On this site" chips)
 }
-export const BrowseScreen: FC<BrowseProps> = ({ movies, genres, initialGenre, myServices, account, onOpen, onBack, onToggleWatched }) => {
+export const BrowseScreen: FC<BrowseProps> = ({ movies, genres, initialGenre, myServices, account, onOpen, onBack, onToggleWatched, backIcon = 'back', strip }) => {
   const [genre, setGenre] = useState(initialGenre);
   const [status, setStatus] = useState<Status>('unwatched');
   const [sort, setSort] = useState<SortKey>('popular');
@@ -412,7 +414,7 @@ export const BrowseScreen: FC<BrowseProps> = ({ movies, genres, initialGenre, my
     <div className="bs-root min-h-screen w-full">
       <div className="bs-top">
         <header className="bs-head">
-          <button type="button" className="bs-back" onClick={onBack} aria-label="Back to genre tiles"><ChevronLeft size={20} aria-hidden /></button>
+          {backIcon === 'back' && <button type="button" className="bs-back" onClick={onBack} aria-label="Back to genre tiles"><ChevronLeft size={20} aria-hidden /></button>}
           <GenreMenu
             value={genre}
             onChange={pickGenre}
@@ -426,7 +428,7 @@ export const BrowseScreen: FC<BrowseProps> = ({ movies, genres, initialGenre, my
               type="search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Escape') { if (query) setQuery(''); else input.current?.blur(); } }}
+              onKeyDown={(e) => { if (e.key === 'Escape') { if (query) setQuery(''); else { e.preventDefault(); input.current?.blur(); } } }}
               placeholder="Search films"
               aria-label="Search films"
               autoComplete="off"
@@ -435,6 +437,7 @@ export const BrowseScreen: FC<BrowseProps> = ({ movies, genres, initialGenre, my
             {query ? <button type="button" className="bs-x" aria-label="Clear search" onClick={() => { setQuery(''); input.current?.focus(); }}><X size={14} aria-hidden /></button> : <kbd aria-hidden>/</kbd>}
           </label>
           {account}
+          {backIcon === 'close' && <button type="button" className="bs-back bs-close" onClick={onBack} aria-label="Close"><X size={20} aria-hidden /></button>}
         </header>
         <div className="bs-bar">
           <h1 className="bs-gtitle rp-display" data-muted={searching || undefined}>{genre}</h1>
@@ -446,6 +449,7 @@ export const BrowseScreen: FC<BrowseProps> = ({ movies, genres, initialGenre, my
             onChange={(s) => { setQuery(''); setStatus(s as Status); }}
             items={[{ id: 'unwatched', label: 'Unwatched', count: counts.unwatched }, { id: 'watched', label: 'Watched', count: counts.watched }]}
           />
+          {strip}
           <SortMenu sort={sort} setSort={setSort} filters={filters} setFilters={setFilters} hasServices={myServices.length > 0} />
         </div>
       </div>

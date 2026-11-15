@@ -22,7 +22,7 @@ const NOW = REF_DATE.getTime(); // demo data is pinned to a fixed date (same as 
 const SEARCH: [RegExp, (q: string) => string][] = [
   [/^netflix/, (q) => `https://www.netflix.com/search?q=${q}`],
   [/^amazon (prime )?video/, (q) => `https://www.primevideo.com/search?phrase=${q}`],
-  [/^(jio)?hotstar/, (q) => `https://www.hotstar.com/search?q=${q}`],
+  [/^(jio)?hotstar/, (q) => `https://www.hotstar.com/in/explore?search_query=${q}`],
   [/^zee5/, (q) => `https://www.zee5.com/search?q=${q}`],
   [/^sony ?liv$/, (q) => `https://www.sonyliv.com/search?searchTerm=${q}`],
   [/^apple tv( store| plus)?$/, (q) => `https://tv.apple.com/in/search?term=${q}`],
@@ -157,12 +157,18 @@ const HeroTrailer: FC<{ trailerKey: string; backdrop: string; title: string; liv
 
 /* ---------- overlay ---------- */
 
-export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () => void; onToggleWatched: (id: string) => void; onRemove: (id: string) => void }> = ({
+// Extension: the site we are on. Its provider links go to the site's own search, in the same tab.
+export interface SiteHint { matches: (providerName: string) => boolean; searchUrl: (title: string) => string; target?: string }
+
+export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () => void; onToggleWatched: (id: string) => void; onRemove?: (id: string) => void; siteHint?: SiteHint; compact?: boolean; trailer?: 'embed' | 'link' }> = ({
   movie,
   myServices,
   onClose,
   onToggleWatched,
   onRemove,
+  siteHint,
+  compact: c, // extension popup: smaller hero, poster and title
+  trailer = 'embed', // 'link': no player (YouTube refuses embeds inside extension pages), just a Watch trailer link
 }) => {
   const reduce = useReducedMotion();
   const [present, safeToRemove] = usePresence();
@@ -282,13 +288,14 @@ export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () 
   const mineFirst = (a: Provider, b: Provider) => +mine(b) - +mine(a);
   const streams = m.providers.filter((p) => p.kind === 'stream').sort(mineFirst);
   const rents = m.providers.filter((p) => p.kind === 'rent').sort(mineFirst);
-  const primary: Provider | undefined = streams.find((p) => hasSearch(p.name)) ?? streams[0] ?? m.providers[0];
+  const primary: Provider | undefined = (siteHint ? m.providers.find((p) => siteHint.matches(p.name)) : undefined) ?? streams.find((p) => hasSearch(p.name)) ?? streams[0] ?? m.providers[0];
+  const where = (name?: string) => (siteHint && name && siteHint.matches(name) ? { href: siteHint.searchUrl(m.title), target: siteHint.target ?? '_blank' } : { href: providerUrl(m.title, name), target: '_blank' });
   const meta = [m.year ? String(m.year) : null, m.mediaType === 'tv' ? (m.seasons ? `${m.seasons} season${m.seasons === 1 ? '' : 's'}` : null) : runtime(m.runtimeMin)].filter(Boolean);
   const n = m.recommendations.length;
   const recs = [...m.recommendations].sort((a, b) => +new Date(b.at) - +new Date(a.at));
   const shown = allCreators ? recs : recs.slice(0, 4);
 
-  const radius = narrow ? '22px 22px 0 0' : 20;
+  const radius = narrow ? '22px 22px 0 0' : c ? 0 : 20;
 
   const link =
     'inline-flex min-h-11 items-center justify-center gap-2 rounded-full px-5 text-[15px] font-semibold transition-[transform,background-color,border-color] duration-150 active:scale-[0.97]';
@@ -303,7 +310,7 @@ export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () 
       onPointerDown={(e) => { down.current = e.target === e.currentTarget; }}
       onClick={(e) => down.current && e.target === e.currentTarget && onClose()}
       style={{ clipPath }}
-      className="fixed inset-0 z-50 flex items-end justify-center sm:items-center sm:p-6"
+      className={`fixed inset-0 z-50 flex justify-center ${c ? 'items-stretch' : 'items-end sm:items-center sm:p-6'}`}
     >
       <motion.div
         aria-hidden
@@ -319,8 +326,8 @@ export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () 
         className="rp-hide-scroll relative w-full max-w-[1000px] overflow-y-auto overscroll-contain bg-[var(--rp-surface)] shadow-[0_40px_120px_-20px_rgb(0_0_0/0.9),0_0_0_1px_var(--rp-line)]"
         style={{
           borderRadius: radius,
-          maxHeight: narrow ? 'calc(100dvh - 12px)' : '90vh',
-          height: narrow ? 'calc(100dvh - 12px)' : undefined,
+          maxHeight: narrow ? 'calc(100dvh - 12px)' : c ? '100dvh' : '90vh',
+          height: narrow ? 'calc(100dvh - 12px)' : c ? '100dvh' : undefined,
         }}
         initial={src ? false : { opacity: 0 }}
         animate={{ opacity: 1 }}
@@ -352,27 +359,24 @@ export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () 
             </div>
 
             <Item>
-              <div className="relative h-[220px] overflow-hidden [container-type:size] sm:h-[360px]">
-                {m.trailerKey ? <HeroTrailer trailerKey={m.trailerKey} backdrop={m.backdrop} title={m.title} live={trailerReady && present} /> : <img src={m.backdrop} alt="" className="h-full w-full object-cover" />}
-                <div
-                  className="pointer-events-none absolute inset-0"
-                  style={{ background: 'linear-gradient(to top, var(--rp-surface) 0%, rgb(19 19 22 / 0.8) 16%, rgb(19 19 22 / 0) 40%)' }}
-                />
+              <div className={`relative overflow-hidden [container-type:size] ${c ? 'h-[150px]' : 'h-[220px] sm:h-[360px]'}`}>
+                {m.trailerKey && trailer === 'embed' ? <HeroTrailer trailerKey={m.trailerKey} backdrop={m.backdrop} title={m.title} live={trailerReady && present} /> : <img src={m.backdrop} alt="" className="h-full w-full object-cover" />}
+                <div className="rp-hero-fade pointer-events-none absolute inset-0" />
               </div>
             </Item>
 
-            <div className="relative px-5 pb-8 sm:px-9">
-              <div className="-mt-24 flex items-end gap-5 sm:-mt-32 sm:gap-7">
-                <Item className="hidden shrink-0 sm:block">
+            <div className={`relative px-5 pb-8 ${c ? '' : 'sm:px-9'}`}>
+              <div className={`flex items-end ${c ? '-mt-14 gap-4' : '-mt-24 gap-5 sm:-mt-32 sm:gap-7'}`}>
+                <Item className={c ? 'shrink-0' : 'hidden shrink-0 sm:block'}>
                   <img
                     src={m.poster}
                     alt={`${m.title} poster`}
-                    className="aspect-[2/3] w-[190px] rounded-xl object-cover shadow-[0_18px_40px_-10px_rgb(0_0_0/0.8),0_0_0_1px_var(--rp-line)]"
+                    className={`aspect-[2/3] ${c ? 'w-[92px]' : 'w-[190px]'} rounded-xl object-cover shadow-[0_18px_40px_-10px_rgb(0_0_0/0.8),0_0_0_1px_var(--rp-line)]`}
                   />
                 </Item>
                 <div className="min-w-0 flex-1 pb-1">
                   <Item>
-                    <h2 id={titleId} className="rp-display text-[34px] font-semibold leading-[1.02] [text-shadow:0_2px_24px_rgb(0_0_0/0.6)] sm:text-[52px]">
+                    <h2 id={titleId} className={`rp-display font-semibold leading-[1.02] [text-shadow:0_2px_24px_rgb(0_0_0/0.6)] ${c ? 'text-[26px]' : 'text-[34px] sm:text-[52px]'}`}>
                       {m.title}
                     </h2>
                   </Item>
@@ -400,8 +404,7 @@ export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () 
 
               <Item className="mt-6 flex flex-wrap gap-3">
                 <a
-                  href={providerUrl(m.title, primary?.name)}
-                  target="_blank"
+                  {...where(primary?.name)}
                   rel="noopener noreferrer"
                   className={`${link} bg-[var(--rp-accent)] text-[var(--rp-accent-ink)] hover:brightness-110`}
                 >
@@ -433,6 +436,11 @@ export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () 
                   </span>
                   Mark as watched
                 </button>
+                {m.trailerKey && trailer === 'link' && (
+                  <a href={`https://www.youtube.com/watch?v=${encodeURIComponent(m.trailerKey)}`} target="_blank" rel="noopener noreferrer" className={`${link} border border-[var(--rp-line-strong)] hover:border-[var(--rp-muted)]`}>
+                    <ExternalLink size={16} aria-hidden /> Watch trailer
+                  </a>
+                )}
               </Item>
 
               <div className="mt-9 grid gap-9 md:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)] md:gap-12">
@@ -471,13 +479,13 @@ export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () 
                     {m.providers.length ? (
                       <div className="flex flex-wrap items-center gap-2">
                         {streams.map((p) => (
-                          <a key={p.name} href={providerUrl(m.title, p.name)} target="_blank" rel="noopener noreferrer"
+                          <a key={p.name} {...where(p.name)} rel="noopener noreferrer"
                             className={`inline-flex min-h-11 items-center gap-1.5 rounded-full border ${mine(p) ? 'border-[var(--rp-text)] bg-white/[0.06]' : 'border-[var(--rp-line-strong)]'} px-4 text-[14px] font-medium transition-[transform,border-color] duration-150 hover:border-[var(--rp-muted)] active:scale-[0.97]`}>
                             {p.name}<ExternalLink size={12} className="text-[var(--rp-faint)]" aria-hidden />
                           </a>
                         ))}
                         {rents.map((p) => (
-                          <a key={p.name} href={providerUrl(m.title, p.name)} target="_blank" rel="noopener noreferrer"
+                          <a key={p.name} {...where(p.name)} rel="noopener noreferrer"
                             className="inline-flex min-h-11 items-center gap-1.5 rounded-full px-3 text-[13px] text-[var(--rp-muted)] transition-[transform,color] duration-150 hover:text-[var(--rp-text)] active:scale-[0.97]">
                             {p.name} <span className="text-[11px] text-[var(--rp-faint)]">rent</span>
                           </a>
@@ -522,12 +530,12 @@ export const MovieOverlay: FC<{ movie: Movie; myServices: string[]; onClose: () 
                     )}
                   </Item>
 
-                  <Item>
+                  {onRemove && <Item>
                     <button type="button" onClick={() => { if (confirm(`Remove "${m.title}" from your list?`)) { onRemove(m.id); onClose(); } }}
                       className="inline-flex min-h-11 items-center text-[13px] text-[var(--rp-faint)] underline-offset-4 transition-colors hover:text-[var(--rp-danger)] hover:underline">
                       Remove from my list
                     </button>
-                  </Item>
+                  </Item>}
                 </div>
               </div>
             </div>
